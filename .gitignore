@@ -2,6 +2,7 @@ dist-newstyle/
 cosmobot.sqlite3*
 config.toml
 *.sh
+!ops/*.sh
 .ghcid-errors
 __pycache__/
 # FM runtime and secrets

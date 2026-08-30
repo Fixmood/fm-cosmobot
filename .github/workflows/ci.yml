@@ -41,6 +41,23 @@ jobs:
       - name: Test
         run: python -m unittest discover -s fm-domain -p 'test_*.py' -v
 
+  admin:
+    name: FM Control Center
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Syntax check
+        run: python -m py_compile admin/app.py admin/test_app.py
+      - name: Test
+        run: python admin/test_app.py -v
+      - name: Build admin image
+        run: docker build --tag fm-admin:ci -f admin/Dockerfile admin
+
   cabal:
     name: Cabal
     runs-on: ubuntu-latest

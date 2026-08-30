@@ -50,6 +50,52 @@ class AdminApiTest(unittest.TestCase):
         _, logs = self.request("GET", "/api/logs")
         self.assertEqual([item["action"] for item in logs["items"]], ["delete", "update", "create"])
 
+    def test_audit_filters_by_actor_action_collection_and_time(self):
+        self.request("POST", "/api/collections/personas", {"id": "one"})
+        self.request("POST", "/api/collections/models", {"id": "two"}, token="test-token")
+        # Actor is deliberately supplied as a separate header, like the production UI/API client.
+        request = Request(self.base + "/api/collections/personas", data=json.dumps({"id": "three"}).encode(),
+                          headers={"X-FM-Admin-Token": "test-token", "X-FM-Admin-Actor": "operator"}, method="POST")
+        with urlopen(request):
+            pass
+        _, filtered = self.request("GET", "/api/logs?actor=operator&action=create&collection=personas&limit=1")
+        self.assertEqual(len(filtered["items"]), 1)
+        self.assertEqual(filtered["items"][0]["actor"], "operator")
+
+    def test_observability_overview_tolerates_rpc_failure(self):
+        def domain(path):
+            return {"ok": True, "data": {"library_texts": 3}} if path == "/stats" else {"ok": True, "data": {}}
+
+        def rpc(method, _params=None):
+            if method == "config.snapshot":
+                return {"ok": False, "error": "RPC timeout"}
+            return {"ok": True, "data": {"entries": []}}
+
+        with patch.object(app, "fetch_domain", side_effect=domain), patch.object(app, "fetch_rpc", side_effect=rpc):
+            status, payload = self.request("GET", "/api/observability/overview")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["rpc"]["ok"])
+        self.assertFalse(payload["config_sync"]["applied"])
+        self.assertEqual(payload["domain"]["ok"], True)
+
+    def test_observability_reports_unsynced_saved_config_reason(self):
+        app.write_state({"config_versions": [{"id": "cfg-1", "after": {"value": "new"}}]})
+        with patch.object(app, "fetch_domain", return_value={"ok": True, "data": {}}), patch.object(
+            app, "fetch_rpc", return_value={"ok": True, "data": {"value": "old"}}
+        ):
+            _, payload = self.request("GET", "/api/observability/overview")
+        self.assertTrue(payload["config_sync"]["saved"])
+        self.assertFalse(payload["config_sync"]["applied"])
+        self.assertIn("不一致", payload["config_sync"]["reason"])
+
+    def test_recent_errors_redact_credentials(self):
+        app.record_error("rpc", "Authorization: Bearer secret123 api_key=sk-secret password=hunter2")
+        state = app.read_state()
+        self.assertNotIn("secret123", json.dumps(state))
+        self.assertNotIn("sk-secret", json.dumps(state))
+        self.assertNotIn("hunter2", json.dumps(state))
+
     def test_static_dashboard(self):
         with urlopen(self.base + "/") as response:
             self.assertEqual(response.status, 200)
@@ -149,6 +195,42 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("version_id", payload)
         sync.assert_called_once_with("persona", {"action": "set", "scope": "private_default", "content": "old"})
+
+    def test_config_lifecycle_write_observe_rollback(self):
+        snapshots = [
+            {"ok": True, "data": {"private_default": "old", "group_default": "keep", "models": []}},
+            {"ok": True, "data": {"private_default": "new", "group_default": "keep", "models": []}},
+        ]
+        with patch.object(app, "fetch_rpc", side_effect=snapshots), patch.object(
+            app, "runtime_config_result", return_value={"ok": True, "data": {"saved": True, "applied": True}}
+        ):
+            status, written = self.request(
+                "POST", "/api/runtime/config/persona",
+                {"action": "set", "scope": "private_default", "content": "new"},
+            )
+        self.assertEqual(status, 200)
+        version_id = written["version_id"]
+
+        with patch.object(app, "fetch_domain", return_value={"ok": True, "data": {}}), patch.object(
+            app, "fetch_rpc", side_effect=[
+                {"ok": True, "data": {"private_default": "new", "group_default": "keep", "models": []}},
+                {"ok": True, "data": {"entries": [{"name": "sync", "progress": 1.0}]}},
+            ]
+        ):
+            _, observed = self.request("GET", "/api/observability/overview")
+        self.assertTrue(observed["config_sync"]["saved"])
+        self.assertTrue(observed["config_sync"]["applied"])
+        self.assertEqual(observed["tasks"]["running"], 1)
+
+        with patch.object(app, "fetch_rpc", side_effect=[
+            {"ok": True, "data": {"private_default": "new", "group_default": "keep", "models": []}},
+            {"ok": True, "data": {"private_default": "old", "group_default": "keep", "models": []}},
+        ]), patch.object(
+            app, "runtime_config_result", return_value={"ok": True, "data": {"saved": True, "applied": True}}
+        ):
+            status, rolled_back = self.request("POST", "/api/runtime/config/rollback", {"version_id": version_id})
+        self.assertEqual(status, 200)
+        self.assertIn("version_id", rolled_back)
 
 
 if __name__ == "__main__":

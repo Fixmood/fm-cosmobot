@@ -110,6 +110,13 @@ bash ops/deploy_production.sh
 bash ops/verify_production.sh
 ```
 
+阶段 7 的完整验证入口为 `bash ops/stage7_verify.sh`，它会执行后台接口与
+Domain 回归测试、凭据扫描、Python 语法检查、Compose 配置校验和 Admin
+镜像构建；检测到 Cabal/GHC 时还会执行 Cosmobot 的 Haskell 构建与测试。
+生产发布前的人工检查与失败回滚分别见
+[`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md) 和
+[`docs/ROLLBACK.md`](docs/ROLLBACK.md)。
+
 部署脚本会检查源码状态和凭据特征，构建并测试候选镜像，验证服务健康状态和镜像版本，并在验证失败时恢复上一版本。容器健康不等于消息链路验证通过，发布后仍应在测试 QQ 群和 Matrix 房间验证实际流程。
 
 ## 配置与数据边界

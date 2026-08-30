@@ -36,6 +36,8 @@ python3 admin/app.py
 - 文库、赛文、成绩和归档数据的真实只读查询接口；
 - 触发规则、人设、模型和群配置的 JSON CRUD；
 - 配置修改审计日志；
+- 配置同步、Cosmobot RPC、Domain、后台任务和最近错误的可观察性总览；
+- 支持按操作者、动作、资源和时间范围筛选审计日志；
 - Cosmobot RPC 的工具审计、媒体缓存和后台任务只读状态；
 - 同源网页控制台。
 
@@ -85,6 +87,7 @@ GET /api/runtime/config
 GET /api/runtime/config/versions
 GET /api/runtime/config/versions/{id}
 GET /api/runtime/config/versions/{id}/diff
+GET /api/observability/overview
 POST /api/runtime/config/persona
 POST /api/runtime/config/trigger
 POST /api/runtime/config/model
@@ -96,6 +99,21 @@ DELETE /api/runtime/config/trigger
 后台只做代理和错误归一化，不保存或回显 RPC token。配置写接口返回 Cosmobot
 报告的 `saved` 和 `applied` 状态；RPC 失败时返回 `502`。`/api/collections/*`
 仍是未同步的控制平面草稿存储。
+
+可观察性总览：
+
+```text
+GET /api/observability/overview
+GET /api/observability/overview?actor=admin&action=update&collection=personas&limit=50
+GET /api/logs?actor=admin&action=update&collection=personas&from=unix_seconds&to=unix_seconds
+```
+
+`/api/observability/overview` 始终返回 HTTP 200 的聚合结果；其中 `rpc`、
+`domain`、`tasks` 和 `config_sync` 各自携带 `ok` 与 `reason`，单个组件失败不
+会让后台总览崩溃。`config_sync.applied=false` 时，`reason` 会说明是 RPC
+不可达、无法读取当前快照，还是已保存版本与当前快照不一致。`recent_errors`
+只保留最近 100 条，展示最近 20 条，并对 Bearer token、API Key、密码等字段
+脱敏。审计日志默认保留既有行为，筛选参数均可选，`limit` 最大为 200。
 
 ## 后续接入顺序
 

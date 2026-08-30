@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +29,7 @@ RPC_TIMEOUT = float(os.environ.get("FM_RPC_TIMEOUT", "4"))
 LOCK = threading.RLock()
 COLLECTIONS = {"groups", "triggers", "personas", "models"}
 VERSION_LIMIT = 100
+ERROR_LIMIT = 100
 DOMAIN_READS = {
     "library": "/library/search?limit=50",
     "contests": "/contest/search?limit=50",
@@ -39,15 +42,18 @@ DOMAIN_READS = {
 def read_state() -> dict:
     with LOCK:
         if not STATE_PATH.exists():
-            return {"groups": {}, "triggers": {}, "personas": {}, "models": {}, "audit": [], "config_versions": []}
+            return {"groups": {}, "triggers": {}, "personas": {}, "models": {}, "audit": [], "config_versions": [], "recent_errors": []}
         try:
             value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            value = {}
+        if not isinstance(value, dict):
             value = {}
         return {
             **{name: value.get(name, {}) for name in COLLECTIONS},
             "audit": value.get("audit", [])[-200:],
             "config_versions": value.get("config_versions", [])[-VERSION_LIMIT:],
+            "recent_errors": value.get("recent_errors", [])[-ERROR_LIMIT:],
         }
 
 
@@ -59,12 +65,36 @@ def write_state(state: dict) -> None:
         temporary.replace(STATE_PATH)
 
 
-def record_audit(action: str, collection: str, item_id: str) -> None:
+def sanitize_error(message: object) -> str:
+    """Keep telemetry useful without persisting credentials from a failed call."""
+    text = re.sub(
+        r"(?i)(Bearer\s+|api[_-]?key\s*=|token\s*=|password\s*=)[^\s&;,)\]}]+",
+        r"\1[redacted]",
+        str(message),
+    )
+    return text[:500]
+
+
+def record_error(component: str, error: object, actor: str = "system") -> None:
+    with LOCK:
+        state = read_state()
+        state["recent_errors"].append({
+            "component": component,
+            "error": sanitize_error(error),
+            "actor": actor[:80] or "system",
+            "at": time.time(),
+        })
+        state["recent_errors"] = state["recent_errors"][-ERROR_LIMIT:]
+        write_state(state)
+
+
+def record_audit(action: str, collection: str, item_id: str, actor: str = "admin") -> None:
     state = read_state()
     state["audit"].append({
         "action": action,
         "collection": collection,
         "item_id": item_id,
+        "actor": actor[:80] or "admin",
         "at": time.time(),
     })
     write_state(state)
@@ -76,15 +106,21 @@ def fetch_domain(path: str) -> dict:
         with urlopen(request, timeout=4) as response:
             return {"ok": True, "data": json.loads(response.read().decode("utf-8"))}
     except Exception as error:  # The dashboard must show partial outages instead of failing entirely.
-        return {"ok": False, "error": str(error)}
+        result = {"ok": False, "error": sanitize_error(error)}
+        record_error("domain", result["error"])
+        return result
 
 
 def fetch_rpc(method: str, params: dict | None = None) -> dict:
     """Call one read-only RPC method without exposing the bearer token."""
     if not RPC_ENABLED:
-        return {"ok": False, "error": "Cosmobot RPC 未启用。"}
+        result = {"ok": False, "error": "Cosmobot RPC 未启用。"}
+        record_error("rpc", result["error"])
+        return result
     if not RPC_TOKEN:
-        return {"ok": False, "error": "Cosmobot RPC 已启用，但未配置 FM_RPC_TOKEN。"}
+        result = {"ok": False, "error": "Cosmobot RPC 已启用，但未配置 FM_RPC_TOKEN。"}
+        record_error("rpc", result["error"])
+        return result
     try:
         import websocket
 
@@ -102,10 +138,119 @@ def fetch_rpc(method: str, params: dict | None = None) -> dict:
         if "error" in response:
             error = response["error"]
             message = error.get("message", "RPC 请求失败") if isinstance(error, dict) else str(error)
-            return {"ok": False, "error": message}
+            result = {"ok": False, "error": sanitize_error(message)}
+            record_error("rpc", result["error"])
+            return result
         return {"ok": True, "data": response.get("result")}
     except Exception as error:  # Runtime telemetry must degrade independently.
-        return {"ok": False, "error": str(error)}
+        result = {"ok": False, "error": sanitize_error(error)}
+        record_error("rpc", result["error"])
+        return result
+
+
+def query_value(query: dict, name: str, default: str = "") -> str:
+    values = query.get(name, [])
+    return str(values[-1]).strip() if values else default
+
+
+def filtered_audit(query: dict) -> list[dict]:
+    state = read_state()
+    actor = query_value(query, "actor").lower()
+    action = query_value(query, "action").lower()
+    collection = query_value(query, "collection").lower()
+    try:
+        start = float(query_value(query, "from", query_value(query, "start", "0")) or 0)
+    except ValueError:
+        start = 0
+    try:
+        end = float(query_value(query, "to", query_value(query, "end", str(time.time()))) or time.time())
+    except ValueError:
+        end = time.time()
+    try:
+        limit = max(1, min(int(query_value(query, "limit", "200")), 200))
+    except ValueError:
+        limit = 200
+    items = []
+    for item in reversed(state["audit"]):
+        try:
+            item_at = float(item.get("at", 0))
+        except (TypeError, ValueError):
+            continue
+        if not start <= item_at <= end:
+            continue
+        if actor and actor not in str(item.get("actor", "admin")).lower():
+            continue
+        if action and action not in str(item.get("action", "")).lower():
+            continue
+        if collection and collection not in str(item.get("collection", "")).lower():
+            continue
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def config_sync_status(snapshot_result: dict) -> dict:
+    versions = read_state()["config_versions"]
+    latest = versions[-1] if versions else None
+    status = {
+        "ok": True,
+        "last_version_id": latest.get("id") if latest else None,
+        "saved": latest is not None,
+        "applied": False,
+        "reason": None,
+    }
+    if not snapshot_result.get("ok"):
+        status.update(ok=False, applied=False, reason=snapshot_result.get("error", "无法读取 Cosmobot 当前配置。"))
+        return status
+    if latest is None:
+        status["applied"] = True
+        status["reason"] = "暂无后台配置变更版本。"
+        return status
+    current = snapshot_result.get("data")
+    status["applied"] = current == latest.get("after")
+    if not status["applied"]:
+        status["reason"] = "已保存配置与 Cosmobot 当前快照不一致，可能尚未应用或已被其他来源修改。"
+    return status
+
+
+def observability_overview(query: dict) -> dict:
+    """Collect independent component states; one outage must not abort the overview."""
+    jobs = {
+        "domain_health": lambda: fetch_domain("/health"),
+        "domain_stats": lambda: fetch_domain("/stats"),
+        "rpc_snapshot": lambda: fetch_rpc("config.snapshot"),
+        "rpc_tasks": lambda: fetch_rpc("concurrency.list"),
+    }
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {name: executor.submit(job) for name, job in jobs.items()}
+        for name, future in futures.items():
+            try:
+                results[name] = future.result()
+            except Exception as error:
+                component = "rpc" if name.startswith("rpc_") else "domain"
+                record_error(component, error)
+                results[name] = {"ok": False, "error": sanitize_error(error)}
+    domain_health = results["domain_health"]
+    domain_stats = results["domain_stats"]
+    rpc_snapshot = results["rpc_snapshot"]
+    rpc_tasks = results["rpc_tasks"]
+    task_data = rpc_tasks.get("data") if rpc_tasks.get("ok") else None
+    entries = task_data.get("entries", []) if isinstance(task_data, dict) else (task_data if isinstance(task_data, list) else [])
+    errors = list(reversed(read_state()["recent_errors"]))[:20]
+    return {
+        "ok": True,
+        "generated_at": time.time(),
+        "config_sync": config_sync_status(rpc_snapshot),
+        "rpc": {"ok": rpc_snapshot["ok"] and rpc_tasks["ok"], "reason": None if rpc_snapshot["ok"] and rpc_tasks["ok"] else (rpc_snapshot.get("error") or rpc_tasks.get("error"))},
+        "domain": {"ok": domain_health["ok"] and domain_stats["ok"], "reason": None if domain_health["ok"] and domain_stats["ok"] else (domain_health.get("error") or domain_stats.get("error"))},
+        "domain_stats": domain_stats,
+        "tasks": {"ok": rpc_tasks["ok"], "running": len(entries), "entries": entries[:100], "reason": None if rpc_tasks["ok"] else rpc_tasks.get("error")},
+        "recent_errors": errors,
+        "audit": filtered_audit(query),
+        "state": {name: len(read_state()[name]) for name in COLLECTIONS},
+    }
 
 
 def runtime_config_result(kind: str, payload: dict | None = None) -> dict:
@@ -262,8 +407,10 @@ class Api(BaseHTTPRequestHandler):
                 "archive": fetch_domain("/archive/status"),
                 "state": {name: len(read_state()[name]) for name in COLLECTIONS},
             })
+        elif request.path == "/api/observability/overview":
+            self.send_json(HTTPStatus.OK, observability_overview(parse_qs(request.query)))
         elif request.path == "/api/logs":
-            self.send_json(HTTPStatus.OK, {"ok": True, "items": list(reversed(read_state()["audit"]))})
+            self.send_json(HTTPStatus.OK, {"ok": True, "items": filtered_audit(parse_qs(request.query))})
         elif request.path.startswith("/api/domain/"):
             name = request.path.removeprefix("/api/domain/")
             path = DOMAIN_READS.get(name)
@@ -367,6 +514,10 @@ class Api(BaseHTTPRequestHandler):
                 version_id = save_config_version(before_result["data"], after_result["data"], kind, payload, actor)
                 if version_id:
                     result["version_id"] = version_id
+        if not result["ok"]:
+            record_error("config_sync", result.get("error", "运行时配置同步失败。"), self.headers.get("X-FM-Admin-Actor", "admin"))
+        elif isinstance(result.get("data"), dict) and result["data"].get("applied") is False:
+            record_error("config_sync", result["data"].get("reason", "配置保存成功但尚未生效。"), self.headers.get("X-FM-Admin-Actor", "admin"))
         self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
 
     def runtime_config_rollback(self) -> None:
@@ -390,6 +541,7 @@ class Api(BaseHTTPRequestHandler):
             return
         after_result = fetch_rpc("config.snapshot")
         if not after_result["ok"]:
+            record_error("config_sync", "回滚已执行，但无法确认当前生效状态。", self.headers.get("X-FM-Admin-Actor", "admin"))
             self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "回滚已执行，但无法确认当前生效状态。"})
             return
         actor = self.headers.get("X-FM-Admin-Actor", "admin").strip()[:80] or "admin"
@@ -431,7 +583,8 @@ class Api(BaseHTTPRequestHandler):
         item["id"] = target_id
         state[collection][target_id] = item
         write_state(state)
-        record_audit("update" if replace else "create", collection, target_id)
+        actor = self.headers.get("X-FM-Admin-Actor", "admin").strip()[:80] or "admin"
+        record_audit("update" if replace else "create", collection, target_id, actor)
         self.send_json(HTTPStatus.OK, {"ok": True, "item": item})
 
     def do_DELETE(self) -> None:
@@ -453,7 +606,8 @@ class Api(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.NOT_FOUND, "记录不存在。")
             return
         write_state(state)
-        record_audit("delete", parts[0], parts[1])
+        actor = self.headers.get("X-FM-Admin-Actor", "admin").strip()[:80] or "admin"
+        record_audit("delete", parts[0], parts[1], actor)
         self.send_json(HTTPStatus.OK, {"ok": True, "deleted": parts[1]})
 
     def send_static(self, name: str) -> None:
