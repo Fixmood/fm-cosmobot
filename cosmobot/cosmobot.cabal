@@ -312,8 +312,9 @@ library
         Bot.Trigger
         Bot.Prelude
         Bot.RPC.Audit
-        Bot.RPC.Client
         Bot.RPC.Config
+        Bot.RPC.Client
+        Bot.RPC.RuntimeConfig
         Bot.RPC.Server
         Bot.RPC.State
         Bot.Resource

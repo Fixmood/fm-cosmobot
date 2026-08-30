@@ -81,10 +81,18 @@ Cosmobot RPC 只读接口：
 GET /api/runtime/audit
 GET /api/runtime/media
 GET /api/runtime/concurrency
+GET /api/runtime/config
+POST /api/runtime/config/persona
+POST /api/runtime/config/trigger
+POST /api/runtime/config/model
+DELETE /api/runtime/config/persona
+DELETE /api/runtime/config/trigger
 ```
 
 这些接口分别调用 `audit.recent`、`media.stats` 和 `concurrency.list`。
-后台只做代理和错误归一化，不保存或回显 RPC token，也不提供运行时写操作。
+后台只做代理和错误归一化，不保存或回显 RPC token。配置写接口返回 Cosmobot
+报告的 `saved` 和 `applied` 状态；RPC 失败时返回 `502`。`/api/collections/*`
+仍是未同步的控制平面草稿存储。
 
 ## 后续接入顺序
 

@@ -85,6 +85,25 @@ class AdminApiTest(unittest.TestCase):
                 self.request("GET", "/api/runtime/media")
         self.assertIn("502", str(context.exception))
 
+    def test_runtime_config_write_returns_saved_and_applied(self):
+        with patch.object(app, "runtime_config_result", return_value={
+            "ok": True, "data": {"saved": True, "applied": True}
+        }) as sync:
+            status, payload = self.request("POST", "/api/runtime/config/persona", {
+                "action": "set", "scope": "private_default", "content": "简洁。"
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"]["applied"], True)
+        sync.assert_called_once_with("persona", {"action": "set", "scope": "private_default", "content": "简洁。"})
+
+    def test_runtime_config_delete_maps_to_clear(self):
+        with patch.object(app, "runtime_config_result", return_value={
+            "ok": True, "data": {"saved": True, "applied": True}
+        }) as sync:
+            status, _ = self.request("DELETE", "/api/runtime/config/trigger")
+        self.assertEqual(status, 200)
+        sync.assert_called_once_with("trigger", {"action": "clear"})
+
 
 if __name__ == "__main__":
     unittest.main()

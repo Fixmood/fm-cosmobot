@@ -51,6 +51,7 @@ import qualified Network.WebSockets as WS
 data RpcServerCallbacks es = RpcServerCallbacks
   { auditMethod :: RPC.RpcRequest -> Eff es (Maybe (Either RPC.RpcError Aeson.Value))
   , managerMethod :: RPC.RpcRequest -> Eff es (Maybe RPC.RpcResponse)
+  , configMethod :: RPC.RpcRequest -> Eff es (Maybe (Either RPC.RpcError Aeson.Value))
   }
 
 data RpcAttachmentUpload = RpcAttachmentUpload
@@ -78,6 +79,7 @@ noRpcServerCallbacks :: RpcServerCallbacks es
 noRpcServerCallbacks = RpcServerCallbacks
   { auditMethod = \_ -> pure Nothing
   , managerMethod = \_ -> pure Nothing
+  , configMethod = \_ -> pure Nothing
   }
 
 withManagerRpcCallbacks
@@ -287,6 +289,8 @@ dispatchRpcRequestUnsafe rpcState _cfg callbacks request =
     method
       | "audit." `Text.isPrefixOf` method ->
           dispatchAudit callbacks request
+      | "config." `Text.isPrefixOf` method ->
+          dispatchConfig callbacks request
       | "concurrency." `Text.isPrefixOf` method || "resource." `Text.isPrefixOf` method ->
           dispatchManager callbacks request
       | otherwise ->
@@ -828,6 +832,16 @@ dispatchAudit callbacks request =
       pure (JSONRPC.ErrorMessage (JSONRPC.JSONRPCError JSONRPC.rPC_VERSION (RPC.requestId request) err))
     Just (Right value) ->
       pure (RPC.successResponse (RPC.requestId request) value)
+
+dispatchConfig
+  :: RpcServerCallbacks es
+  -> RPC.RpcRequest
+  -> Eff es RPC.RpcResponse
+dispatchConfig callbacks request =
+  callbacks.configMethod request >>= \case
+    Nothing -> pure (methodNotFound (RPC.requestId request) (RPC.requestMethod request))
+    Just (Left err) -> pure (JSONRPC.ErrorMessage (JSONRPC.JSONRPCError JSONRPC.rPC_VERSION (RPC.requestId request) err))
+    Just (Right value) -> pure (RPC.successResponse (RPC.requestId request) value)
 
 dispatchManager
   :: RpcServerCallbacks es

@@ -123,6 +123,23 @@ Possession of the RPC bearer token grants superuser resource access. Resource
 methods can therefore inspect or modify resources owned through any chat
 platform.
 
+### Runtime configuration
+
+Authenticated clients may use the following configuration methods. They run
+inside the Cosmobot process and therefore use the same validation, locks, and
+runtime state as the corresponding FM tools:
+
+| Method | Purpose |
+| --- | --- |
+| `config.snapshot` | Read effective runtime personas, member styles, triggers, and model status |
+| `config.persona` | Get, set, or clear a scoped private persona, group persona, or member style |
+| `config.trigger` | List, get, set, or clear a trigger configuration by scope key |
+| `config.model` | List, add, edit, delete, switch, or reset the active chat model |
+
+Successful writes return `saved: true` and `applied: true`. Model switching
+probes the target endpoint before changing the active selection. API keys are
+accepted for model creation or editing but are never returned in RPC results.
+
 ### Concurrency
 
 | Method | Parameters | Result |

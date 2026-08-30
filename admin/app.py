@@ -106,6 +106,12 @@ def fetch_rpc(method: str, params: dict | None = None) -> dict:
         return {"ok": False, "error": str(error)}
 
 
+def runtime_config_result(kind: str, payload: dict | None = None) -> dict:
+    if kind not in {"persona", "trigger", "model"}:
+        return {"ok": False, "error": "运行时配置类型不存在。"}
+    return fetch_rpc(f"config.{kind}", payload or {"action": "status"})
+
+
 def validate_item(item: object) -> tuple[dict | None, str | None]:
     if not isinstance(item, dict):
         return None, "请求体必须是 JSON 对象。"
@@ -184,6 +190,9 @@ class Api(BaseHTTPRequestHandler):
         elif request.path == "/api/runtime/concurrency":
             result = fetch_rpc("concurrency.list")
             self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path == "/api/runtime/config":
+            result = fetch_rpc("config.snapshot")
+            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
         elif request.path.startswith("/api/collections/"):
             self.collection_get(request.path.removeprefix("/api/collections/"), parse_qs(request.query))
         elif request.path == "/":
@@ -213,7 +222,9 @@ class Api(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "需要有效的 FM_ADMIN_TOKEN。")
             return
         request = urlparse(self.path)
-        if request.path.startswith("/api/collections/"):
+        if request.path.startswith("/api/runtime/config/"):
+            self.runtime_config_write(request.path.removeprefix("/api/runtime/config/"))
+        elif request.path.startswith("/api/collections/"):
             self.collection_write(request.path.removeprefix("/api/collections/"), replace=False)
         else:
             self.send_error_json(HTTPStatus.NOT_FOUND, "接口不存在。")
@@ -223,10 +234,16 @@ class Api(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "需要有效的 FM_ADMIN_TOKEN。")
             return
         request = urlparse(self.path)
-        if request.path.startswith("/api/collections/"):
+        if request.path.startswith("/api/runtime/config/"):
+            self.runtime_config_write(request.path.removeprefix("/api/runtime/config/"))
+        elif request.path.startswith("/api/collections/"):
             self.collection_write(request.path.removeprefix("/api/collections/"), replace=True)
         else:
             self.send_error_json(HTTPStatus.NOT_FOUND, "接口不存在。")
+
+    def runtime_config_write(self, raw_kind: str) -> None:
+        result = runtime_config_result(raw_kind.strip("/"), self.read_json())
+        self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
 
     def collection_write(self, raw_path: str, replace: bool) -> None:
         parts = [part for part in raw_path.split("/") if part]
@@ -259,7 +276,13 @@ class Api(BaseHTTPRequestHandler):
         if not self.authorized():
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "需要有效的 FM_ADMIN_TOKEN。")
             return
-        parts = [part for part in urlparse(self.path).path.removeprefix("/api/collections/").split("/") if part]
+        request = urlparse(self.path)
+        if request.path.startswith("/api/runtime/config/"):
+            kind = request.path.removeprefix("/api/runtime/config/").strip("/")
+            result = runtime_config_result(kind, {"action": "clear"})
+            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+            return
+        parts = [part for part in request.path.removeprefix("/api/collections/").split("/") if part]
         if len(parts) != 2 or parts[0] not in COLLECTIONS:
             self.send_error_json(HTTPStatus.BAD_REQUEST, "删除需要提供资源名称和 id。")
             return

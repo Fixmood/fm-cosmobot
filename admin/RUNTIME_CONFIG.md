@@ -32,11 +32,13 @@ returning API keys, and report application failures without claiming success.
 The existing `/api/collections/*` endpoints remain control-plane storage until
 this adapter is complete.
 
-## Current Gap
+## Application Contract
 
-Cosmobot currently exposes RPC methods for audit, media, concurrency, and
-resources, but no configuration method. The next implementation step is to add
-the narrow `config.*` RPC family in Cosmobot and then map the admin CRUD routes
-to it. Direct writes from the admin container to `config.toml`, memory files,
-or `trigger-config.json` are intentionally out of scope because they bypass
-Cosmobot's in-process locks, validation, and model selection state.
+Cosmobot exposes the narrow `config.*` RPC family. The admin container calls
+these methods instead of writing `config.toml`, memory files, or
+`trigger-config.json` directly. This preserves Cosmobot's in-process locks,
+validation, and model selection state.
+
+The control center keeps the old `/api/collections/*` endpoints as draft
+storage. Only `/api/runtime/config` and its typed child endpoints represent
+configuration handled by the running Cosmobot instance.
