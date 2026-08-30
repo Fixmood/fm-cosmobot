@@ -80,7 +80,7 @@ loadTriggerConfigByKey requestedKey = do
     raw <- TextIO.readFile triggerConfigPath
     pure $ Aeson.decodeStrict (TextEncoding.encodeUtf8 raw) >>= lookupConfig requestedKey
   where
-    lookupConfig requestedKey (Aeson.Object object) = KeyMap.lookup (Key.fromText requestedKey) object >>= AesonTypes.parseMaybe Aeson.parseJSON
+    lookupConfig configKey (Aeson.Object object) = KeyMap.lookup (Key.fromText configKey) object >>= AesonTypes.parseMaybe Aeson.parseJSON
     lookupConfig _ _ = Nothing
 
 saveTriggerConfig :: IncomingMessage -> TriggerConfig -> IO ()

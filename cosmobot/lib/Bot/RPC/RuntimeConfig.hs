@@ -80,7 +80,7 @@ configMethod request =
         | action == "get" || action == "status" -> do
             current <- liftIO (Trigger.loadTriggerConfigByKey scope)
             pure (Right (triggerResult scope current))
-        | action == "clear" -> liftIO (Trigger.clearTriggerConfigByKey scope) >> pure (Right (savedValue scope))
+        | action == "clear" -> liftIO (Trigger.clearTriggerConfigByKey scope) >> pure (Right (triggerSavedValue scope))
         | action == "set" -> do
             let modes = traverse parseMode modesRaw :: Either Text [Trigger.TriggerMode]
             case modes of
@@ -90,7 +90,7 @@ configMethod request =
                 | otherwise -> do
                     let config = Trigger.TriggerConfig (ordNub parsed) (clean keywords)
                     liftIO (Trigger.saveTriggerConfigByKey scope config)
-                    pure (Right (savedValue scope))
+                    pure (Right (triggerSavedValue scope))
         | otherwise -> pure (Left (RPC.rpcError "invalid_params" "action must be list, get, status, set, or clear"))
       where
         parseMode :: Text -> Either Text Trigger.TriggerMode
@@ -167,13 +167,18 @@ personaScope raw ident = case Text.toCaseFold (Text.strip raw) of
   "member" -> MemoryStore.MemberStyleMemory <$> requireId "member" ident
   _ -> Left "scope must be private, private_default, group, group_default, or member"
   where
-    requireId label = maybe (Left (label <> " scope requires id")) (Right . Text.strip) . nonEmpty
-    requireInteger label value = maybe (Left (label <> " scope requires a positive numeric id")) Right (value >>= readPositive . Text.unpack)
+    requireId :: Text -> Maybe Text -> Either Text Text
+    requireId label value =
+      maybe (Left (label <> " scope requires id")) Right (value >>= nonEmpty)
+    requireInteger :: Text -> Maybe Text -> Either Text Integer
+    requireInteger label value =
+      maybe (Left (label <> " scope requires a positive numeric id")) Right (value >>= readPositive . Text.unpack)
     readPositive text = case readMaybe text of Just number | number > (0 :: Integer) -> Just number; _ -> Nothing
     nonEmpty value = let clean = Text.strip value in if Text.null clean then Nothing else Just clean
 
 personaResult scope_ value = Aeson.object ["scope" Aeson..= showScope scope_, "content" Aeson..= value, "saved" Aeson..= isJust value, "applied" Aeson..= isJust value]
 savedValue scope_ = Aeson.object ["scope" Aeson..= showScope scope_, "saved" Aeson..= True, "applied" Aeson..= True]
+triggerSavedValue scope_ = Aeson.object ["scope" Aeson..= scope_, "saved" Aeson..= True, "applied" Aeson..= True]
 showScope = \case
   MemoryStore.PrivatePersonaMemory id_ -> "private:" <> id_
   MemoryStore.DefaultPrivatePersonaMemory -> "private_default"

@@ -16,10 +16,6 @@ module Bot.Chat.Bridge.FM
   , fmStandaloneMessage
   , FMTakeoverAddress (..)
   , FMTakeoverState (..)
-  , takeoverAliases
-  , takeoverEnabled
-  , takeoverSource
-  , takeoverDestination
   , readFMTakeoverState
   , writeFMTakeoverState
   , takeoverAddressFromMessage
@@ -160,10 +156,10 @@ data FMTakeoverState = FMTakeoverState
   deriving (Eq, Show, Generic)
 
 instance Aeson.ToJSON FMTakeoverState where
-  toJSON state = Aeson.object
-    [ "enabled" Aeson..= state.takeoverEnabled
-    , "source" Aeson..= state.takeoverSource
-    , "destination" Aeson..= state.takeoverDestination
+  toJSON takeoverState = Aeson.object
+    [ "enabled" Aeson..= takeoverState.takeoverEnabled
+    , "source" Aeson..= takeoverState.takeoverSource
+    , "destination" Aeson..= takeoverState.takeoverDestination
     ]
 
 instance Aeson.FromJSON FMTakeoverState where
@@ -189,12 +185,12 @@ readFMTakeoverState :: IO (Maybe FMTakeoverState)
 readFMTakeoverState = IORef.readIORef takeoverStateRef
 
 writeFMTakeoverState :: Maybe FMTakeoverState -> IO ()
-writeFMTakeoverState state = do
+writeFMTakeoverState takeoverState = do
   createDirectoryIfMissing True "/data"
   let temporary = takeoverStatePath <> ".tmp"
-  LazyByteString.writeFile temporary (Aeson.encode state)
+  LazyByteString.writeFile temporary (Aeson.encode takeoverState)
   renameFile temporary takeoverStatePath
-  IORef.writeIORef takeoverStateRef state
+  IORef.writeIORef takeoverStateRef takeoverState
 
 takeoverAddressFromMessage :: IncomingMessage -> FMTakeoverAddress
 takeoverAddressFromMessage message = FMTakeoverAddress
@@ -221,7 +217,7 @@ takeoverAddressFromRequest platformText kindText targetText = do
             Right FMTakeoverAddress
               { takeoverPlatform = PlatformMatrix
               , takeoverKind = ChatGroup
-              , takeoverChatId = Just (fromMaybe 0 (readMaybe (toString target)))
+              , takeoverChatId = Just (fromMaybe 0 (readMaybe (toString target) :: Maybe Integer))
               , takeoverPeerId = Nothing
               , takeoverAliases = [target]
               }
@@ -283,10 +279,10 @@ takeoverMatches address message =
     _ -> takeoverAddressFromMessage message == address
 
 takeoverMatchesSource :: FMTakeoverState -> IncomingMessage -> Bool
-takeoverMatchesSource state = takeoverMatches state.takeoverSource
+takeoverMatchesSource takeoverState = takeoverMatches takeoverState.takeoverSource
 
 takeoverMatchesDestination :: FMTakeoverState -> IncomingMessage -> Bool
-takeoverMatchesDestination state = takeoverMatches state.takeoverDestination
+takeoverMatchesDestination takeoverState = takeoverMatches takeoverState.takeoverDestination
 
 takeoverIsOwnerMessage :: IncomingMessage -> Bool
 takeoverIsOwnerMessage message =
