@@ -21,7 +21,6 @@ import qualified Data.List as List
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
 import Control.Monad.Trans.Resource (ResourceT)
-import qualified Control.Exception as Exception
 import Effectful.FileSystem (FileSystem)
 import qualified Data.ByteString.Streaming.HTTP as StreamingHTTP
 import qualified Network.HTTP.Client as HTTP
@@ -136,11 +135,9 @@ downloadQQMediaObject _manager ref request =
     -- QQ's CDN occasionally returns an entirely unreachable address set. A
     -- fresh manager forces DNS resolution on every retry instead of retaining
     -- the failed address in the process-wide connection pool.
-    freshQQMediaRequest =
-      Exception.bracket
-        (HTTP.newManager HTTPTLS.tlsManagerSettings)
-        HTTP.closeManager'
-        (HTTP.httpLbs (qqMediaDownloadRequest request))
+    freshQQMediaRequest = do
+      manager <- HTTP.newManager HTTPTLS.tlsManagerSettings
+      HTTP.httpLbs (qqMediaDownloadRequest request) manager
 
 requestSourceName :: HTTP.Request -> Text
 requestSourceName =
