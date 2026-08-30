@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free FM Control Center API and static file server."""
+"""Small FM Control Center API and static file server."""
 
 from __future__ import annotations
 

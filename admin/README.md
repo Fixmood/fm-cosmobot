@@ -1,6 +1,6 @@
 # FM Control Center
 
-FM Control Center 是 FM 的管理后台第一版，使用 Python 标准库提供管理 API 和静态网页，不新增第三方运行时依赖。
+FM Control Center 是 FM 的管理后台第一版，使用 Python 提供管理 API 和静态网页；Cosmobot RPC 接入使用固定版本的 `websocket-client`。
 
 ## 本地运行
 
