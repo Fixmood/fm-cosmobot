@@ -33,6 +33,13 @@ FM 是基于 Cosmobot 的多平台智能机器人实现，面向 QQ 和 Matrix �
 - 支持群能力、房间访问、触发规则、循环保护和服务状态管理。
 - 支持全局默认人设、群级人设、私聊人设和用户级回复风格覆盖。
 
+### Web 管理后台
+
+- `admin/` 提供 FM Control Center 的无依赖管理 API 和网页界面。
+- 总览页读取 FM Domain 的健康、统计和归档状态。
+- 支持触发规则、人设、模型和群配置的增删改查，并记录操作审计。
+- 后台控制平面与 FM Domain 业务数据库分开保存；生产运行时接入通过受认证 API 或 RPC 完成。
+
 ## 工具系统
 
 FM 默认注册 83 个聊天 Agent 工具，覆盖模型、消息、文库、赛事、桥接、媒体、记忆、执行环境和后台任务；ACP 客户端另有 3 个专用工具。
@@ -67,6 +74,7 @@ QQ / Matrix
 | `cosmobot/lib/Bot/LLM/` | OpenAI 兼容模型配置与传输 |
 | `cosmobot/lib/Bot/Storage/` | SQLite 等持久化存储 |
 | `fm-domain/` | 文库、赛文、成绩、排行榜和报表服务 |
+| `admin/` | FM Control Center 管理 API、网页和测试 |
 | `ops/` | 同步、回归检查和生产部署脚本 |
 | `docs/` | 工具参考、部署和运维说明 |
 

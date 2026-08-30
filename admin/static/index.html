@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FM Control Center</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1016; --panel:#121a23; --panel-2:#17222d; --line:#263542; --text:#e9f0f5; --muted:#91a2af; --green:#52d49a; --amber:#f0be65; --red:#ef7777; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+    button, input, textarea, select { font:inherit; }
+    button { cursor:pointer; border:1px solid var(--line); border-radius:6px; padding:8px 12px; color:var(--text); background:var(--panel-2); }
+    button:hover { border-color:#557082; background:#1c2b37; }
+    .shell { display:grid; grid-template-columns:230px 1fr; min-height:100vh; }
+    aside { border-right:1px solid var(--line); padding:24px 16px; background:#0e151d; }
+    .brand { padding:0 12px 24px; font-size:20px; font-weight:700; letter-spacing:0; }
+    .brand small { display:block; margin-top:3px; color:var(--muted); font-size:12px; font-weight:400; }
+    nav { display:grid; gap:4px; }
+    nav button { width:100%; border-color:transparent; background:transparent; text-align:left; color:var(--muted); }
+    nav button.active, nav button:hover { color:var(--text); background:var(--panel-2); }
+    main { padding:28px clamp(18px,4vw,52px); max-width:1500px; width:100%; margin:auto; }
+    header { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:26px; }
+    h1,h2,h3,p { margin:0; } h1 { font-size:24px; } h2 { font-size:17px; } .muted { color:var(--muted); }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .card { border:1px solid var(--line); border-radius:7px; background:var(--panel); padding:18px; }
+    .metric { min-height:118px; } .metric .label { color:var(--muted); } .metric .value { margin-top:12px; font-size:27px; font-weight:700; }
+    .status { display:inline-flex; align-items:center; gap:7px; color:var(--green); } .status::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; }
+    .status.warn { color:var(--amber); } .status.error { color:var(--red); }
+    .section { margin-top:24px; } .section-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:11px; }
+    table { width:100%; border-collapse:collapse; } th,td { padding:11px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-weight:500; }
+    .pill { display:inline-block; padding:3px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:12px; }
+    .empty { color:var(--muted); padding:22px 10px; text-align:center; }
+    dialog { width:min(560px,calc(100% - 32px)); border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--text); padding:0; }
+    dialog::backdrop { background:#0009; } .modal { padding:22px; } .modal header { margin-bottom:18px; }
+    label { display:grid; gap:6px; margin:12px 0; color:var(--muted); } input, textarea, select { width:100%; border:1px solid var(--line); border-radius:5px; padding:9px; color:var(--text); background:#0b1219; } textarea { min-height:110px; resize:vertical; }
+    .notice { padding:12px 14px; border-left:3px solid var(--amber); background:#2a2317; color:#e9d3a6; }
+    .hidden { display:none !important; }
+    @media (max-width:850px) { .shell { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid var(--line); padding:14px; } .brand { padding:4px 8px 12px; } nav { grid-template-columns:repeat(3,1fr); } nav button { padding:8px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } main { padding:20px 14px; } }
+    @media (max-width:520px) { .grid { grid-template-columns:1fr; } header { display:block; } header .actions { margin-top:14px; } nav { grid-template-columns:repeat(2,1fr); } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand">FM Control Center<small>运行控制台</small></div>
+      <nav>
+        <button class="active" data-view="overview">总览</button>
+        <button data-view="messages">消息链路</button>
+        <button data-view="triggers">触发规则</button>
+        <button data-view="personas">人设</button>
+        <button data-view="models">模型</button>
+        <button data-view="groups">群与房间</button>
+        <button data-view="logs">审计日志</button>
+      </nav>
+    </aside>
+    <main>
+      <header><div><h1 id="title">运行总览</h1><p class="muted" id="subtitle">FM Domain 与控制平面状态</p></div><div class="actions"><button id="refresh">刷新</button><button id="token">设置访问令牌</button></div></header>
+      <section id="overview" class="view">
+        <div class="grid"><div class="card metric"><div class="label">控制台</div><div class="value status">在线</div></div><div class="card metric"><div class="label">FM Domain</div><div class="value" id="domain">--</div></div><div class="card metric"><div class="label">文库</div><div class="value" id="library">--</div></div><div class="card metric"><div class="label">成绩记录</div><div class="value" id="scores">--</div></div></div>
+        <div class="section"><div class="section-head"><h2>服务状态</h2><span class="muted" id="updated">--</span></div><div class="card"><table><thead><tr><th>服务</th><th>状态</th><th>信息</th></tr></thead><tbody id="services"></tbody></table></div></div>
+        <div class="section"><div class="section-head"><h2>管理资源</h2></div><div class="card"><div id="resource-summary" class="grid"></div></div></div>
+      </section>
+      <section id="resource" class="view hidden"><div class="notice">当前页面管理控制平面配置。保存前请确认适用范围；所有新增、修改和删除操作都会写入审计日志。</div><div class="section"><div class="section-head"><h2 id="resource-title">资源</h2><button id="add">新增</button></div><div class="card"><table><thead><tr><th>ID</th><th>内容</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="items"></tbody></table><div id="empty" class="empty hidden">暂无记录</div></div></div></section>
+      <section id="logs" class="view hidden"><div class="section"><div class="section-head"><h2>操作审计</h2></div><div class="card"><table><thead><tr><th>时间</th><th>动作</th><th>资源</th><th>ID</th></tr></thead><tbody id="audit"></tbody></table></div></div></section>
+      <section id="messages" class="view hidden"><div class="section"><div class="section-head"><h2>消息链路</h2></div><div class="card"><p class="muted">实时消息链路接口将在接入 Cosmobot RPC 审计流后显示。当前可从审计日志查看后台配置变更。</p></div></div></section>
+    </main>
+  </div>
+  <dialog id="editor"><form method="dialog" class="modal"><header><h2 id="editor-title">新增记录</h2><button value="cancel" aria-label="关闭">关闭</button></header><label>ID<input id="item-id" required pattern="[A-Za-z0-9._:-]+"></label><label>JSON 内容<textarea id="item-json" required>{}</textarea></label><div class="actions"><button value="cancel">取消</button><button id="save" value="default">保存</button></div></form></dialog>
+  <script>
+    const state = { resource: "", editId: null, token: localStorage.getItem("fm-admin-token") || "" };
+    const $ = (id) => document.getElementById(id);
+    const headers = () => state.token ? {"X-FM-Admin-Token": state.token} : {};
+    async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: { ...headers(), ...(options.headers || {}) } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); return data; }
+    function fmt(value) { return value ? new Date(value * 1000).toLocaleString("zh-CN") : "--"; }
+    function statusCell(result) { return result && result.ok ? '<span class="status">正常</span>' : '<span class="status error">异常</span>'; }
+    async function loadOverview() { try { const data = await api("/api/overview"); const stats = data.stats.data || {}; $("domain").innerHTML = statusCell(data.domain); $("library").textContent = stats.library_texts ?? "--"; $("scores").textContent = stats.score_records ?? "--"; $("updated").textContent = fmt(data.generated_at); $("services").innerHTML = [["FM Domain",data.domain],["数据统计",data.stats],["归档状态",data.archive]].map(([name,result]) => `<tr><td>${name}</td><td>${statusCell(result)}</td><td>${result.ok ? "接口可访问" : result.error}</td></tr>`).join(""); $("resource-summary").innerHTML = Object.entries(data.state).map(([name,count]) => `<div><span class="muted">${name}</span><div class="value">${count}</div></div>`).join(""); } catch (error) { $("services").innerHTML = `<tr><td colspan="3" class="empty">${error.message}</td></tr>`; } }
+    async function loadResource(resource) { state.resource = resource; $("resource-title").textContent = ({triggers:"触发规则",personas:"人设",models:"模型",groups:"群与房间"})[resource]; try { const data = await api(`/api/collections/${resource}`); const items = data.items || []; $("empty").classList.toggle("hidden", items.length > 0); $("items").innerHTML = items.map(item => `<tr><td><span class="pill">${item.id}</span></td><td><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></td><td>${fmt(item.updated_at)}</td><td><button data-edit="${item.id}">编辑</button> <button data-delete="${item.id}">删除</button></td></tr>`).join(""); } catch (error) { $("items").innerHTML = `<tr><td colspan="4" class="empty">${error.message}</td></tr>`; } }
+    async function loadLogs() { const data = await api("/api/logs"); $("audit").innerHTML = (data.items || []).map(item => `<tr><td>${fmt(item.at)}</td><td>${item.action}</td><td>${item.collection}</td><td>${item.item_id}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">暂无记录</td></tr>'; }
+    function escapeHtml(text) { return text.replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[char])); }
+    function show(view) { document.querySelectorAll(".view").forEach(node => node.classList.add("hidden")); document.querySelectorAll("nav button").forEach(button => button.classList.toggle("active", button.dataset.view === view)); $("title").textContent = ({overview:"运行总览",messages:"消息链路",triggers:"触发规则",personas:"人设",models:"模型",groups:"群与房间",logs:"审计日志"})[view]; if (["triggers","personas","models","groups"].includes(view)) { $("resource").classList.remove("hidden"); loadResource(view); } else { $(view).classList.remove("hidden"); } if (view === "logs") loadLogs(); }
+    document.querySelectorAll("nav button").forEach(button => button.onclick = () => show(button.dataset.view)); $("refresh").onclick = () => state.resource ? loadResource(state.resource) : loadOverview();
+    $("token").onclick = () => { const value = prompt("输入 FM_ADMIN_TOKEN；留空仅适合本机开发：", state.token); if (value !== null) { state.token = value.trim(); localStorage.setItem("fm-admin-token", state.token); loadOverview(); } };
+    $("add").onclick = () => { state.editId = null; $("editor-title").textContent = "新增记录"; $("item-id").value = ""; $("item-json").value = "{}"; $("editor").showModal(); };
+    $("items").onclick = async (event) => { const id = event.target.dataset.edit || event.target.dataset.delete; if (!id) return; if (event.target.dataset.edit) { const data = await api(`/api/collections/${state.resource}/${encodeURIComponent(id)}`); state.editId = id; $("editor-title").textContent = "编辑记录"; $("item-id").value = id; $("item-id").disabled = true; $("item-json").value = JSON.stringify(data.item, null, 2); $("editor").showModal(); } else if (confirm(`删除 ${id}？`)) { await api(`/api/collections/${state.resource}/${encodeURIComponent(id)}`, {method:"DELETE"}); await loadResource(state.resource); } };
+    $("save").onclick = async (event) => { event.preventDefault(); let payload; try { payload = JSON.parse($("item-json").value); } catch (_) { alert("JSON 格式不正确"); return; } payload.id = $("item-id").value.trim(); const path = state.editId ? `/api/collections/${state.resource}/${encodeURIComponent(state.editId)}` : `/api/collections/${state.resource}`; try { await api(path, {method: state.editId ? "PUT" : "POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)}); $("editor").close(); $("item-id").disabled = false; await loadResource(state.resource); } catch (error) { alert(error.message); } };
+    loadOverview();
+  </script>
+</body>
+</html>
