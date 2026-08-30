@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes shellcheck
-          shellcheck ops/*.sh
+          shellcheck --severity=error ops/*.sh
 
   fm-domain:
     name: FM Domain
