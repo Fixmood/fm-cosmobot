@@ -1,5 +1,3 @@
-{-# LANGUAGE FieldSelectors #-}
-
 module Bot.Chat.Bridge.FM
   ( fmMatrixRoomId
   , fmQQGroupId
@@ -10,20 +8,9 @@ module Bot.Chat.Bridge.FM
   , fmOwnerQQId
   , fmBotQQId
   , fmOwnerRelayBody
-  , fmOwnerRelayBodyWithImages
   , fmReplyRelayBody
-  , fmReplyBody
-  , fmStandaloneMessage
   , FMTakeoverAddress (..)
   , FMTakeoverState (..)
-  , takeoverPlatform
-  , takeoverKind
-  , takeoverChatId
-  , takeoverPeerId
-  , takeoverAliases
-  , takeoverEnabled
-  , takeoverSource
-  , takeoverDestination
   , readFMTakeoverState
   , writeFMTakeoverState
   , takeoverAddressFromMessage
@@ -35,10 +22,6 @@ module Bot.Chat.Bridge.FM
   , takeoverIsControlMessage
   , takeoverIsBotMessage
   , takeoverIncomingBody
-  , takeoverIncomingBodyWithImages
-  , takeoverIncomingBodyWithName
-  , takeoverOwnerBody
-  , takeoverOwnerBodyWithImages
   , markFMAgentReply
   , isFMAgentReply
   , matrixOwnerAsQQ
@@ -186,7 +169,7 @@ takeoverStateRef = unsafePerformIO (IORef.newIORef =<< loadFMTakeoverState)
 loadFMTakeoverState :: IO (Maybe FMTakeoverState)
 loadFMTakeoverState =
   catchIOError
-    (Aeson.decode <$> LazyByteString.readFile takeoverStatePath)
+    (pure (Aeson.decode =<< LazyByteString.readFile takeoverStatePath))
     (const (pure Nothing))
 
 readFMTakeoverState :: IO (Maybe FMTakeoverState)
@@ -209,14 +192,13 @@ takeoverAddressFromMessage message = FMTakeoverAddress
   , takeoverAliases = message.chatAliases
   }
 
-takeoverAddressFromRequest :: Text -> Text -> Text -> Either Text FMTakeoverAddress
-takeoverAddressFromRequest platformText kindText targetText = do
+takeoverAddressFromRequest :: Text -> Text -> Either Text FMTakeoverAddress
+takeoverAddressFromRequest platformText targetText = do
   platform <- case Text.toLower (Text.strip platformText) of
     "qq" -> Right PlatformQQ
     "matrix" -> Right PlatformMatrix
     value -> Left ("接管目标平台只能是 qq 或 matrix，收到：" <> value)
   let target = Text.strip targetText
-      targetKind = Text.toLower (Text.strip kindText)
   if Text.null target
     then Left "接管目标不能为空。"
     else case platform of
@@ -225,23 +207,12 @@ takeoverAddressFromRequest platformText kindText targetText = do
             Right FMTakeoverAddress
               { takeoverPlatform = PlatformMatrix
               , takeoverKind = ChatGroup
-              , takeoverChatId = Just (fromMaybe 0 (readMaybe (toString target)))
+              , takeoverChatId = Nothing
               , takeoverPeerId = Nothing
               , takeoverAliases = [target]
               }
         | otherwise -> Left "Matrix 接管目标必须是完整房间 ID，例如 !abc:g24.at。"
       PlatformQQ
-        | targetKind `elem` ["private", "user", "person", "私聊"]
-        , Just userId <- readMaybe (toString target), userId > 0 ->
-            Right FMTakeoverAddress
-              { takeoverPlatform = PlatformQQ
-              , takeoverKind = ChatPrivate
-              , takeoverChatId = Nothing
-              , takeoverPeerId = Just target
-              , takeoverAliases = []
-              }
-        | targetKind `notElem` ["", "group", "群"] ->
-            Left "QQ target_kind 只能是 group 或 private。"
         | Just groupId <- readMaybe (toString target), groupId > 0 ->
             Right FMTakeoverAddress
               { takeoverPlatform = PlatformQQ
@@ -250,7 +221,7 @@ takeoverAddressFromRequest platformText kindText targetText = do
               , takeoverPeerId = Nothing
               , takeoverAliases = []
               }
-        | otherwise -> Left "QQ 接管目标需要填写正整数群号或私聊账号。"
+        | otherwise -> Left "QQ 接管目标目前需要填写正整数群号。"
       _ -> Left "不支持的接管目标。"
 
 takeoverTargetMessage :: FMTakeoverAddress -> IncomingMessage
@@ -278,13 +249,7 @@ takeoverTargetMessage address = IncomingMessage
   }
 
 takeoverMatches :: FMTakeoverAddress -> IncomingMessage -> Bool
-takeoverMatches address message =
-  case (address.takeoverPlatform, address.takeoverKind, message.platform, message.kind) of
-    (PlatformQQ, ChatPrivate, PlatformQQ, ChatPrivate) ->
-      let expected = address.takeoverPeerId <|> (show <$> address.takeoverChatId)
-          actual = message.senderId <|> (show <$> message.chatId)
-      in isJust expected && expected == actual
-    _ -> takeoverAddressFromMessage message == address
+takeoverMatches address message = takeoverAddressFromMessage message == address
 
 takeoverMatchesSource :: FMTakeoverState -> IncomingMessage -> Bool
 takeoverMatchesSource state = takeoverMatches state.takeoverSource
@@ -310,35 +275,11 @@ takeoverIsControlMessage :: Text -> Bool
 takeoverIsControlMessage value =
   let normalized = Text.toLower (Text.filter (not . (`elem` [' ', '\t', '\x3000'])) value)
   in any (`Text.isInfixOf` normalized)
-      [ "接管fm", "结束接管", "退出接管", "停止接管", "关闭接管"
-      , "接管状态", "接管情况", "查看接管", "接管信息"
-      ]
+      [ "接管fm", "结束接管", "退出接管", "停止接管", "关闭接管" ]
 
 takeoverIncomingBody :: IncomingMessage -> Text
 takeoverIncomingBody message =
-  "😻" <> fromMaybe "未知用户" (message.senderUsername <|> message.senderId) <> "：" <> cleanImageFilenameBody message.imageUrls message.text
-
-takeoverIncomingBodyWithImages :: IncomingMessage -> Text
-takeoverIncomingBodyWithImages message =
-  ReplyBody.replyContentToBody ReplyBody.ReplyContent
-    { text = takeoverIncomingBody message
-    , images = message.imageUrls
-    }
-
-takeoverIncomingBodyWithName :: Text -> IncomingMessage -> Text
-takeoverIncomingBodyWithName displayName message =
-  "😻" <> displayName <> "：" <> message.text
-
-takeoverOwnerBody :: Text -> Text
-takeoverOwnerBody body =
-  "😼Fixmood：" <> cleanImageFilename body
-
-takeoverOwnerBodyWithImages :: Text -> [Text] -> Text
-takeoverOwnerBodyWithImages body images =
-  ReplyBody.replyContentToBody ReplyBody.ReplyContent
-    { text = takeoverOwnerBody body
-    , images
-    }
+  "😻" <> fromMaybe "未知用户" (message.senderUsername <|> message.senderId) <> "：" <> message.text
 
 {-# NOINLINE bridgeConfigFor #-}
 bridgeConfigFor :: IncomingMessage -> FMBridgeConfig
@@ -378,79 +319,16 @@ bridgeDeliveryTargets messageId = do
 
 fmOwnerRelayBody :: Text -> Text
 fmOwnerRelayBody body =
-  "😼 Fixmood：" <> cleanImageFilename body
-
-fmOwnerRelayBodyWithImages :: Text -> [Text] -> Text
-fmOwnerRelayBodyWithImages body images =
-  ReplyBody.replyContentToBody ReplyBody.ReplyContent
-    { text = fmOwnerRelayBody (ReplyBody.renderReplyBody body)
-    , images = ReplyBody.replyImageUrls body <> images
-    }
+  "😼 Fixmood：" <> body
 
 fmReplyRelayBody :: Text -> Text
 fmReplyRelayBody body =
   let ReplyBody.ReplyContent{text, images} = ReplyBody.replyContentFromBody body
-      cleanText = stripReplyPrefix text
       prefixedText =
         if Text.null (Text.strip text)
           then ""
-          else if isTypingPracticeBody cleanText then cleanText else "😻 FM：" <> cleanText
+          else "😻 FM：" <> stripReplyPrefix text
   in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
-
-fmReplyBody :: Text -> Text
-fmReplyBody body =
-  let cleanBody = stripReplyPrefix body
-  in if isTypingPracticeBody cleanBody then cleanBody else "😻 FM：" <> cleanBody
-
-isTypingPracticeBody :: Text -> Bool
-isTypingPracticeBody body =
-  "[FM/" `Text.isPrefixOf` Text.stripStart body
-    && "-FM发文" `Text.isInfixOf` body
-
--- Matrix uses the uploaded image's generated filename as the message body.
--- Do not mirror that implementation detail as visible QQ text, while keeping
--- real captions and ordinary filenames intact.
-cleanImageFilenameBody :: [Text] -> Text -> Text
-cleanImageFilenameBody images body
-  | not (null images) && isGeneratedImageFilename body = ""
-  | otherwise = body
-
-cleanImageFilename :: Text -> Text
-cleanImageFilename = cleanImageFilenameBody ["bridge-image"]
-
-isGeneratedImageFilename :: Text -> Bool
-isGeneratedImageFilename value =
-  let normalized = Text.toLower (Text.strip value)
-  in normalized `elem` genericImageFilenames || isHexImageFilename normalized
-
-genericImageFilenames :: [Text]
-genericImageFilenames =
-  [ "image.jpg", "image.jpeg", "image.png", "image.gif", "image.webp"
-  , "image_1.jpg", "image_1.jpeg", "image_1.png", "image_1.gif", "image_1.webp"
-  , "image-1.jpg", "image-1.jpeg", "image-1.png", "image-1.gif", "image-1.webp"
-  ]
-
-isHexImageFilename :: Text -> Bool
-isHexImageFilename value =
-  case Text.breakOnEnd "." value of
-    (stemWithDot, extension)
-      | not (Text.null stemWithDot)
-      , not (Text.null extension)
-      , Text.length (Text.dropEnd 1 stemWithDot) >= 16
-      , Text.all isHexDigit (Text.dropEnd 1 stemWithDot) ->
-          extension `elem` ["jpg", "jpeg", "png", "gif", "webp"]
-    _ -> False
-  where
-    isHexDigit character =
-      character `elem` ['0' .. '9'] || character `elem` ['a' .. 'f'] || character `elem` ['A' .. 'F']
-
--- Agent output on QQ is sent as a standalone FM message. The private target
--- remains in senderId while clearing messageId prevents OneBot reply quoting.
-fmStandaloneMessage :: IncomingMessage -> IncomingMessage
-fmStandaloneMessage message
-  | message.platform == PlatformQQ && message.kind `elem` [ChatGroup, ChatPrivate] =
-      message{messageId = Nothing, replyToMessageId = Nothing, raw = Aeson.Null}
-  | otherwise = message
 
 markFMAgentReply :: IncomingMessage -> IncomingMessage
 markFMAgentReply message =

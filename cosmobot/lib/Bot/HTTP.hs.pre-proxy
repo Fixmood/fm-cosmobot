@@ -19,7 +19,6 @@ import qualified Data.Text as Text
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Client
 import qualified Network.HTTP.Client.TLS as ClientTLS
-import qualified Data.ByteString.Char8 as ByteString
 import Network.HTTP.Req (HttpConfig (..), Option, Req, Url, useHttpsURI, (/:))
 import qualified Network.HTTP.Req as Req
 import qualified Network.TLS as TLS
@@ -60,8 +59,7 @@ httpsEndpointUrl endpoint path = do
 newTlsManager :: IO Client.Manager
 newTlsManager =
   ClientTLS.newTlsManagerWith
-    (Client.managerSetProxy (Client.useProxy (Client.Proxy (ByteString.pack "172.20.0.1") 40123))
-      (ClientTLS.mkManagerSettings tlsSettings Nothing))
+    (ClientTLS.mkManagerSettings tlsSettings Nothing)
       { Client.managerConnCount = sharedManagerConnectionCount
       }
 

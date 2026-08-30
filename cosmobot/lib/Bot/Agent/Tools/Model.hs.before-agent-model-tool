@@ -1,0 +1,62 @@
+{-|
+Module      : Bot.Agent.Tools.Model
+Description : Runtime chat-model selection tools
+Stability   : experimental
+-}
+module Bot.Agent.Tools.Model
+  ( chatModelStatusTool
+  , chatModelSwitchTool
+  , chatModelResetTool
+  )
+where
+
+import Bot.Agent.Tool
+import Bot.Agent.Tools.Common
+import Bot.Agent.Types
+import qualified Bot.Effect.LLM as LLM
+import Bot.Prelude
+import qualified Data.Text as Text
+
+chatModelStatusTool :: LLM.LLM :> es => Tool (Eff es)
+chatModelStatusTool =
+  withDescription "Show FM's current chat model and every configured model profile. Use this when asked which model is active or which models are available."
+  $ tool "chat_model_status" noArguments do
+      models <- LLM.listChatModels
+      pure . toolText $ renderModels models
+
+chatModelSwitchTool :: LLM.LLM :> es => Tool (Eff es)
+chatModelSwitchTool =
+  allowWhen superuserOnly
+  . withDescription "Switch FM's global chat model profile immediately. Use only when the superuser asks to change models. Pass a configured profile name or its exact model id; call chat_model_status first when the target is ambiguous. Never request or expose API keys."
+  $ tool "chat_model_switch"
+      (requiredText "target" "Configured profile name or exact model id returned by chat_model_status.")
+      \target -> do
+        LLM.selectChatModel (Text.strip target) <&> \case
+          Left err -> toolFailure (permanentArgumentFailure err err)
+          Right selected -> toolText ("Switched the global chat model to " <> renderModel selected <> ".")
+
+chatModelResetTool :: LLM.LLM :> es => Tool (Eff es)
+chatModelResetTool =
+  allowWhen superuserOnly
+  . withDescription "Restore FM's global chat model to the default profile from config.toml. Use only when the superuser asks to restore or reset the model."
+  $ tool "chat_model_reset" noArguments do
+      LLM.resetChatModel <&> \case
+        Nothing -> toolFailure (permanentArgumentFailure "No default chat model is configured." "No default chat model is configured.")
+        Just selected -> toolText ("Restored the default chat model: " <> renderModel selected <> ".")
+
+renderModels :: [LLM.ChatModelInfo] -> Text
+renderModels [] =
+  "No chat model profiles are configured."
+renderModels models =
+  Text.unlines
+    ( "Configured chat model profiles:"
+    : [ "- " <> renderModel modelInfo
+          <> if modelInfo.current then " [current]" else ""
+          <> if modelInfo.configuredDefault then " [default]" else ""
+      | modelInfo <- models
+      ]
+    )
+
+renderModel :: LLM.ChatModelInfo -> Text
+renderModel modelInfo =
+  modelInfo.provider <> " (" <> modelInfo.model <> ")"

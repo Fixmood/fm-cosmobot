@@ -23,9 +23,7 @@ module Bot.Agent.Tools.FMDomain
   , fmAiContestLeaderboardImageTool
   , fmCompetitionScoreQueryTool
   , fmCompetitionScoreSummaryTool
-  , fmScoreAnalysisTool
   , fmCompetitionScoreImageTool
-  , fmChartTool
   , fmBotGuardAccountsTool
   , fmDomainStatsTool
   ) where
@@ -430,25 +428,55 @@ fmContestSendTool =
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req POST (http "172.20.0.4" /: "contest" /: "session" /: "start")
-              (ReqBodyJson (Aeson.object
-                [ "platform" Aeson..= chatPlatformKey context.message.platform
-                , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
-                , "requester_id" Aeson..= fromMaybe "" context.message.senderId
-                , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
-                , "query" Aeson..= fromMaybe "" query
-                , "source" Aeson..= fromMaybe "" source
-                , "date" Aeson..= fromMaybe "" competitionDate
-                ])) jsonResponse (port 8077)
-          sendLibrarySegment context (responseBody response :: Aeson.Value)
+            req GET (http "172.20.0.4" /: "contest" /: "pick") NoReqBody jsonResponse
+              ( "q" =: fromMaybe "" query
+                <> "source" =: fromMaybe "" source
+                <> "date" =: fromMaybe "" competitionDate
+                <> port 8077
+              )
+          let value = responseBody response :: Aeson.Value
+              title = fromMaybe "历史赛文" $ AesonTypes.parseMaybe (Aeson.withObject "contest" (\o -> o Aeson..:? "title" Aeson..!= "")) value
+              sourceName = fromMaybe "赛文" $ AesonTypes.parseMaybe (Aeson.withObject "contest" (\o -> o Aeson..:? "source_group" Aeson..!= "")) value
+              contestDate = fromMaybe "日期未知" $ AesonTypes.parseMaybe (Aeson.withObject "contest" (\o -> o Aeson..:? "competition_date" Aeson..!= "")) value
+              body = fromMaybe "" $ AesonTypes.parseMaybe (Aeson.withObject "contest" (\o -> o Aeson..:? "content" Aeson..!= "")) value
+              cleanBody = cleanHistoricalContestBody body title
+              segmentId = fromMaybe (0 :: Int) $ AesonTypes.parseMaybe (Aeson.withObject "contest" (\o -> o Aeson..:? "segment_id" Aeson..!= (0 :: Int))) value
+              message = "[FM/赛文·" <> sourceName <> "] [日期" <> contestDate <> "] 《" <> title <> "》 [字数" <> show (Text.length cleanBody) <> "]\n" <> cleanBody <> "\n-----第" <> show segmentId <> "段-FM发文"
+          if Text.null (Text.strip body)
+            then pure (toolText "没有找到符合条件的历史赛文。")
+            else do
+              sent <- Chat.replyTo context.message message
+              pure . toolText $ case rights sent of
+                _ : _ -> "历史赛文已发送。不要在最终回复中重复正文。"
+                [] -> "历史赛文发送失败：" <> Text.intercalate "；" (lefts sent)
+
+cleanHistoricalContestBody :: Text -> Text -> Text
+cleanHistoricalContestBody rawBody title =
+  Text.intercalate "\n"
+    . reverse
+    . dropWhile (Text.null . Text.strip)
+    . reverse
+    . dropRepeatedTitle
+    . dropWhile (Text.null . Text.strip)
+    . Text.lines
+    $ rawBody
+  where
+    dropRepeatedTitle (firstLine : rest)
+      | normalizedFirst == normalizedTitle = rest
+      | normalizedFirst `Text.isSuffixOf` normalizedTitle = rest
+      | normalizedTitle `Text.isSuffixOf` normalizedFirst = rest
+      where
+        normalizedFirst = Text.strip firstLine
+        normalizedTitle = Text.strip title
+    dropRepeatedTitle bodyLines = bodyLines
 
 fmLiveCompetitionRankTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLiveCompetitionRankTool =
   allowWhen hasExplicitContestIntent
   . noisy
-  . withDescription "Query and send a complete live public typing-contest leaderboard as one PNG image. Use this autonomously when natural language asks for the current or dated leaderboard of 虎杯, a supported group, 极速杯, or 锦标赛. The source may be 虎杯, a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends the complete image itself, so do not repeat the rows in the final response."
+  . withDescription "Query and send a live public typing-contest leaderboard as one or more PNG pages. Use this autonomously when natural language asks for the current or dated leaderboard of a supported group, 极速杯, or 锦标赛. The source may be a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends images itself, so do not repeat the rows in the final response."
   $ tool "fm_live_competition_rank"
-      ( optionalText "source" "Optional public contest source: 虎杯, supported QQ group name/number, 极速杯, or 锦标赛."
+      ( optionalText "source" "Optional public contest source: supported QQ group name/number, 极速杯, or 锦标赛."
       , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
       )
       \source competitionDate -> do
@@ -464,13 +492,16 @@ fmLiveCompetitionRankTool =
               )
           case AesonTypes.parseMaybe parseLiveRank (responseBody response :: Aeson.Value) of
             Nothing -> pure (toolText "实时排行榜查询失败：领域服务返回格式不正确。")
-            Just (status, kind, groupId, actualDate, _, message)
+            Just (status, kind, groupId, actualDate, pageCount, message)
               | status /= "ok" -> pure (toolText ("实时排行榜查询失败：" <> fallback message "公开网站当前没有返回可用数据。"))
               | otherwise -> do
                   let sourceKey = if kind == "group" then groupId else kind
-                      imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
-                        <> "&date=" <> actualDate <> "&combined=1"
-                  sent <- Chat.replyTo context.message (ReplyBody.imageDirective imageUrl)
+                      urls =
+                        [ "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
+                          <> "&date=" <> actualDate <> "&page=" <> show page
+                        | page <- [1 .. max 1 pageCount]
+                        ]
+                  sent <- Chat.replyTo context.message (Text.intercalate "\n" (map ReplyBody.imageDirective urls))
                   pure . toolText $ case rights sent of
                     _ : _ -> "实时排行榜图片已发送。不要在最终回复中重复排行榜内容。"
                     [] -> "实时排行榜已生成，但图片发送失败：" <> Text.intercalate "；" (lefts sent)
@@ -672,40 +703,6 @@ fmCompetitionScoreSummaryTool =
               )
           pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
-fmScoreAnalysisTool :: HTTP.HTTP :> es => Tool (Eff es)
-fmScoreAnalysisTool =
-  withDescription "Analyze the current user's typing performance from live public contest leaderboards and FM's archived typing scores. Use for natural-language questions such as today's contest results, today's typing results, all scores together, comparisons, averages, best results, accuracy below 95%, or a recent date range. The tool resolves the current sender by QQ ID, keeps contest and ordinary typing results separate, and never treats a missing leaderboard row as a zero score. Do not use this for merely sending a leaderboard image."
-  $ tool "fm_score_analysis"
-      ( optionalText "scope" "Optional scope: all, contest, or typing. Defaults to all."
-      , optionalText "start_date" "Optional start date in YYYY-MM-DD format."
-      , optionalText "end_date" "Optional end date in YYYY-MM-DD format; defaults to today in China."
-      , optionalInt "days" "Optional recent calendar-day span from 1 to 3650; ignored when start_date is provided."
-      , optionalText "user_id" "Optional QQ or platform user ID; defaults to the current sender."
-      , optionalText "name" "Optional exact display name; used as a fallback when a public source has no QQ ID."
-      , optionalText "source" "Optional source such as 虎杯, 锦标赛, 极速杯, or 555赛文. Empty means all sources."
-      )
-      \scope startDate endDate requestedDays userId name source -> do
-        context <- askToolContext
-        withCapability context "scores" do
-          let choose values = case filter (not . Text.null . Text.strip) values of
-                value : _ -> value
-                [] -> ""
-              resolvedUserId = choose [fromMaybe "" userId, fromMaybe "" context.message.senderId]
-              resolvedName = choose [fromMaybe "" name, fromMaybe "" context.message.senderUsername]
-              days = fromMaybe 1 requestedDays
-          response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "analysis" /: "scores") NoReqBody jsonResponse
-              ( "user_id" =: resolvedUserId
-                <> "name" =: resolvedName
-                <> "scope" =: fromMaybe "all" scope
-                <> "start_date" =: fromMaybe "" startDate
-                <> "end_date" =: fromMaybe "" endDate
-                <> "days" =: days
-                <> "source" =: fromMaybe "" source
-                <> port 8077
-              )
-          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
-
 fmCompetitionScoreImageTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmCompetitionScoreImageTool =
   noisy
@@ -724,29 +721,6 @@ fmCompetitionScoreImageTool =
           case rights sent of
             _ : _ -> pure (toolText "成绩图片已发送。")
             [] -> pure (toolText ("成绩图片发送失败：" <> Text.intercalate "；" (lefts sent)))
-
-fmChartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
-fmChartTool =
-  withDescription "Generate and send a professional high-resolution PNG chart from preserved contest scores. Use for requests for a score curve, trend chart, history chart, or data visualization; this is a chart tool, not image generation. Resolve the person by QQ ID or display name."
-  $ tool "fm_chart"
-      ( optionalText "user_id" "Optional QQ or platform user ID."
-      , optionalText "name" "Optional display-name fragment."
-      , optionalText "source" "Optional source, such as 虎杯 or 锦标赛."
-      , optionalInt "days" "Optional number of recent calendar days, from 1 to 3650."
-      , optionalText "metric" "Optional metric: speed, accuracy, or keystrokes. Defaults to speed."
-      )
-      \userId name source requestedDays metric -> do
-        context <- askToolContext
-        withCapability context "scores" do
-          let days = max 1 (min 3650 (fromMaybe 30 requestedDays))
-              url = "http://172.20.0.4:8077/reports/score-chart.png?user_id="
-                <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name
-                <> "&source=" <> fromMaybe "" source <> "&days=" <> show days
-                <> "&metric=" <> fromMaybe "speed" metric
-          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
-          case rights sent of
-            _ : _ -> pure (toolText "成绩图表已发送。")
-            [] -> pure (toolText ("成绩图表发送失败：" <> Text.intercalate "；" (lefts sent)))
 
 fmBotGuardAccountsTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmBotGuardAccountsTool =

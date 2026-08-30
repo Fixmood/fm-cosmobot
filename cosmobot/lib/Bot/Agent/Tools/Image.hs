@@ -50,7 +50,6 @@ hasExplicitImageGenerationIntent context =
   any (`Text.isInfixOf` normalized)
     [ "生图", "生成图片", "图片生成", "生成一张图", "生成一张", "画图", "画一张"
     , "做张图", "来张图", "绘制", "出图", "生成头像", "生成海报"
-    , "draw", "create an image", "generate an image", "make an image"
     ]
   where
     normalized = Text.toLower context.input.text

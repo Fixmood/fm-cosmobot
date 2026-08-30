@@ -13,14 +13,13 @@ where
 
 import Bot.Agent.Tools.Chat
 import Bot.Agent.Tools.Audio
-import Bot.Agent.Tools.Emacs
-import Bot.Agent.Tools.Bridge
 import Bot.Agent.Tools.Files
 import Bot.Agent.Tools.FMDomain
 import Bot.Agent.Tools.Image
 import Bot.Agent.Tools.Media
 import Bot.Agent.Tools.Memory
 import Bot.Agent.Tools.Matrix
+import Bot.Agent.Tools.Model
 import Bot.Agent.Tools.Schedule
 import Bot.Agent.Tools.Sandbox
 import Bot.Agent.Tools.Shell
@@ -28,12 +27,9 @@ import Bot.Agent.Tools.Skills
 import Bot.Agent.Tools.SubAgent
 import Bot.Agent.Tools.Continuation
 import Bot.Agent.Tools.Meta
-import Bot.Agent.Tools.Model
 import Bot.Agent.Tools.Python
-import Bot.Agent.Tools.Repository
 import Bot.Agent.Tools.Terminal
 import Bot.Agent.Tools.Time
-import Bot.Agent.Tools.Trigger
 import Bot.Agent.Tools.Typst
 import Bot.Agent.Tools.Web
 import Bot.Agent.Tools.Workspace
@@ -45,7 +41,6 @@ import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.ChatLog as ChatLog
 import qualified Bot.Effect.Concurrency as Concurrency
 import qualified Bot.Effect.HTTP as HTTP
-import qualified Bot.Effect.Lifecycle as Lifecycle
 import qualified Bot.Effect.LLM as LLM
 import qualified Bot.Effect.Media as Media
 import qualified Bot.Effect.Memory as Memory
@@ -66,7 +61,6 @@ defaultTools
   => Chat.Chat :> es
   => ChatLog.ChatLog :> es
   => HTTP.HTTP :> es
-  => Lifecycle.Lifecycle :> es
   => LLM.LLM :> es
   => Media.Media :> es
   => Memory.Memory :> es
@@ -95,7 +89,6 @@ defaultToolsWith
   => Chat.Chat :> es
   => ChatLog.ChatLog :> es
   => HTTP.HTTP :> es
-  => Lifecycle.Lifecycle :> es
   => LLM.LLM :> es
   => Media.Media :> es
   => Memory.Memory :> es
@@ -119,13 +112,7 @@ defaultToolsWith extraTools = tools
   where
     tools =
       [ toolEnableTool
-      , triggerManageTool
-      , fmRepositoryPRTool
-      , accountBalanceTool
-      , chatModelManageTool
-      , chatModelAddTool
-      , chatModelEditTool
-      , chatModelDeleteTool
+      , chatModelStatusTool
       , chatModelSwitchTool
       , chatModelResetTool
       , queryChatLogTool
@@ -134,7 +121,6 @@ defaultToolsWith extraTools = tools
       , webSearchTool
       , webFetchTool
       , datetimeTool
-      , chatModelStatusTool
       , fmGroupStatusTool
       , fmLibrarySearchTool
       , fmLibraryPickTool
@@ -142,22 +128,19 @@ defaultToolsWith extraTools = tools
       , fmLibraryContinueTool
       , fmLibraryContinueSameTool
       , fmLibraryContinuePreviousTool
-      , fmLibraryRecallRecentTool
       , fmLibraryStopTool
+      , fmLibraryRecallRecentTool
       , fmLibraryStatsTool
       , fmRecallQueryTool
       , fmScoreQueryTool
       , fmGroupSetOnlineTool
       , fmGroupSetCapabilityTool
-      , fmBridgeStatusTool
-      , fmBridgeManageTool
-      , fmBridgeTestTool
-      , fmRelayToOwnerTool
-      , fmRelayMessageTool
-      , fmTakeoverManageTool
+      , fmMessageDeliveryTool
       , fmContestSearchTool
-      , fmContestSendTool
+      , fmContestPickTool
       , fmLiveCompetitionRankTool
+      , fmCompetitionHistoryTool
+      , fmCompetitionHistorySyncTool
       , fmLiveCompetitionTextTool
       , fmAiContestTextTool
       , fmAiContestPublishTool
@@ -165,18 +148,15 @@ defaultToolsWith extraTools = tools
       , fmAiContestLeaderboardImageTool
       , fmCompetitionScoreQueryTool
       , fmCompetitionScoreSummaryTool
-      , fmScoreAnalysisTool
       , fmCompetitionScoreImageTool
-      , fmChartTool
       , fmBotGuardAccountsTool
       , fmDomainStatsTool
       , readMediaTextTool
       , mediaToFileTool
       , viewImageTool
       , generateImageTool
-      , editImageTool
-      , generateAudioTool
       , typstRenderTool
+      , generateAudioTool
       , sendReplyTool
       , sendFileTool
       , sendMediaTool
@@ -190,9 +170,6 @@ defaultToolsWith extraTools = tools
       , scheduleTool
       , senderMemoryTool
       , chatMemoryTool
-      , privatePersonaTool
-      , groupPersonaTool
-      , memberStyleTool
       , loadSkillTool
       , sandboxTool
       , commandTool
@@ -202,7 +179,6 @@ defaultToolsWith extraTools = tools
       , captureContinuationTool
       , resumeContinuationTool
       , subagentTool tools
-      , emacsEvalTool
       ] <> extraTools
 
 acpTools :: ACP.ACP :> es => [Tool (Eff es)]

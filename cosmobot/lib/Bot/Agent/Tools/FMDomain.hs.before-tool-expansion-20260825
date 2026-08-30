@@ -14,7 +14,7 @@ module Bot.Agent.Tools.FMDomain
   , fmGroupSetOnlineTool
   , fmGroupSetCapabilityTool
   , fmContestSearchTool
-  , fmContestSendTool
+  , fmContestPickTool
   , fmLiveCompetitionRankTool
   , fmLiveCompetitionTextTool
   , fmAiContestTextTool
@@ -23,9 +23,7 @@ module Bot.Agent.Tools.FMDomain
   , fmAiContestLeaderboardImageTool
   , fmCompetitionScoreQueryTool
   , fmCompetitionScoreSummaryTool
-  , fmScoreAnalysisTool
   , fmCompetitionScoreImageTool
-  , fmChartTool
   , fmBotGuardAccountsTool
   , fmDomainStatsTool
   ) where
@@ -44,7 +42,6 @@ import Bot.Core.Message
   ( ChatPlatform (PlatformQQ)
   , IncomingMessage (..)
   , MessageDigest (..)
-  , MessageInput (..)
   , chatPlatformKey
   , messageIdText
   , textMessageId
@@ -63,13 +60,12 @@ fmGroupStatusTool =
   withDescription "Read FM group status and enabled capabilities from the migrated FM data service."
     $ tool "fm_group_status" noArguments do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "groups") NoReqBody jsonResponse (port 8077)
+        req GET (http "fm-domain" /: "groups") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
 
 fmLibrarySearchTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmLibrarySearchTool =
-  allowWhen hasExplicitLibraryIntent
-  . withDescription "Search FM's migrated typing-practice library by title, topic, or content keyword. Available only when the current user message explicitly asks for typing-practice text, an article, 文来, 发文, or the FM library; never reinterpret an unrelated topic as a library search."
+  withDescription "Search FM's migrated typing-practice library by title, topic, or content keyword."
     $ tool "fm_library_search"
       ( requiredText "query" "Title, topic, or keyword."
       , optionalInt "limit" "Maximum results, from 1 to 30."
@@ -79,27 +75,25 @@ fmLibrarySearchTool =
         withCapability context "library" do
           let limit = max 1 (min 30 (fromMaybe 10 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "library" /: "search") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "library" /: "search") NoReqBody jsonResponse
               ("q" =: query <> "limit" =: limit <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
 
 fmLibraryPickTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmLibraryPickTool =
-  allowWhen hasExplicitLibraryIntent
-  . withDescription "Select one complete typing-practice text from FM's library matching a natural-language source, date, or topic. Available only for an explicit typing-practice article or FM-library request."
+  withDescription "Select one complete typing-practice text from FM's library matching a natural-language topic or title."
     $ tool "fm_library_pick" (requiredText "query" "Desired title, topic, style, or keyword.")
       \query -> do
         context <- askToolContext
         withCapability context "library" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "library" /: "pick") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "library" /: "pick") NoReqBody jsonResponse
               ("q" =: query <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 fmLibraryStartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLibraryStartTool =
-  allowWhen hasExplicitLibraryIntent
-  . withDescription "Start a persistent FM typing-practice article session in the current chat and send its first segment. Use only when the current message explicitly asks FM to send an article, 文来, 发文, 来一篇, or a difficulty command. A topic mentioned in ordinary conversation is not a request to search or send an article. For fm 淼/水/易/普/难/虐, pass that exact character in difficulty and leave query empty; each mode randomly selects only from its strict difficulty interval. The selected mode persists after typing scores. The tool sends the article itself; do not repeat the article body in the final response."
+  withDescription "Start a persistent FM typing-practice article session in the current chat and send its first segment. Use this whenever the user naturally asks FM to send an article, including a topic, title, difficulty, or character count. For fm 淼/水/易/普/难/虐, pass that exact character in difficulty and leave query empty; each mode randomly selects only from its strict difficulty interval. The selected mode persists after typing scores. The tool sends the article itself; do not repeat the article body in the final response."
   $ tool "fm_library_start"
       ( optionalText "query" "Optional title, topic, style, or content keyword. Leave empty for 文来 and difficulty commands."
       , optionalText "difficulty" "Optional strict difficulty mode: 淼、水、易、普、难、虐. Empty means random 文来."
@@ -200,7 +194,7 @@ fmLibraryStatsTool =
   withDescription "Read FM typing-practice library statistics, including total texts, characters, difficulty indexing, and active article sessions."
   $ tool "fm_library_stats" noArguments do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
+        req GET (http "fm-domain" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 librarySessionPayload :: Context -> Aeson.Value
@@ -241,7 +235,7 @@ libraryStartPayload context query difficulty length =
 postLibrarySession :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postLibrarySession action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "library" /: "session" /: action)
+    req POST (http "fm-domain" /: "library" /: "session" /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -307,7 +301,7 @@ standaloneLibraryMessage message =
     , raw = Aeson.Null
     }
 
-fmRecallQueryTool :: (HTTP.HTTP :> es, Chat.Chat :> es) => Tool (Eff es)
+fmRecallQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmRecallQueryTool =
   withDescription "Query original QQ messages captured before recall. Use natural-language criteria; all users may query recall records."
     $ tool "fm_recall_query"
@@ -318,22 +312,12 @@ fmRecallQueryTool =
         context <- askToolContext
         withCapability context "recall" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "recalls") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "recalls") NoReqBody jsonResponse
               ( "group_id" =: fromMaybe "" groupId
                 <> "q" =: fromMaybe "" query
                 <> port 8077
               )
-          let records = responseBody response :: [Aeson.Value]
-              imageUrls = concatMap recallImageUrls records
-          when (not (null imageUrls)) $
-            void $ Chat.replyTo context.message
-              (Text.intercalate "\n" (map ReplyBody.imageDirective imageUrls))
-          pure . toolText . jsonText $ records
-
-recallImageUrls :: Aeson.Value -> [Text]
-recallImageUrls =
-  fromMaybe [] . AesonTypes.parseMaybe
-    (Aeson.withObject "FM recall record" (\o -> o Aeson..:? "image_urls" Aeson..!= []))
+          pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
 
 fmScoreQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmScoreQueryTool =
@@ -348,7 +332,7 @@ fmScoreQueryTool =
         withCapability context "scores" do
           let limit = max 1 (min 100 (fromMaybe 20 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "scores") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "scores") NoReqBody jsonResponse
               ( "group_id" =: fromMaybe "" groupId
                 <> "sender_id" =: fromMaybe "" senderId
                 <> "limit" =: limit
@@ -366,7 +350,7 @@ fmGroupSetOnlineTool =
       )
       \groupId online -> do
         response <- HTTP.runReq $
-          req POST (http "172.20.0.4" /: "group-state")
+          req POST (http "fm-domain" /: "group-state")
             (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
             jsonResponse
             (port 8077)
@@ -383,7 +367,7 @@ fmGroupSetCapabilityTool =
       )
       \groupId capability enabled -> do
         response <- HTTP.runReq $
-          req POST (http "172.20.0.4" /: "group-capability")
+          req POST (http "fm-domain" /: "group-capability")
             (ReqBodyJson (Aeson.object
               [ "group_id" Aeson..= groupId
               , "capability" Aeson..= capability
@@ -395,8 +379,7 @@ fmGroupSetCapabilityTool =
 
 fmContestSearchTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmContestSearchTool =
-  allowWhen hasExplicitContestIntent
-  . withDescription "Search FM's preserved typing-contest text library by source group, date, title, topic, or content. Available only when the current message literally mentions a typing contest, 赛文, 比赛, 赛事, 555, a named cup, or a leaderboard. Role-play words such as 案子, 案件, 卷宗, 侦探, or 调查 never mean contest text."
+  withDescription "Search FM's preserved contest-text library by source group, date, title, topic, or content."
     $ tool "fm_contest_search"
       ( optionalText "query" "Optional title, topic, or content keyword."
       , optionalText "source" "Optional source group or contest name."
@@ -408,7 +391,7 @@ fmContestSearchTool =
         withCapability context "contest" do
           let limit = max 1 (min 30 (fromMaybe 10 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "contest" /: "search") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "contest" /: "search") NoReqBody jsonResponse
               ( "q" =: fromMaybe "" query
                 <> "source" =: fromMaybe "" source
                 <> "date" =: fromMaybe "" competitionDate
@@ -417,11 +400,10 @@ fmContestSearchTool =
               )
           pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
 
-fmContestSendTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
-fmContestSendTool =
-  allowWhen hasExplicitContestIntent
-  . withDescription "Send one complete preserved historical typing-contest text matching a source, date, title, or topic. This is FM's dedicated historical contest sending tool for requests to发/来一篇/练一篇历史赛文, or when the user does not ask for today's/current/online text. For today/current/online contest text use fm_live_competition_text. The tool sends the complete text itself, so do not repeat it."
-    $ tool "fm_contest_send"
+fmContestPickTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmContestPickTool =
+  withDescription "Select one complete preserved contest text matching a natural-language source, date, or topic."
+    $ tool "fm_contest_pick"
       ( optionalText "query" "Optional title, topic, or content keyword."
       , optionalText "source" "Optional source group or contest name."
       , optionalText "date" "Optional date in YYYY-MM-DD format."
@@ -430,32 +412,27 @@ fmContestSendTool =
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req POST (http "172.20.0.4" /: "contest" /: "session" /: "start")
-              (ReqBodyJson (Aeson.object
-                [ "platform" Aeson..= chatPlatformKey context.message.platform
-                , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
-                , "requester_id" Aeson..= fromMaybe "" context.message.senderId
-                , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
-                , "query" Aeson..= fromMaybe "" query
-                , "source" Aeson..= fromMaybe "" source
-                , "date" Aeson..= fromMaybe "" competitionDate
-                ])) jsonResponse (port 8077)
-          sendLibrarySegment context (responseBody response :: Aeson.Value)
+            req GET (http "fm-domain" /: "contest" /: "pick") NoReqBody jsonResponse
+              ( "q" =: fromMaybe "" query
+                <> "source" =: fromMaybe "" source
+                <> "date" =: fromMaybe "" competitionDate
+                <> port 8077
+              )
+          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 fmLiveCompetitionRankTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLiveCompetitionRankTool =
-  allowWhen hasExplicitContestIntent
-  . noisy
-  . withDescription "Query and send a complete live public typing-contest leaderboard as one PNG image. Use this autonomously when natural language asks for the current or dated leaderboard of 虎杯, a supported group, 极速杯, or 锦标赛. The source may be 虎杯, a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends the complete image itself, so do not repeat the rows in the final response."
+  noisy
+  . withDescription "Query and send a live public typing-contest leaderboard as one or more PNG pages. Use this autonomously when natural language asks for the current or dated leaderboard of a supported group, 极速杯, or 锦标赛. The source may be a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends images itself, so do not repeat the rows in the final response."
   $ tool "fm_live_competition_rank"
-      ( optionalText "source" "Optional public contest source: 虎杯, supported QQ group name/number, 极速杯, or 锦标赛."
+      ( optionalText "source" "Optional public contest source: supported QQ group name/number, 极速杯, or 锦标赛."
       , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
       )
       \source competitionDate -> do
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "live") NoReqBody jsonResponse
               ( "source" =: fromMaybe "" source
                 <> "group_id" =: contextChatId context
                 <> "date" =: fromMaybe "" competitionDate
@@ -464,13 +441,16 @@ fmLiveCompetitionRankTool =
               )
           case AesonTypes.parseMaybe parseLiveRank (responseBody response :: Aeson.Value) of
             Nothing -> pure (toolText "实时排行榜查询失败：领域服务返回格式不正确。")
-            Just (status, kind, groupId, actualDate, _, message)
+            Just (status, kind, groupId, actualDate, pageCount, message)
               | status /= "ok" -> pure (toolText ("实时排行榜查询失败：" <> fallback message "公开网站当前没有返回可用数据。"))
               | otherwise -> do
                   let sourceKey = if kind == "group" then groupId else kind
-                      imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
-                        <> "&date=" <> actualDate <> "&combined=1"
-                  sent <- Chat.replyTo context.message (ReplyBody.imageDirective imageUrl)
+                      urls =
+                        [ "http://fm-domain:8077/reports/live-competition.png?source=" <> sourceKey
+                          <> "&date=" <> actualDate <> "&page=" <> show page
+                        | page <- [1 .. max 1 pageCount]
+                        ]
+                  sent <- Chat.replyTo context.message (Text.intercalate "\n" (map ReplyBody.imageDirective urls))
                   pure . toolText $ case rights sent of
                     _ : _ -> "实时排行榜图片已发送。不要在最终回复中重复排行榜内容。"
                     [] -> "实时排行榜已生成，但图片发送失败：" <> Text.intercalate "；" (lefts sent)
@@ -488,8 +468,7 @@ fmLiveCompetitionRankTool =
 
 fmLiveCompetitionTextTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLiveCompetitionTextTool =
-  allowWhen hasExplicitLiveContestIntent
-  . withDescription "Fetch and send the exact live public typing-contest text for a supported group or 极速杯. Use only when the current message explicitly asks for 赛文, 比赛文章, 赛事文本, or a named typing contest. Never treat 案子, 案件, 卷宗, 侦探, or other persona metaphors as a contest request. 锦标赛 does not expose its text. The tool sends the exact text itself, so do not rewrite or repeat it."
+  withDescription "Fetch and send the exact live public typing-contest text for a supported group or 极速杯. Use this autonomously when natural language asks to view or send today's or a dated public contest text. 锦标赛 does not expose its text. The source may be a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends the exact text itself, so do not rewrite or repeat it."
   $ tool "fm_live_competition_text"
       ( optionalText "source" "Optional public contest source: supported QQ group name/number, 极速杯, or 锦标赛."
       , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
@@ -498,7 +477,7 @@ fmLiveCompetitionTextTool =
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "live" /: "text") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "live" /: "text") NoReqBody jsonResponse
               ( "source" =: fromMaybe "" source
                 <> "group_id" =: contextChatId context
                 <> "date" =: fromMaybe "" competitionDate
@@ -507,48 +486,20 @@ fmLiveCompetitionTextTool =
               )
           case AesonTypes.parseMaybe parseLiveText (responseBody response :: Aeson.Value) of
             Nothing -> pure (toolText "实时赛文查询失败：领域服务返回格式不正确。")
-            Just (status, sourceName, title, wordNumber, body, message)
+            Just (status, message)
               | status /= "ok" -> pure (toolText ("实时赛文查询失败：" <> fallback message "公开网站当前没有返回赛文正文。"))
-              | Text.null (Text.strip body) -> pure (toolText "实时赛文查询失败：公开网站返回了空正文。")
+              | Text.null (Text.strip message) -> pure (toolText "实时赛文查询失败：公开网站返回了空正文。")
               | otherwise -> do
-                  let displaySource = fromMaybe sourceName source
-                      formatted =
-                        "[FM/赛文·" <> contestDisplayName displaySource <> "] 《" <> title <> "》 [字数" <> show wordNumber <> "]\n\n"
-                          <> body <> "\n\n-----第" <> contestShortName displaySource <> "段-FM发文"
-                  sent <- Chat.replyTo context.message formatted
+                  sent <- Chat.replyTo context.message message
                   pure . toolText $ case rights sent of
                     _ : _ -> "实时赛文已发送。不要在最终回复中重复正文。"
                     [] -> "实时赛文已取得，但发送失败：" <> Text.intercalate "；" (lefts sent)
   where
-    parseLiveText :: Aeson.Value -> AesonTypes.Parser (Text, Text, Text, Int, Text, Text)
+    parseLiveText :: Aeson.Value -> AesonTypes.Parser (Text, Text)
     parseLiveText = Aeson.withObject "FM live competition text" \o ->
-      (,,,,,)
+      (,)
         <$> o Aeson..: "status"
-        <*> o Aeson..:? "source" Aeson..!= ""
-        <*> o Aeson..:? "title" Aeson..!= "实时赛文"
-        <*> o Aeson..:? "word_number" Aeson..!= 0
-        <*> (cleanLiveCompetitionBody
-          <$> o Aeson..:? "content" Aeson..!= ""
-          <*> o Aeson..:? "title" Aeson..!= "")
         <*> o Aeson..:? "message" Aeson..!= ""
-    cleanLiveCompetitionBody rawBody title =
-      Text.intercalate "\n" . dropTrailingEmptyLines . dropTrailingMarker . dropTitle . Text.lines $ rawBody
-      where
-        dropTitle (firstLine : rest)
-          | Text.strip firstLine == Text.strip title = rest
-        dropTitle lines = lines
-        dropTrailingMarker = reverse . dropWhile (\line -> "-----" `Text.isPrefixOf` Text.strip line) . reverse
-        dropTrailingEmptyLines = reverse . dropWhile Text.null . reverse
-    contestDisplayName sourceName
-      | "极速杯" `Text.isInfixOf` sourceName = "极速杯"
-      | "虎杯" `Text.isInfixOf` sourceName = "虎杯"
-      | "锦标赛" `Text.isInfixOf` sourceName = "锦标赛"
-      | otherwise = "赛文"
-    contestShortName sourceName
-      | "极速杯" `Text.isInfixOf` sourceName = "jsb"
-      | "虎杯" `Text.isInfixOf` sourceName = "hb"
-      | "锦标赛" `Text.isInfixOf` sourceName = "jb"
-      | otherwise = "sw"
     fallback value defaultValue = if Text.null (Text.strip value) then defaultValue else value
 
 contextChatId :: Context -> Text
@@ -556,21 +507,19 @@ contextChatId context = maybe "" show context.message.chatId
 
 fmAiContestTextTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmAiContestTextTool =
-  allowWhen hasExplicitContestIntent
-  . withDescription "Read FM's persisted daily AI typing-contest text. Available only for an explicit AI赛文 or 555 request; ordinary cases and detective role-play are unrelated. When date is omitted, return the latest saved text."
+  withDescription "Read FM's persisted daily AI contest text. When date is omitted, return the latest saved text."
     $ tool "fm_ai_contest_text" (optionalText "date" "Optional date in YYYY-MM-DD format.")
       \competitionDate -> do
         context <- askToolContext
         withCapability context "ai_contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "ai-contest" /: "text") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "ai-contest" /: "text") NoReqBody jsonResponse
               ("date" =: fromMaybe "" competitionDate <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 fmAiContestPublishTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmAiContestPublishTool =
-  allowWhen hasExplicitContestIntent
-  . withDescription "Publish and send FM's daily AI typing contest text (segment 555). Use when the user naturally asks for today's AI contest text or uses the retained 555 workflow. If today's text already exists it is reused. When absent, provide a newly written 300-to-800-character Chinese typing text as body. The tool sends the text itself; do not repeat it in the final response."
+  withDescription "Publish and send FM's daily AI typing contest text (segment 555). Use when the user naturally asks for today's AI contest text or uses the retained 555 workflow. If today's text already exists it is reused. When absent, provide a newly written 300-to-800-character Chinese typing text as body. The tool sends the text itself; do not repeat it in the final response."
   $ tool "fm_ai_contest_publish"
       ( requiredText "body" "A newly written 300-to-800-character Chinese typing text, used only if the requested date has no saved text."
       , optionalText "title" "Optional short title."
@@ -581,7 +530,7 @@ fmAiContestPublishTool =
         context <- askToolContext
         withCapability context "ai_contest" do
           response <- HTTP.runReq $
-            req POST (http "172.20.0.4" /: "ai-contest" /: "text")
+            req POST (http "fm-domain" /: "ai-contest" /: "text")
               (ReqBodyJson (Aeson.object
                 [ "body" Aeson..= body
                 , "title" Aeson..= fromMaybe "" title
@@ -591,39 +540,28 @@ fmAiContestPublishTool =
               jsonResponse (port 8077)
           sendAiContestText context (responseBody response :: Aeson.Value)
 
-fmAiContestLeaderboardTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmAiContestLeaderboardTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmAiContestLeaderboardTool =
-  allowWhen hasExplicitContestIntent
-  . withDescription "Read FM's persisted 555 AI contest leaderboard for one date, keeping each participant's best score."
+  noisy
+  . withDescription "Send FM's persisted 555 AI contest leaderboard as a PNG image. This is the required response for requests such as today's AI contest leaderboard or 555 ranking. Do not fetch the JSON and do not summarize or repeat the rows as text."
     $ tool "fm_ai_contest_leaderboard" (optionalText "date" "Optional date in YYYY-MM-DD format.")
       \competitionDate -> do
         context <- askToolContext
         withCapability context "ai_contest" do
-          response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
-              ("date" =: fromMaybe "" competitionDate <> port 8077)
-          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+          let url = "http://fm-domain:8077/reports/ai-leaderboard.png?date=" <> fromMaybe "" competitionDate
+          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
+          pure . toolText $ case rights sent of
+            _ : _ -> "AI 赛文排行榜图片已发送。不要在最终回复中重复排行榜内容。"
+            [] -> "AI 赛文排行榜图片发送失败：" <> Text.intercalate "；" (lefts sent)
 
 fmAiContestLeaderboardImageTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmAiContestLeaderboardImageTool =
-  allowWhen hasExplicitContestIntent
-  . withDescription "Generate and send FM's persisted 555 AI contest leaderboard as a PNG image to the current chat."
+  withDescription "Generate and send FM's persisted 555 AI contest leaderboard as a PNG image to the current chat."
     $ tool "fm_ai_contest_leaderboard_image" (optionalText "date" "Optional date in YYYY-MM-DD format.")
       \competitionDate -> do
         context <- askToolContext
         withCapability context "ai_contest" do
-          resolvedDate <- case Text.strip <$> competitionDate of
-            Just date | not (Text.null date) -> pure date
-            _ -> do
-              response <- HTTP.runReq $
-                req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
-                  (port 8077)
-              pure $ fromMaybe "" $ AesonTypes.parseMaybe
-                (Aeson.withObject "FM AI leaderboard" (Aeson..: "date"))
-                (responseBody response :: Aeson.Value)
-          let cacheKey = fromMaybe "refresh" (messageIdText <$> context.message.messageId)
-              url = "http://172.20.0.4:8077/reports/ai-leaderboard.png?date="
-                <> resolvedDate <> "&v=" <> cacheKey
+          let url = "http://fm-domain:8077/reports/ai-leaderboard.png?date=" <> fromMaybe "" competitionDate
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _:_ -> pure (toolText "Leaderboard image sent successfully.")
@@ -643,7 +581,7 @@ fmCompetitionScoreQueryTool =
         withCapability context "scores" do
           let limit = max 1 (min 100 (fromMaybe 20 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "scores") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "scores") NoReqBody jsonResponse
               ( "user_id" =: fromMaybe "" userId
                 <> "name" =: fromMaybe "" name
                 <> "source" =: fromMaybe "" source
@@ -664,43 +602,9 @@ fmCompetitionScoreSummaryTool =
         context <- askToolContext
         withCapability context "scores" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "summary") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "summary") NoReqBody jsonResponse
               ( "user_id" =: fromMaybe "" userId
                 <> "name" =: fromMaybe "" name
-                <> "source" =: fromMaybe "" source
-                <> port 8077
-              )
-          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
-
-fmScoreAnalysisTool :: HTTP.HTTP :> es => Tool (Eff es)
-fmScoreAnalysisTool =
-  withDescription "Analyze the current user's typing performance from live public contest leaderboards and FM's archived typing scores. Use for natural-language questions such as today's contest results, today's typing results, all scores together, comparisons, averages, best results, accuracy below 95%, or a recent date range. The tool resolves the current sender by QQ ID, keeps contest and ordinary typing results separate, and never treats a missing leaderboard row as a zero score. Do not use this for merely sending a leaderboard image."
-  $ tool "fm_score_analysis"
-      ( optionalText "scope" "Optional scope: all, contest, or typing. Defaults to all."
-      , optionalText "start_date" "Optional start date in YYYY-MM-DD format."
-      , optionalText "end_date" "Optional end date in YYYY-MM-DD format; defaults to today in China."
-      , optionalInt "days" "Optional recent calendar-day span from 1 to 3650; ignored when start_date is provided."
-      , optionalText "user_id" "Optional QQ or platform user ID; defaults to the current sender."
-      , optionalText "name" "Optional exact display name; used as a fallback when a public source has no QQ ID."
-      , optionalText "source" "Optional source such as 虎杯, 锦标赛, 极速杯, or 555赛文. Empty means all sources."
-      )
-      \scope startDate endDate requestedDays userId name source -> do
-        context <- askToolContext
-        withCapability context "scores" do
-          let choose values = case filter (not . Text.null . Text.strip) values of
-                value : _ -> value
-                [] -> ""
-              resolvedUserId = choose [fromMaybe "" userId, fromMaybe "" context.message.senderId]
-              resolvedName = choose [fromMaybe "" name, fromMaybe "" context.message.senderUsername]
-              days = fromMaybe 1 requestedDays
-          response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "analysis" /: "scores") NoReqBody jsonResponse
-              ( "user_id" =: resolvedUserId
-                <> "name" =: resolvedName
-                <> "scope" =: fromMaybe "all" scope
-                <> "start_date" =: fromMaybe "" startDate
-                <> "end_date" =: fromMaybe "" endDate
-                <> "days" =: days
                 <> "source" =: fromMaybe "" source
                 <> port 8077
               )
@@ -718,35 +622,12 @@ fmCompetitionScoreImageTool =
       \userId name source -> do
         context <- askToolContext
         withCapability context "scores" do
-          let url = "http://172.20.0.4:8077/reports/competition-score.png?user_id="
+          let url = "http://fm-domain:8077/reports/competition-score.png?user_id="
                 <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name <> "&source=" <> fromMaybe "" source
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _ : _ -> pure (toolText "成绩图片已发送。")
             [] -> pure (toolText ("成绩图片发送失败：" <> Text.intercalate "；" (lefts sent)))
-
-fmChartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
-fmChartTool =
-  withDescription "Generate and send a professional high-resolution PNG chart from preserved contest scores. Use for requests for a score curve, trend chart, history chart, or data visualization; this is a chart tool, not image generation. Resolve the person by QQ ID or display name."
-  $ tool "fm_chart"
-      ( optionalText "user_id" "Optional QQ or platform user ID."
-      , optionalText "name" "Optional display-name fragment."
-      , optionalText "source" "Optional source, such as 虎杯 or 锦标赛."
-      , optionalInt "days" "Optional number of recent calendar days, from 1 to 3650."
-      , optionalText "metric" "Optional metric: speed, accuracy, or keystrokes. Defaults to speed."
-      )
-      \userId name source requestedDays metric -> do
-        context <- askToolContext
-        withCapability context "scores" do
-          let days = max 1 (min 3650 (fromMaybe 30 requestedDays))
-              url = "http://172.20.0.4:8077/reports/score-chart.png?user_id="
-                <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name
-                <> "&source=" <> fromMaybe "" source <> "&days=" <> show days
-                <> "&metric=" <> fromMaybe "speed" metric
-          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
-          case rights sent of
-            _ : _ -> pure (toolText "成绩图表已发送。")
-            [] -> pure (toolText ("成绩图表发送失败：" <> Text.intercalate "；" (lefts sent)))
 
 fmBotGuardAccountsTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmBotGuardAccountsTool =
@@ -759,7 +640,7 @@ fmBotGuardAccountsTool =
       )
       \action accountId label -> do
         response <- HTTP.runReq $
-          req POST (http "172.20.0.4" /: "bot-guard" /: "accounts")
+          req POST (http "fm-domain" /: "bot-guard" /: "accounts")
             (ReqBodyJson (Aeson.object
               [ "action" Aeson..= action
               , "account_id" Aeson..= fromMaybe "" accountId
@@ -799,48 +680,15 @@ fmDomainStatsTool =
   withDescription "Read record counts for FM's migrated library, contest, score, recall, and group data."
     $ tool "fm_domain_stats" noArguments do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "stats") NoReqBody jsonResponse (port 8077)
+        req GET (http "fm-domain" /: "stats") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
-
-hasExplicitLibraryIntent :: Context -> Bool
-hasExplicitLibraryIntent context =
-  not (hasExplicitContestIntent context)
-    && (any (`Text.isInfixOf` normalized) libraryTerms || isDifficultyCommand normalized)
-  where
-    normalized = Text.toLower . Text.filter (not . (`elem` [' ', '\t', '\r', '\n'])) $ context.input.text
-    libraryTerms =
-      [ "发文", "文来", "来一篇", "发一篇", "文章", "练习文", "文库"
-      , "续文", "续段", "上一篇", "这篇文", "停止发文", "单字练习"
-      ]
-    isDifficultyCommand input =
-      any (`Text.isInfixOf` input)
-        [ "fm淼", "fm水", "fm易", "fm普", "fm难", "fm虐"
-        , "fm，淼", "fm，水", "fm，易", "fm，普", "fm，难", "fm，虐"
-        ]
-
-hasExplicitContestIntent :: Context -> Bool
-hasExplicitContestIntent context =
-  any (`Text.isInfixOf` normalized) contestTerms
-  where
-    normalized = Text.toLower context.input.text
-    contestTerms =
-      [ "赛文", "比赛", "赛事", "555", "虎杯", "极速杯", "锦标赛"
-      , "群赛", "赛榜", "排行榜", "ai赛文"
-      ]
-
-hasExplicitLiveContestIntent :: Context -> Bool
-hasExplicitLiveContestIntent context =
-  hasExplicitContestIntent context && any (`Text.isInfixOf` normalized) liveTerms
-  where
-    normalized = Text.toLower context.input.text
-    liveTerms = ["今天", "当天", "当前", "实时", "在线", "官网", "公开", "最新"]
 
 withCapability :: HTTP.HTTP :> es => Context -> Text -> Eff es ToolResult -> Eff es ToolResult
 withCapability context capability action =
   case context.message of
     IncomingMessage{platform = PlatformQQ, chatId = Just groupId} -> do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "group-capability") NoReqBody jsonResponse
+        req GET (http "fm-domain" /: "group-capability") NoReqBody jsonResponse
           ("group_id" =: (show groupId :: Text) <> "capability" =: capability <> port 8077)
       let enabled = fromMaybe True $ AesonTypes.parseMaybe
             (Aeson.withObject "FM group capability" (Aeson..: "enabled"))

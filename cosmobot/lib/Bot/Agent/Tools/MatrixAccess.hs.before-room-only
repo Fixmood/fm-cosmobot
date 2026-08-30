@@ -1,0 +1,123 @@
+module Bot.Agent.Tools.MatrixAccess
+  ( matrixAccessTool
+  )
+where
+
+import Bot.Agent.Tool
+import Bot.Agent.Tools.Common
+import Bot.Agent.Types
+import Bot.Core.Message (ChatKind (ChatPrivate), ChatPlatform (PlatformMatrix), IncomingMessage (..))
+import Bot.Prelude
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.Types as AesonTypes
+import qualified Data.List as List
+import qualified Data.Text as Text
+import qualified Data.Text.IO as TextIO
+import qualified System.Directory as Directory
+
+matrixOverridePath :: FilePath
+matrixOverridePath = "/data/matrix-room-overrides.txt"
+
+matrixAccessTool :: (IOE :> es) => Tool (Eff es)
+matrixAccessTool =
+  allowWhen matrixAccessSuperuser
+  . withDescription "Manage Matrix access for the current room. Only the owner can use this. Actions: view, open, close, open_private, close_private. Natural-language mappings: '开放当前房间' -> open, '关闭当前房间' -> close, '开放我的私聊' -> open_private, '关闭我的私聊' -> close_private. open/close manage the current room; private actions only work inside the owner's one-to-one private chat."
+  $ tool "matrix_access"
+      (parsedArguments
+        (objectSchema
+          [ fieldText "action" "One of: view, open, close, open_private, close_private."
+          ]
+          ["action"])
+        parseMatrixAccessAction)
+      runMatrixAccess
+
+matrixAccessSuperuser :: Context -> Bool
+matrixAccessSuperuser context =
+  superuserOnly context && context.message.platform == PlatformMatrix
+
+data MatrixAccessAction
+  = MatrixAccessView
+  | MatrixAccessOpen
+  | MatrixAccessClose
+  | MatrixAccessOpenPrivate
+  | MatrixAccessClosePrivate
+
+parseMatrixAccessAction :: Aeson.Value -> AesonTypes.Parser MatrixAccessAction
+parseMatrixAccessAction = Aeson.withObject "matrix_access arguments" $ \object -> do
+  action <- Text.toLower . Text.strip <$> object Aeson..: Key.fromText "action"
+  case action of
+    "view" -> pure MatrixAccessView
+    "open" -> pure MatrixAccessOpen
+    "close" -> pure MatrixAccessClose
+    "open_private" -> pure MatrixAccessOpenPrivate
+    "close_private" -> pure MatrixAccessClosePrivate
+    _ -> fail "action must be one of: view, open, close"
+
+runMatrixAccess action = do
+  context <- askToolContext
+  case viaNonEmpty head context.message.chatAliases of
+    Nothing -> pure (toolText "当前消息没有 Matrix 房间 ID，无法管理房间权限。")
+    Just roomId -> do
+      let room = Text.strip roomId
+      if not ("!" `Text.isPrefixOf` room)
+        then pure (toolText "当前消息不是可管理的 Matrix 房间。")
+        else do
+          current <- liftIO readOverrides
+          case action of
+            MatrixAccessView ->
+              pure (toolText (renderStatus room current))
+            MatrixAccessOpen -> do
+              liftIO (writeOverrides (updateOverride room True current))
+              pure (toolText ("已开放当前 Matrix 房间：" <> room))
+            MatrixAccessClose -> do
+              liftIO (writeOverrides (updateOverride room False current))
+              pure (toolText ("已关闭当前 Matrix 房间：" <> room))
+            MatrixAccessOpenPrivate
+              | context.message.kind /= ChatPrivate ->
+                  pure (toolText "“开放我的私聊”只能在你与 FM 的一对一 Matrix 私聊中使用。")
+              | otherwise -> do
+                  liftIO (writeOverrides (updateOverride room True current))
+                  pure (toolText "已开放你与 FM 的一对一 Matrix 私聊。")
+            MatrixAccessClosePrivate
+              | context.message.kind /= ChatPrivate ->
+                  pure (toolText "“关闭我的私聊”只能在你与 FM 的一对一 Matrix 私聊中使用。")
+              | otherwise -> do
+                  liftIO (writeOverrides (updateOverride room False current))
+                  pure (toolText "已关闭你与 FM 的一对一 Matrix 私聊。")
+
+data Override = OverrideOpen | OverrideClosed
+  deriving (Eq)
+
+readOverrides :: IO [(Text, Override)]
+readOverrides = do
+  exists <- Directory.doesFileExist matrixOverridePath
+  if not exists
+    then pure []
+    else parseOverrides <$> Text.lines <$> TextIO.readFile matrixOverridePath
+
+parseOverrides :: [Text] -> [(Text, Override)]
+parseOverrides = mapMaybe \line ->
+  case Text.uncons (Text.strip line) of
+    Just ('+', room) | not (Text.null room) -> Just (room, OverrideOpen)
+    Just ('-', room) | not (Text.null room) -> Just (room, OverrideClosed)
+    _ -> Nothing
+
+updateOverride :: Text -> Bool -> [(Text, Override)] -> [(Text, Override)]
+updateOverride room open overrides =
+  (room, if open then OverrideOpen else OverrideClosed)
+    : filter ((/= room) . fst) overrides
+
+writeOverrides :: [(Text, Override)] -> IO ()
+writeOverrides overrides =
+  TextIO.writeFile matrixOverridePath $ Text.unlines
+    [ (if status == OverrideOpen then "+" else "-") <> room
+    | (room, status) <- overrides
+    ]
+
+renderStatus :: Text -> [(Text, Override)] -> Text
+renderStatus room overrides =
+  case List.lookup room overrides of
+    Just OverrideOpen -> "当前 Matrix 房间已开放：" <> room
+    Just OverrideClosed -> "当前 Matrix 房间已关闭：" <> room
+    Nothing -> "当前 Matrix 房间使用默认白名单：" <> room

@@ -1,0 +1,94 @@
+module Bot.Agent.Tools.Bridge
+  ( fmBridgeStatusTool
+  , fmBridgeTestTool
+  ) where
+
+import Bot.Agent.Tool
+import Bot.Agent.Tools.Common
+  ( fieldBoolean
+  , jsonText
+  , optionalText
+  , superuserOnly
+  )
+import Bot.Agent.Types (Context (..), toolText)
+import qualified Bot.Chat.Bridge.FM as FMBridge
+import Bot.Core.Message
+  ( ChatKind (ChatGroup)
+  , ChatPlatform (PlatformQQ)
+  , IncomingMessage (..)
+  , MessageDigest (..)
+  )
+import qualified Bot.Effect.Chat as Chat
+import Bot.Prelude
+import qualified Data.Aeson as Aeson
+import qualified Data.Text as Text
+
+fmBridgeStatusTool :: Tool (Eff es)
+fmBridgeStatusTool =
+  allowWhen superuserOnly
+  . withDescription "Inspect FM's Matrix-to-QQ bridge mapping and behavior without sending a message. Use this when the owner asks whether the bridge is configured or how it currently routes messages. This reports configuration, not live delivery health; use fm_bridge_test for an end-to-end check."
+  $ tool "fm_bridge_status" noArguments do
+      context <- askToolContext
+      pure . toolText . jsonText $ Aeson.object
+        [ "configured" Aeson..= True
+        , "matrix_room_id" Aeson..= FMBridge.fmMatrixRoomId
+        , "qq_group_id" Aeson..= FMBridge.fmQQGroupId
+        , "owner_matrix_id" Aeson..= FMBridge.fmOwnerMatrixId
+        , "owner_qq_id" Aeson..= FMBridge.fmOwnerQQId
+        , "owner_messages_matrix_to_qq" Aeson..= True
+        , "fm_replies_matrix_and_qq" Aeson..= True
+        , "loop_protection" Aeson..= True
+        , "current_message_uses_bridge_pipeline" Aeson..= FMBridge.usesMatrixReplyPipeline context.message
+        , "live_delivery_health" Aeson..= ("not_tested" :: Text)
+        ]
+
+fmBridgeTestTool :: Chat.Chat :> es => Tool (Eff es)
+fmBridgeTestTool =
+  noisy
+  . allowWhen superuserOnly
+  . withDescription "Run one end-to-end FM bridge test by sending a short marked message to both the configured Matrix room and QQ group through the real bridge pipeline. Only call when the owner explicitly asks to test the bridge. Set confirm=true only for that explicit request. Never use arbitrary user content as a relay."
+  $ tool "fm_bridge_test"
+      ( requiredArgument (fieldBoolean "confirm" "Must be true after the owner explicitly asks to send a bridge test message.") :: ToolArgument Bool
+      , optionalText "label" "Optional short diagnostic label, limited to 40 characters."
+      )
+      \confirm label -> do
+        context <- askToolContext
+        if not confirm
+          then pure (toolText "桥接测试未发送：需要主人明确要求测试，并将 confirm 设为 true。")
+          else do
+            let cleanLabel = Text.take 40 . Text.filter (`notElem` ['\r', '\n']) . Text.strip $ fromMaybe "手动检查" label
+                body = "【FM桥接测试】" <> cleanLabel
+                target = bridgeTestTarget context.message
+            results <- Chat.replyTo target body
+            let errors = lefts results
+                deliveries = mapMaybe FMBridge.bridgeDeliveryTargets (rights results)
+                matrixDelivered = not (null deliveries)
+                qqDelivered = any (not . null . snd) deliveries
+                status
+                  | matrixDelivered && qqDelivered = "桥接测试成功：Matrix 与 QQ 均已收到测试消息。"
+                  | matrixDelivered = "桥接测试部分成功：Matrix 已收到，但 QQ 投递失败。"
+                  | otherwise = "桥接测试失败：Matrix 未成功投递，因此没有继续同步到 QQ。"
+                detail = if null errors then "" else " 失败信息：" <> Text.intercalate "；" errors
+            pure (toolText (status <> detail))
+
+bridgeTestTarget :: IncomingMessage -> IncomingMessage
+bridgeTestTarget message =
+  message
+    { platform = PlatformQQ
+    , kind = ChatGroup
+    , chatId = Just FMBridge.fmQQGroupId
+    , chatAliases = []
+    , digest = message.digest
+        { chatIsAllowed = True
+        , senderIsAllowed = True
+        , senderIsSuperuser = True
+        }
+    , messageId = Nothing
+    , replyToMessageId = Nothing
+    , mentions = []
+    , mentionUsernames = []
+    , imageUrls = []
+    , files = []
+    , text = ""
+    , raw = Aeson.Null
+    }

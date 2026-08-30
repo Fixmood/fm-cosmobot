@@ -1,8 +1,6 @@
 module Bot.Handler.FM
   ( fmHandlers
   , DirectLibraryCommand (..)
-  , isDirectLibraryMessage
-  , isPotentialTypingScore
   , parseDirectLibraryCommand
   , parseDirectRecallCommand
   ) where
@@ -31,8 +29,6 @@ fmHandlers =
   , recallDirectHandler
   , libraryStopHandler
   , aiContestQuickHandler
-  , allCompetitionRankQuickHandler
-  , liveCompetitionQuickHandler
   , messageArchiveHandler
   , recallArchiveHandler
   , pausedGroupHandler
@@ -165,66 +161,13 @@ aiContestQuickHandler
 aiContestQuickHandler =
   stopOn (matching isAiContestQuick) \message _ -> do
     response <- HTTP.runReq $
-      req GET (http "172.20.0.4" /: "ai-contest" /: "text") NoReqBody jsonResponse (port 8077)
+      req GET (http "fm-domain" /: "ai-contest" /: "text") NoReqBody jsonResponse (port 8077)
     case parseAiContest (responseBody response :: Aeson.Value) of
       Nothing -> sendStandalone message "今天的 AI 赛文还没生成，直接告诉 FM 想要什么风格，我现在写。"
       Just (competitionDate, title, body, difficulty) ->
         sendStandalone message $
           "[FM/AI赛文·" <> difficulty <> "] 《" <> title <> "》 [字数" <> show (Text.length body) <> "]\n"
           <> body <> "\n-----第555段 " <> competitionDate <> "-FM赛文"
-
-liveCompetitionQuickHandler
-  :: (HTTP.HTTP :> es, Chat.Chat :> es)
-  => RouteHandler es
-liveCompetitionQuickHandler =
-  stopOn (matching isLiveCompetitionRankQuick) \message _ -> do
-    enabled <- case (message.kind, message.chatId) of
-      (ChatGroup, Just groupId) -> groupCapabilityEnabled (show groupId) "contest"
-      _ -> pure True
-    if not enabled
-      then sendStandalone message "当前群没有开启赛文排行榜功能。"
-      else do
-        response <- HTTP.runReq $
-          req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
-            ( "source" =: ("锦标赛" :: Text)
-              <> "group_id" =: maybe ("" :: Text) show message.chatId
-              <> "soft" =: True
-              <> port 8077
-            )
-        case parseLiveCompetition (responseBody response :: Aeson.Value) of
-          Just ("ok", kind, actualDate, _) -> do
-            let sourceKey = if kind == "group" then maybe "" show message.chatId else kind
-                cacheKey = fromMaybe "refresh" (messageIdText <$> message.messageId)
-                imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source="
-                  <> sourceKey <> "&date=" <> actualDate <> "&combined=1&v=" <> cacheKey
-            void $ Chat.replyTo (standaloneMessage message)
-              "😻 FM：正在调用 fm_live_competition_rank 工具…"
-            sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
-            when (null (rights sent)) $
-              sendStandalone message "锦标赛排行榜图片发送失败。"
-          Just (_, _, _, errorMessage) ->
-            sendStandalone message ("锦标赛排行榜获取失败：" <> errorMessage)
-          Nothing ->
-            sendStandalone message "锦标赛排行榜获取失败：领域服务返回格式不正确。"
-
-isLiveCompetitionRankQuick :: IncomingMessage -> Bool
-isLiveCompetitionRankQuick message =
-  message.eventKind == IncomingMessageCreated
-    && message.platform == PlatformQQ
-    && let text = Text.toCaseFold (Text.strip message.text)
-       in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
-          && "锦标赛" `Text.isInfixOf` text
-          && ("排行榜" `Text.isInfixOf` text || "排行榜" `Text.isInfixOf` Text.replace "榜" "排行榜" text)
-
-parseLiveCompetition :: Aeson.Value -> Maybe (Text, Text, Text, Text)
-parseLiveCompetition value = AesonTypes.parseMaybe parser value
-  where
-    parser = Aeson.withObject "FM live competition" \o ->
-      (,,,)
-        <$> o Aeson..:? "status" Aeson..!= "error"
-        <*> o Aeson..:? "kind" Aeson..!= "champ"
-        <*> o Aeson..:? "date" Aeson..!= ""
-        <*> o Aeson..:? "message" Aeson..!= "公开赛事网站当前没有返回可用数据。"
 
 messageArchiveHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es)
@@ -237,7 +180,7 @@ messageArchiveHandler =
             (Aeson.withObject "FM event response" (Aeson..:? "competition_date")) response
           cacheKey = fromMaybe "refresh" (messageIdText <$> message.messageId)
           leaderboardUrl =
-            "http://172.20.0.4:8077/reports/ai-leaderboard.png?date="
+            "http://fm-domain:8077/reports/ai-leaderboard.png?date="
               <> competitionDate <> "&v=" <> cacheKey
       sent <- Chat.replyTo (standaloneMessage message)
         (ReplyBody.imageDirective leaderboardUrl)
@@ -249,8 +192,6 @@ libraryScoreContinueHandler
   => RouteHandler es
 libraryScoreContinueHandler =
   stopOn (matching isPotentialTypingScore) \message _ -> do
-    -- Score handling stops later routes, so archive the score explicitly here.
-    void $ postEvent "message" (messagePayload message)
     enabled <- case (message.kind, message.chatId) of
       (ChatGroup, Just groupId) -> groupCapabilityEnabled (show groupId) "library"
       _ -> pure True
@@ -260,7 +201,7 @@ libraryScoreContinueHandler =
         ])
       let status = fromMaybe ("error" :: Text) $ AesonTypes.parseMaybe
             (Aeson.withObject "FM library score result" (Aeson..: "status")) response
-      when (status == "segment") $
+      when (status /= "ignored") $
         sendDirectLibraryResult message response
 
 recallArchiveHandler :: HTTP.HTTP :> es => RouteHandler es
@@ -310,7 +251,7 @@ libraryDirectHandler =
     { help = Nothing
     , helpVisible = const False
     , decide = \message ->
-        if not (isDirectLibraryMessage message)
+        if message.eventKind /= IncomingMessageCreated || message.platform /= PlatformQQ
           then pure Skip
           else case parseDirectLibraryCommand message.text of
             Nothing -> pure Skip
@@ -322,11 +263,6 @@ libraryDirectHandler =
                 when enabled (runDirectLibraryCommand message command)
     }
 
-isDirectLibraryMessage :: IncomingMessage -> Bool
-isDirectLibraryMessage message =
-  message.eventKind == IncomingMessageCreated
-    && message.platform `elem` [PlatformQQ, PlatformMatrix]
-
 runDirectLibraryCommand
   :: (HTTP.HTTP :> es, Chat.Chat :> es)
   => IncomingMessage
@@ -337,10 +273,10 @@ runDirectLibraryCommand message = \case
     sendStandalone message reason
   DirectLibraryStats -> do
     response <- HTTP.runReq $
-      req GET (http "172.20.0.4" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
+      req GET (http "fm-domain" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
     sendStandalone message (renderLibraryStats (responseBody response :: Aeson.Value))
   DirectLibraryContinue -> do
-    response <- postLibraryAction "session" "continue-same" (directLibraryPayload message [])
+    response <- postLibraryAction "session" "continue" (directLibraryPayload message [])
     sendDirectLibraryResult message response
   DirectLibraryArticle difficulty requestedLength -> do
     response <- postLibraryAction "session" "start" (directLibraryPayload message
@@ -404,7 +340,7 @@ directLibraryPayload message fields =
 postLibraryAction :: HTTP.HTTP :> es => Text -> Text -> Aeson.Value -> Eff es Aeson.Value
 postLibraryAction section action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "library" /: section /: action)
+    req POST (http "fm-domain" /: "library" /: section /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -441,100 +377,6 @@ repeatCommandHandler =
           let reply = if enabled then "跟风复读现在开着。" else "跟风复读现在关着。"
           void (Chat.replyTo message reply)
         _ -> pure ()
-
-allCompetitionRankQuickHandler
-  :: (HTTP.HTTP :> es, Chat.Chat :> es)
-  => RouteHandler es
-allCompetitionRankQuickHandler =
-  stopOn (matching isAllCompetitionRankQuick) \message _ -> do
-    enabled <- case (message.kind, message.chatId) of
-      (ChatGroup, Just groupId) -> groupCapabilityEnabled (show groupId) "contest"
-      _ -> pure True
-    if not enabled
-      then sendStandalone message "当前群没有开启赛文排行榜功能。"
-      else do
-        void $ Chat.replyTo (standaloneMessage message)
-          "😻 FM：正在调用 fm_live_competition_rank 工具…"
-        results <- traverse (fetchRank message)
-          [ ("champ" :: Text, "锦标赛" :: Text)
-          , ("tiger", "虎杯")
-          , ("comp", "极速杯")
-          , ("540678308", "极速联赛")
-          , ("1021522088", "五笔修炼基地")
-          , ("151040026", "帝隆")
-          , ("776227233", "梦幻打字阁")
-          , ("391047371", "092五笔正规闲聊群")
-          , ("201323122", "倉頡之友")
-          , ("488748631", "小鹤进修班")
-          ]
-        aiResult <- fetchAiRank
-        let nodes = rights (results <> [aiResult])
-        if null nodes
-          then sendStandalone message "全部排行榜获取失败，请稍后再试。"
-          else do
-            sent <- Chat.sendMergedForward (standaloneMessage message) nodes
-            case sent of
-              Right _ -> sendStandalone message "😻 FM：全部排行榜已合并转发。"
-              Left errorText -> sendStandalone message ("全部排行榜合并转发失败：" <> errorText)
-  where
-    fetchRank targetMessage (sourceKey, label) = do
-      response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
-          ( "source" =: sourceKey
-            <> "group_id" =: maybe ("" :: Text) show targetMessage.chatId
-            <> "soft" =: True
-            <> port 8077
-          )
-      case AesonTypes.parseMaybe parseRank (responseBody response :: Aeson.Value) of
-        Just ("ok", actualDate) ->
-          pure $ Right (forwardNode label
-            ("http://172.20.0.4:8077/reports/live-competition.png?source="
-              <> sourceKey <> "&date=" <> actualDate <> "&combined=1"))
-        Just (_, _) -> pure (Left label)
-        Nothing -> pure (Left label)
-    fetchAiRank = do
-      response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
-          (port 8077)
-      case AesonTypes.parseMaybe parseAiRank (responseBody response :: Aeson.Value) of
-        Just (actualDate, rows) | not (null rows) ->
-          pure $ Right (forwardNode ("555 AI赛文榜" :: Text)
-            ("http://172.20.0.4:8077/reports/ai-leaderboard.png?date=" <> actualDate))
-        _ -> pure (Left "555 AI赛文榜")
-    parseAiRank = Aeson.withObject "FM AI leaderboard" $ \o ->
-      (,) <$> o Aeson..:? "date" Aeson..!= ("" :: Text)
-          <*> o Aeson..:? "rows" Aeson..!= ([] :: [Aeson.Value])
-    parseRank = Aeson.withObject "FM live rank" $ \o ->
-      (,)
-        <$> o Aeson..:? "status" Aeson..!= ("error" :: Text)
-        <*> o Aeson..:? "date" Aeson..!= ""
-    forwardNode label imageUrl =
-      Aeson.object
-        [ "type" Aeson..= Aeson.String "node"
-        , "data" Aeson..= Aeson.object
-            [ "name" Aeson..= Aeson.String "FM"
-            , "uin" Aeson..= Aeson.String "3471095459"
-            , "content" Aeson..= [
-                Aeson.object
-                  [ "type" Aeson..= Aeson.String "text"
-                  , "data" Aeson..= Aeson.object ["text" Aeson..= label]
-                  ]
-              , Aeson.object
-                  [ "type" Aeson..= Aeson.String "image"
-                  , "data" Aeson..= Aeson.object ["file" Aeson..= imageUrl]
-                  ]
-              ]
-            ]
-        ]
-
-isAllCompetitionRankQuick :: IncomingMessage -> Bool
-isAllCompetitionRankQuick message =
-  message.eventKind == IncomingMessageCreated
-    && message.platform == PlatformQQ
-    && let text = Text.toCaseFold (Text.strip message.text)
-       in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
-          && ("全部" `Text.isInfixOf` text || "所有" `Text.isInfixOf` text)
-          && ("排行榜" `Text.isInfixOf` text || "排行榜" `Text.isInfixOf` Text.replace "榜" "排行榜" text)
 
 repeatFollowHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es)
@@ -691,7 +533,7 @@ parseDirectLibraryCommand raw =
 isPotentialTypingScore :: IncomingMessage -> Bool
 isPotentialTypingScore message =
   message.eventKind == IncomingMessageCreated
-    && message.platform `elem` [PlatformQQ, PlatformMatrix]
+    && message.platform == PlatformQQ
     && "第" `Text.isInfixOf` message.text
     && "段" `Text.isInfixOf` message.text
     && any (`Text.isInfixOf` message.text) ["速度", "速"]
@@ -802,7 +644,7 @@ setRepeatEnabled groupId enabled = do
 repeatEnabled :: HTTP.HTTP :> es => Text -> Eff es Bool
 repeatEnabled groupId = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "repeat-follow" /: "state") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "repeat-follow" /: "state") NoReqBody jsonResponse
       ("group_id" =: groupId <> port 8077)
   pure . fromMaybe True . AesonTypes.parseMaybe (Aeson.withObject "FM repeat state" (Aeson..: "enabled")) $
     (responseBody response :: Aeson.Value)
@@ -810,7 +652,7 @@ repeatEnabled groupId = do
 groupCapabilityEnabled :: HTTP.HTTP :> es => Text -> Text -> Eff es Bool
 groupCapabilityEnabled groupId capability = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "group-capability") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "group-capability") NoReqBody jsonResponse
       ("group_id" =: groupId <> "capability" =: capability <> port 8077)
   pure . fromMaybe True . AesonTypes.parseMaybe (Aeson.withObject "FM group capability" (Aeson..: "enabled")) $
     (responseBody response :: Aeson.Value)
@@ -818,14 +660,14 @@ groupCapabilityEnabled groupId capability = do
 postJson :: HTTP.HTTP :> es => Text -> Text -> Aeson.Value -> Eff es Aeson.Value
 postJson section action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: section /: action)
+    req POST (http "fm-domain" /: section /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
 postLibraryStop :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
 postLibraryStop payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "library" /: "session" /: "stop")
+    req POST (http "fm-domain" /: "library" /: "session" /: "stop")
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -838,14 +680,13 @@ messagePayload message =
     , "sender_id" Aeson..= fromMaybe "" message.senderId
     , "sender_name" Aeson..= fromMaybe "" message.senderUsername
     , "text" Aeson..= message.text
-    , "image_urls" Aeson..= message.imageUrls
     , "raw" Aeson..= message.raw
     ]
 
 postEvent :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postEvent eventName payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "events" /: eventName)
+    req POST (http "fm-domain" /: "events" /: eventName)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -859,7 +700,7 @@ jsonFlag field =
 setGroupOnline :: HTTP.HTTP :> es => Text -> Bool -> Eff es ()
 setGroupOnline groupId online = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "group-state")
+    req POST (http "fm-domain" /: "group-state")
       (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
       jsonResponse
       (port 8077)
@@ -868,7 +709,7 @@ setGroupOnline groupId online = do
 groupOnline :: HTTP.HTTP :> es => Text -> Eff es Bool
 groupOnline groupId = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "group-state") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "group-state") NoReqBody jsonResponse
       ("group_id" =: groupId <> port 8077)
   pure . fromMaybe True . AesonTypes.parseMaybe parseOnline $ (responseBody response :: Aeson.Value)
   where

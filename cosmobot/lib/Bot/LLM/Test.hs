@@ -31,7 +31,6 @@ runLLMWith askTextStream askImageStream askImageEditStream askAudioStream askToo
       LLM.AskToolsStream tools messages -> pure (LLM.liftLocalStream liftLocal (askToolsStream tools messages))
       LLM.ListChatModels -> pure []
       LLM.CurrentChatModel -> pure Nothing
-      LLM.QueryAccountBalance _ -> pure []
       LLM.SelectChatModel _ -> pure (Left "Chat model switching is unavailable in the test interpreter.")
       LLM.ProbeChatModel _ -> pure (Right ())
       LLM.AddChatModel _ -> pure (Right ())

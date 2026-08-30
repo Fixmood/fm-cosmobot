@@ -47,9 +47,8 @@ main =
       , testCase "FM Matrix reply body is relayed at most once" testFmMatrixReplyBodyIsRelayedAtMostOnce
       , testCase "FM bridge delivery ids preserve Matrix and QQ recall targets" testFmBridgeDeliveryIds
       , testCase "FM exact library commands bypass the agent" testFmExactLibraryCommands
-      , testCase "FM direct library route accepts QQ and Matrix" testFmDirectLibraryPlatforms
-      , testCase "FM typing scores continue on QQ and Matrix" testFmTypingScorePlatforms
       , testCase "FM exact recall commands bypass the agent" testFmExactRecallCommands
+      , testCase "FM exact model commands bypass the agent" testFmExactModelCommands
       , testCase "FM ignores QQ bridge echoes from Matrix" testFmIgnoresMatrixBridgeEcho
       , testCase "FM tool notifications are readable and hide internal ids" testFmToolNotificationsAreReadable
       , testCase "incoming message JSON defaults missing files" testIncomingMessageJsonDefaultsMissingFiles
@@ -133,12 +132,6 @@ testTranscriptPreservesSenderIdentity = do
           { QQ.sender = Just (Aeson.object ["nickname" Aeson..= ("alice" :: Text)])
           , QQ.messageId = Just 1
           })
-      firstWithContext = first
-        { replyToMessageId = Just (integerMessageId 77)
-        , mentions = ["424242"]
-        , imageUrls = ["https://example.test/image.png"]
-        , files = [MessageFile{name = "notes.txt", ref = "file-ref"}]
-        }
       second = fromMaybe (error "expected second QQ message") $
         QQ.eventToIncomingMessage ((qqMessageEvent 20002)
           { QQ.sender = Just (Aeson.object ["nickname" Aeson..= ("bob" :: Text)])
@@ -146,18 +139,11 @@ testTranscriptPreservesSenderIdentity = do
           })
       input = MessageInput { text = "hello", attachments = [] }
       transcript = Transcript.appendIncomingMessage second input
-        (Transcript.startWithIncomingMessage firstWithContext input)
+        (Transcript.startWithIncomingMessage first input)
       texts = [content | message <- toList transcript.messages, Just (LLM.TextContent content) <- [message.content]]
-  case texts of
-    [firstText, secondText] -> do
-      assertBool "first user turn has first sender id" ("sender_id=10001" `Text.isInfixOf` firstText)
-      assertBool "second user turn has second sender id" ("sender_id=20002" `Text.isInfixOf` secondText)
-      assertBool "first turn records reply target" ("reply_to_message_id=77" `Text.isInfixOf` firstText)
-      assertBool "first turn records mention state and count" ("mentions_bot=false" `Text.isInfixOf` firstText && "mention_count=1" `Text.isInfixOf` firstText)
-      assertBool "first turn records image state and count" ("has_images=true" `Text.isInfixOf` firstText && "image_count=1" `Text.isInfixOf` firstText)
-      assertBool "first turn records file state and count" ("has_files=true" `Text.isInfixOf` firstText && "file_count=1" `Text.isInfixOf` firstText)
-      assertBool "metadata does not replace the user body" ("<fm_user_message>\nhello\n</fm_user_message>" `Text.isInfixOf` firstText)
-    _ -> assertFailure "expected exactly two user transcript entries"
+  length texts @?= 2
+  assertBool "first user turn has first sender id" ("sender_id=10001" `Text.isInfixOf` head texts)
+  assertBool "second user turn has second sender id" ("sender_id=20002" `Text.isInfixOf` last texts)
 
 testQqInvitationActions :: IO ()
 testQqInvitationActions = do
@@ -289,34 +275,6 @@ testFmExactLibraryCommands = do
   FMHandler.parseDirectLibraryCommand "fm 帮我找一篇虐文"
     @?= Nothing
 
-testFmDirectLibraryPlatforms :: IO ()
-testFmDirectLibraryPlatforms = do
-  let matrixMessage = matrixBridgeMessage "@root:ksqsf.moe" "fm 淼50"
-      qqMessage = matrixMessage { platform = PlatformQQ }
-      discordMessage = matrixMessage { platform = PlatformDiscord }
-      deletedMatrixMessage = matrixMessage { eventKind = IncomingMessageDeleted }
-  assertBool "Matrix library commands use the deterministic route"
-    (FMHandler.isDirectLibraryMessage matrixMessage)
-  assertBool "QQ library commands keep using the deterministic route"
-    (FMHandler.isDirectLibraryMessage qqMessage)
-  assertBool "unrelated platforms do not enter the FM library route"
-    (not (FMHandler.isDirectLibraryMessage discordMessage))
-  assertBool "deleted Matrix events do not start library sessions"
-    (not (FMHandler.isDirectLibraryMessage deletedMatrixMessage))
-
-testFmTypingScorePlatforms :: IO ()
-testFmTypingScorePlatforms = do
-  let score = "第419105段 速度258.24 击键8.95 字数50 键准99.04%"
-      matrixScore = matrixBridgeMessage "@root:ksqsf.moe" score
-      qqScore = matrixScore { platform = PlatformQQ }
-      discordScore = matrixScore { platform = PlatformDiscord }
-  assertBool "Matrix typing scores enter continuation handling"
-    (FMHandler.isPotentialTypingScore matrixScore)
-  assertBool "QQ typing scores keep entering continuation handling"
-    (FMHandler.isPotentialTypingScore qqScore)
-  assertBool "unrelated platforms do not enter continuation handling"
-    (not (FMHandler.isPotentialTypingScore discordScore))
-
 testFmExactRecallCommands :: IO ()
 testFmExactRecallCommands = do
   FMHandler.parseDirectRecallCommand "@FM 撤回这条消息"
@@ -327,6 +285,19 @@ testFmExactRecallCommands = do
     @?= Just FMHandler.DirectRecallAll
   FMHandler.parseDirectRecallCommand "FM 撤回全部消息"
     @?= Just FMHandler.DirectRecallAll
+
+testFmExactModelCommands :: IO ()
+testFmExactModelCommands = do
+  FMHandler.parseDirectModelCommand "fm 模型列表"
+    @?= Just FMHandler.DirectModelStatus
+  FMHandler.parseDirectModelCommand "fm 切换模型 deepseek-v4-flash-vision"
+    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-flash-vision")
+  FMHandler.parseDirectModelCommand "fm 使用 deepseek-v4-pro"
+    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-pro")
+  FMHandler.parseDirectModelCommand "fm，切换视觉模型"
+    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-flash-vision")
+  FMHandler.parseDirectModelCommand "让fm切换带视觉的模型"
+    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-flash-vision")
 
 testFmIgnoresMatrixBridgeEcho :: IO ()
 testFmIgnoresMatrixBridgeEcho = do
@@ -949,11 +920,11 @@ testMatrixAudioMessageIncludesMessageFile = do
 
 testMatrixEncryptedImageBytesDecryptAndVerifyCiphertextHash :: IO ()
 testMatrixEncryptedImageBytesDecryptAndVerifyCiphertextHash = do
-  let cryptoKey = StrictByteString.replicate 32 0
+  let key = StrictByteString.replicate 32 0
       iv = StrictByteString.replicate 16 0
       plainText = "Matrix encrypted image bytes"
-      cipherText = matrixAes256Ctr cryptoKey iv plainText
-      encryptedKey = TextEncoding.decodeUtf8 (Base64URL.encodeUnpadded cryptoKey)
+      cipherText = matrixAes256Ctr key iv plainText
+      encryptedKey = TextEncoding.decodeUtf8 (Base64URL.encodeUnpadded key)
       encryptedIv = TextEncoding.decodeUtf8 (Base64.encode iv)
       encryptedSha256 = TextEncoding.decodeUtf8 (Base64.encode (matrixSha256 cipherText))
   chunks <- Matrix.decryptMatrixEncryptedBytesForTest encryptedKey encryptedIv encryptedSha256 [StrictByteString.take 7 cipherText, StrictByteString.drop 7 cipherText]

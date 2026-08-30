@@ -23,7 +23,6 @@ module Bot.Agent.Tools.FMDomain
   , fmAiContestLeaderboardImageTool
   , fmCompetitionScoreQueryTool
   , fmCompetitionScoreSummaryTool
-  , fmScoreAnalysisTool
   , fmCompetitionScoreImageTool
   , fmChartTool
   , fmBotGuardAccountsTool
@@ -446,9 +445,9 @@ fmLiveCompetitionRankTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLiveCompetitionRankTool =
   allowWhen hasExplicitContestIntent
   . noisy
-  . withDescription "Query and send a complete live public typing-contest leaderboard as one PNG image. Use this autonomously when natural language asks for the current or dated leaderboard of 虎杯, a supported group, 极速杯, or 锦标赛. The source may be 虎杯, a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends the complete image itself, so do not repeat the rows in the final response."
+  . withDescription "Query and send a live public typing-contest leaderboard as one or more PNG pages. Use this autonomously when natural language asks for the current or dated leaderboard of a supported group, 极速杯, or 锦标赛. The source may be a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends images itself, so do not repeat the rows in the final response."
   $ tool "fm_live_competition_rank"
-      ( optionalText "source" "Optional public contest source: 虎杯, supported QQ group name/number, 极速杯, or 锦标赛."
+      ( optionalText "source" "Optional public contest source: supported QQ group name/number, 极速杯, or 锦标赛."
       , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
       )
       \source competitionDate -> do
@@ -464,13 +463,16 @@ fmLiveCompetitionRankTool =
               )
           case AesonTypes.parseMaybe parseLiveRank (responseBody response :: Aeson.Value) of
             Nothing -> pure (toolText "实时排行榜查询失败：领域服务返回格式不正确。")
-            Just (status, kind, groupId, actualDate, _, message)
+            Just (status, kind, groupId, actualDate, pageCount, message)
               | status /= "ok" -> pure (toolText ("实时排行榜查询失败：" <> fallback message "公开网站当前没有返回可用数据。"))
               | otherwise -> do
                   let sourceKey = if kind == "group" then groupId else kind
-                      imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
-                        <> "&date=" <> actualDate <> "&combined=1"
-                  sent <- Chat.replyTo context.message (ReplyBody.imageDirective imageUrl)
+                      urls =
+                        [ "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
+                          <> "&date=" <> actualDate <> "&page=" <> show page
+                        | page <- [1 .. max 1 pageCount]
+                        ]
+                  sent <- Chat.replyTo context.message (Text.intercalate "\n" (map ReplyBody.imageDirective urls))
                   pure . toolText $ case rights sent of
                     _ : _ -> "实时排行榜图片已发送。不要在最终回复中重复排行榜内容。"
                     [] -> "实时排行榜已生成，但图片发送失败：" <> Text.intercalate "；" (lefts sent)
@@ -667,40 +669,6 @@ fmCompetitionScoreSummaryTool =
             req GET (http "172.20.0.4" /: "competition" /: "summary") NoReqBody jsonResponse
               ( "user_id" =: fromMaybe "" userId
                 <> "name" =: fromMaybe "" name
-                <> "source" =: fromMaybe "" source
-                <> port 8077
-              )
-          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
-
-fmScoreAnalysisTool :: HTTP.HTTP :> es => Tool (Eff es)
-fmScoreAnalysisTool =
-  withDescription "Analyze the current user's typing performance from live public contest leaderboards and FM's archived typing scores. Use for natural-language questions such as today's contest results, today's typing results, all scores together, comparisons, averages, best results, accuracy below 95%, or a recent date range. The tool resolves the current sender by QQ ID, keeps contest and ordinary typing results separate, and never treats a missing leaderboard row as a zero score. Do not use this for merely sending a leaderboard image."
-  $ tool "fm_score_analysis"
-      ( optionalText "scope" "Optional scope: all, contest, or typing. Defaults to all."
-      , optionalText "start_date" "Optional start date in YYYY-MM-DD format."
-      , optionalText "end_date" "Optional end date in YYYY-MM-DD format; defaults to today in China."
-      , optionalInt "days" "Optional recent calendar-day span from 1 to 3650; ignored when start_date is provided."
-      , optionalText "user_id" "Optional QQ or platform user ID; defaults to the current sender."
-      , optionalText "name" "Optional exact display name; used as a fallback when a public source has no QQ ID."
-      , optionalText "source" "Optional source such as 虎杯, 锦标赛, 极速杯, or 555赛文. Empty means all sources."
-      )
-      \scope startDate endDate requestedDays userId name source -> do
-        context <- askToolContext
-        withCapability context "scores" do
-          let choose values = case filter (not . Text.null . Text.strip) values of
-                value : _ -> value
-                [] -> ""
-              resolvedUserId = choose [fromMaybe "" userId, fromMaybe "" context.message.senderId]
-              resolvedName = choose [fromMaybe "" name, fromMaybe "" context.message.senderUsername]
-              days = fromMaybe 1 requestedDays
-          response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "analysis" /: "scores") NoReqBody jsonResponse
-              ( "user_id" =: resolvedUserId
-                <> "name" =: resolvedName
-                <> "scope" =: fromMaybe "all" scope
-                <> "start_date" =: fromMaybe "" startDate
-                <> "end_date" =: fromMaybe "" endDate
-                <> "days" =: days
                 <> "source" =: fromMaybe "" source
                 <> port 8077
               )

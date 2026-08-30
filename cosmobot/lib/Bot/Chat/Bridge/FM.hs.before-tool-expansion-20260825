@@ -1,0 +1,197 @@
+module Bot.Chat.Bridge.FM
+  ( fmMatrixRoomId
+  , fmQQGroupId
+  , fmOwnerMatrixId
+  , fmOwnerQQId
+  , fmBotQQId
+  , fmOwnerRelayBody
+  , fmReplyRelayBody
+  , markFMAgentReply
+  , isFMAgentReply
+  , matrixOwnerAsQQ
+  , isMirroredQQMatrixMessage
+  , isMatrixOwnerBridge
+  , usesMatrixReplyPipeline
+  , matrixReplyTarget
+  , qqRelayTarget
+  , bridgeDeliveryMessageId
+  , bridgeDeliveryTargets
+  ) where
+
+import Bot.Core.Message
+import qualified Bot.Core.ReplyBody as ReplyBody
+import Bot.Prelude
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as AesonTypes
+import qualified Data.ByteString.Lazy as LazyByteString
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as TextEncoding
+
+fmMatrixRoomId :: Text
+fmMatrixRoomId = "!juVzWRcyQMbLRCTaNh:matrix.org"
+
+fmQQGroupId :: Integer
+fmQQGroupId = 906230260
+
+fmOwnerMatrixId :: Text
+fmOwnerMatrixId = "@fixmood:g24.at"
+
+fmOwnerQQId :: Text
+fmOwnerQQId = "2822751355"
+
+fmBotQQId :: Text
+fmBotQQId = "3471095459"
+
+bridgeMarker :: Text
+bridgeMarker = "fm-bridge:matrix-owner"
+
+agentReplyMarker :: Text
+agentReplyMarker = "fm-internal:agent-reply"
+
+bridgeDeliveryPrefix :: Text
+bridgeDeliveryPrefix = "fm-bridge-delivery:"
+
+bridgeDeliveryMessageId :: MessageId -> [MessageId] -> MessageId
+bridgeDeliveryMessageId matrixMessageId qqMessageIds =
+  textMessageId $
+    bridgeDeliveryPrefix
+      <> TextEncoding.decodeUtf8
+        (LazyByteString.toStrict (Aeson.encode payload))
+  where
+    payload = Aeson.object
+      [ "matrix" Aeson..= messageIdText matrixMessageId
+      , "qq" Aeson..= map messageIdText qqMessageIds
+      ]
+
+bridgeDeliveryTargets :: MessageId -> Maybe (MessageId, [MessageId])
+bridgeDeliveryTargets messageId = do
+  encoded <- Text.stripPrefix bridgeDeliveryPrefix (messageIdText messageId)
+  value <- Aeson.decodeStrict (TextEncoding.encodeUtf8 encoded)
+  AesonTypes.parseMaybe parseTargets value
+  where
+    parseTargets = Aeson.withObject "FM bridge delivery" \o -> do
+      matrixMessageId <- textMessageId <$> o Aeson..: "matrix"
+      qqMessageIds <- map textMessageId <$> (o Aeson..:? "qq" Aeson..!= [])
+      pure (matrixMessageId, qqMessageIds)
+
+fmOwnerRelayBody :: Text -> Text
+fmOwnerRelayBody body =
+  "😼 Fixmood：" <> body
+
+fmReplyRelayBody :: Text -> Text
+fmReplyRelayBody body =
+  let ReplyBody.ReplyContent{text, images} = ReplyBody.replyContentFromBody body
+      prefixedText =
+        if Text.null (Text.strip text)
+          then ""
+          else "😻 FM：" <> stripReplyPrefix text
+  in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
+
+markFMAgentReply :: IncomingMessage -> IncomingMessage
+markFMAgentReply message =
+  message{chatAliases = agentReplyMarker : filter (/= agentReplyMarker) message.chatAliases}
+
+isFMAgentReply :: IncomingMessage -> Bool
+isFMAgentReply message =
+  agentReplyMarker `elem` message.chatAliases
+
+stripReplyPrefix :: Text -> Text
+stripReplyPrefix value =
+  case firstJust (Text.stripPrefix <$> prefixes <*> pure (Text.stripStart value)) of
+    Just rest -> stripReplyPrefix rest
+    Nothing -> Text.stripStart value
+  where
+    prefixes =
+      [ "😻 FM：", "😻 FM:"
+      , "◆ FM：", "◆ FM:"
+      , "😼 Fixmood：", "😼 Fixmood:"
+      , "✦ Fixmood：", "✦ Fixmood:"
+      , "FM：", "FM:"
+      ]
+
+matrixOwnerAsQQ :: IncomingMessage -> Maybe IncomingMessage
+matrixOwnerAsQQ message = do
+  guard (isFMMatrixRoom message)
+  guard (message.eventKind == IncomingMessageCreated)
+  guard (message.senderId == Just fmOwnerMatrixId)
+  pure message
+    { platform = PlatformQQ
+    , kind = ChatGroup
+    , chatId = Just fmQQGroupId
+    , chatAliases = [fmMatrixRoomId, bridgeMarker]
+    , digest = MessageDigest
+        { chatIsAllowed = True
+        , senderIsAllowed = True
+        , senderIsSuperuser = True
+        , mentionsBot = message.digest.mentionsBot
+        , botId = Just fmBotQQId
+        }
+    , senderId = Just fmOwnerQQId
+    , senderUsername = Just "Fixmood"
+    }
+
+isMirroredQQMatrixMessage :: IncomingMessage -> Bool
+isMirroredQQMatrixMessage message =
+  isFMMatrixRoom message
+    && maybe False isQQBridgeUser message.senderId
+
+isMatrixOwnerBridge :: IncomingMessage -> Bool
+isMatrixOwnerBridge message =
+  message.platform == PlatformQQ
+    && message.chatId == Just fmQQGroupId
+    && bridgeMarker `elem` message.chatAliases
+
+usesMatrixReplyPipeline :: IncomingMessage -> Bool
+usesMatrixReplyPipeline message =
+  (message.platform == PlatformQQ && message.chatId == Just fmQQGroupId)
+    || isFMMatrixRoom message
+
+matrixReplyTarget :: IncomingMessage -> IncomingMessage
+matrixReplyTarget message =
+  target
+    { platform = PlatformMatrix
+    , kind = ChatGroup
+    , chatId = Nothing
+    , chatAliases = [fmMatrixRoomId]
+    , digest = message.digest{botId = Nothing}
+    , senderId = Just fmOwnerMatrixId
+    , senderUsername = Just fmOwnerMatrixId
+    }
+  where
+    -- A QQ message id is not a Matrix event id. Keeping it here creates an
+    -- invalid m.in_reply_to relation that Element cannot resolve.
+    target
+      | isMatrixOwnerBridge message = message
+      | otherwise = message
+          { messageId = Nothing
+          , replyToMessageId = Nothing
+          , raw = Aeson.Null
+          }
+
+qqRelayTarget :: IncomingMessage -> IncomingMessage
+qqRelayTarget message =
+  message
+    { platform = PlatformQQ
+    , kind = ChatGroup
+    , chatId = Just fmQQGroupId
+    , chatAliases = []
+    , messageId = Nothing
+    , replyToMessageId = Nothing
+    , mentions = []
+    , mentionUsernames = []
+    }
+
+isFMMatrixRoom :: IncomingMessage -> Bool
+isFMMatrixRoom message =
+  message.platform == PlatformMatrix
+    && fmMatrixRoomId `elem` message.chatAliases
+
+isQQBridgeUser :: Text -> Bool
+isQQBridgeUser userId =
+  case Text.stripPrefix "@qq_" userId >>= Text.stripSuffix ":pfeiwu.com" of
+    Just qqId -> not (Text.null qqId) && Text.all (`elem` ['0' .. '9']) qqId
+    Nothing -> False
+
+firstJust :: [Maybe a] -> Maybe a
+firstJust =
+  viaNonEmpty head . catMaybes

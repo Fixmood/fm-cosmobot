@@ -2,7 +2,6 @@ module Bot.Handler.FM
   ( fmHandlers
   , DirectLibraryCommand (..)
   , isDirectLibraryMessage
-  , isPotentialTypingScore
   , parseDirectLibraryCommand
   , parseDirectRecallCommand
   ) where
@@ -260,7 +259,7 @@ libraryScoreContinueHandler =
         ])
       let status = fromMaybe ("error" :: Text) $ AesonTypes.parseMaybe
             (Aeson.withObject "FM library score result" (Aeson..: "status")) response
-      when (status == "segment") $
+      when (status /= "ignored") $
         sendDirectLibraryResult message response
 
 recallArchiveHandler :: HTTP.HTTP :> es => RouteHandler es
@@ -340,7 +339,7 @@ runDirectLibraryCommand message = \case
       req GET (http "172.20.0.4" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
     sendStandalone message (renderLibraryStats (responseBody response :: Aeson.Value))
   DirectLibraryContinue -> do
-    response <- postLibraryAction "session" "continue-same" (directLibraryPayload message [])
+    response <- postLibraryAction "session" "continue" (directLibraryPayload message [])
     sendDirectLibraryResult message response
   DirectLibraryArticle difficulty requestedLength -> do
     response <- postLibraryAction "session" "start" (directLibraryPayload message
@@ -691,7 +690,7 @@ parseDirectLibraryCommand raw =
 isPotentialTypingScore :: IncomingMessage -> Bool
 isPotentialTypingScore message =
   message.eventKind == IncomingMessageCreated
-    && message.platform `elem` [PlatformQQ, PlatformMatrix]
+    && message.platform == PlatformQQ
     && "第" `Text.isInfixOf` message.text
     && "段" `Text.isInfixOf` message.text
     && any (`Text.isInfixOf` message.text) ["速度", "速"]
