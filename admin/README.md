@@ -28,6 +28,7 @@ python3 admin/app.py
 后台当前提供：
 
 - FM Domain 健康、统计和归档状态总览；
+- 文库、赛文、成绩和归档数据的真实只读查询接口；
 - 触发规则、人设、模型和群配置的 JSON CRUD；
 - 配置修改审计日志；
 - 同源网页控制台。
@@ -51,6 +52,20 @@ POST   /api/collections/{resource}
 PUT    /api/collections/{resource}/{id}
 DELETE /api/collections/{resource}/{id}
 ```
+
+领域数据只读接口：
+
+```text
+GET /api/domain/library
+GET /api/domain/contests
+GET /api/domain/scores
+GET /api/domain/stats
+GET /api/domain/archive
+```
+
+生产容器模板见 `deploy/fm-admin.compose.yaml`。它与 `fm-domain` 位于同一
+Docker 网络，必须设置 `FM_ADMIN_TOKEN`，并通过外部 Nginx 或其他 HTTPS
+反向代理对外提供访问。
 
 ## 后续接入顺序
 

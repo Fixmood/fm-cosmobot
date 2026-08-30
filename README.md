@@ -37,6 +37,7 @@ FM 是基于 Cosmobot 的多平台智能机器人实现，面向 QQ 和 Matrix �
 
 - `admin/` 提供 FM Control Center 的无依赖管理 API 和网页界面。
 - 总览页读取 FM Domain 的健康、统计和归档状态。
+- 管理 API 提供文库、赛文、成绩和归档数据的真实只读查询。
 - 支持触发规则、人设、模型和群配置的增删改查，并记录操作审计。
 - 后台控制平面与 FM Domain 业务数据库分开保存；生产运行时接入通过受认证 API 或 RPC 完成。
 
@@ -75,6 +76,7 @@ QQ / Matrix
 | `cosmobot/lib/Bot/Storage/` | SQLite 等持久化存储 |
 | `fm-domain/` | 文库、赛文、成绩、排行榜和报表服务 |
 | `admin/` | FM Control Center 管理 API、网页和测试 |
+| `deploy/fm-admin.compose.yaml` | FM 管理后台容器模板 |
 | `ops/` | 同步、回归检查和生产部署脚本 |
 | `docs/` | 工具参考、部署和运维说明 |
 

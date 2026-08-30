@@ -1,0 +1,24 @@
+services:
+  fm-admin:
+    image: ${FM_ADMIN_IMAGE:-fm-admin:local}
+    container_name: fm-admin
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      FM_ADMIN_HOST: 0.0.0.0
+      FM_ADMIN_PORT: 8090
+      FM_ADMIN_TOKEN: ${FM_ADMIN_TOKEN:?FM_ADMIN_TOKEN is required}
+      FM_ADMIN_STATE: /data/fm-admin-state.json
+      FM_DOMAIN_URL: http://fm-domain:8077
+    networks:
+      - fm-runtime
+    volumes:
+      - ${FM_ADMIN_DATA_DIR:-/opt/fm-admin/data}:/data
+    depends_on:
+      fm-domain:
+        condition: service_healthy
+
+networks:
+  fm-runtime:
+    external: true
+    name: fm-runtime

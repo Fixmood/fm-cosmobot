@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 import app
@@ -53,6 +54,13 @@ class AdminApiTest(unittest.TestCase):
         with urlopen(self.base + "/") as response:
             self.assertEqual(response.status, 200)
             self.assertIn(b"FM Control Center", response.read())
+
+    def test_domain_data_is_exposed_as_read_only_proxy(self):
+        with patch.object(app, "fetch_domain", return_value={"ok": True, "data": {"items": []}}) as fetch:
+            status, payload = self.request("GET", "/api/domain/contests")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        fetch.assert_called_once_with("/contest/search?limit=50")
 
 
 if __name__ == "__main__":

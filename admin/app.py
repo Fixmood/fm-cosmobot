@@ -21,6 +21,13 @@ DOMAIN_URL = os.environ.get("FM_DOMAIN_URL", "http://127.0.0.1:8077").rstrip("/"
 ADMIN_TOKEN = os.environ.get("FM_ADMIN_TOKEN", "").strip()
 LOCK = threading.RLock()
 COLLECTIONS = {"groups", "triggers", "personas", "models"}
+DOMAIN_READS = {
+    "library": "/library/search?limit=50",
+    "contests": "/contest/search?limit=50",
+    "scores": "/scores?limit=50",
+    "stats": "/stats",
+    "archive": "/archive/status",
+}
 
 
 def read_state() -> dict:
@@ -126,6 +133,14 @@ class Api(BaseHTTPRequestHandler):
             })
         elif request.path == "/api/logs":
             self.send_json(HTTPStatus.OK, {"ok": True, "items": list(reversed(read_state()["audit"]))})
+        elif request.path.startswith("/api/domain/"):
+            name = request.path.removeprefix("/api/domain/")
+            path = DOMAIN_READS.get(name)
+            if path is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "领域数据接口不存在。")
+            else:
+                result = fetch_domain(path)
+                self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
         elif request.path.startswith("/api/collections/"):
             self.collection_get(request.path.removeprefix("/api/collections/"), parse_qs(request.query))
         elif request.path == "/":
