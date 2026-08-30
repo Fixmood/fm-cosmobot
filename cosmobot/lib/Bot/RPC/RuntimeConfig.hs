@@ -53,8 +53,12 @@ configMethod request =
       Right PersonaArgs{..} -> case personaScope scope ident of
         Left message -> pure (Left (RPC.rpcError "invalid_params" message))
         Right target -> case action of
-          "get" -> Right . personaResult target <$> Memory.loadMemory target
-          "status" -> Right . personaResult target <$> Memory.loadMemory target
+          "get" -> do
+            current <- Memory.loadMemory target
+            pure (Right (personaResult target current))
+          "status" -> do
+            current <- Memory.loadMemory target
+            pure (Right (personaResult target current))
           "set" -> case content of
             Nothing -> pure (Left (RPC.rpcError "invalid_params" "content is required for set"))
             Just text
@@ -69,7 +73,9 @@ configMethod request =
       Right TriggerArgs{..}
         | action == "list" -> Right . Aeson.toJSON . map triggerValue <$> liftIO Trigger.listTriggerConfigs
         | Text.null (Text.strip scope) -> pure (Left (RPC.rpcError "invalid_params" "scope is required"))
-        | action == "get" || action == "status" -> Right . triggerResult scope <$> liftIO (Trigger.loadTriggerConfigByKey scope)
+        | action == "get" || action == "status" -> do
+            current <- liftIO (Trigger.loadTriggerConfigByKey scope)
+            pure (Right (triggerResult scope current))
         | action == "clear" -> liftIO (Trigger.clearTriggerConfigByKey scope) >> pure (Right (savedValue scope))
         | action == "set" -> do
             modes <- traverse parseMode modesRaw
@@ -83,6 +89,7 @@ configMethod request =
                     pure (Right (savedValue scope))
         | otherwise -> pure (Left (RPC.rpcError "invalid_params" "action must be list, get, status, set, or clear"))
       where
+        parseMode :: Text -> Either Text Trigger.TriggerMode
         parseMode raw = maybe (Left ("unknown trigger mode: " <> raw)) Right (Trigger.parseTriggerMode raw)
         clean = filter (not . Text.null) . map Text.strip
 
@@ -154,7 +161,7 @@ personaScope raw ident = case Text.toCaseFold (Text.strip raw) of
   _ -> Left "scope must be private, private_default, group, group_default, or member"
   where
     requireId label = maybe (Left (label <> " scope requires id")) (Right . Text.strip) . nonEmpty
-    requireInteger label value = maybe (Left (label <> " scope requires a positive numeric id")) (Right . read) (value >>= readPositive . Text.unpack)
+    requireInteger label value = maybe (Left (label <> " scope requires a positive numeric id")) Right (value >>= readPositive . Text.unpack)
     readPositive text = case readMaybe text of Just number | number > (0 :: Integer) -> Just number; _ -> Nothing
     nonEmpty value = let clean = Text.strip value in if Text.null clean then Nothing else Just clean
 
