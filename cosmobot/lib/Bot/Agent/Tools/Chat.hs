@@ -1,0 +1,429 @@
+{-|
+Module      : Bot.Agent.Tools.Chat
+Description : Agent tools for chat IO and chat metadata
+Stability   : experimental
+-}
+
+module Bot.Agent.Tools.Chat
+  ( queryChatLogTool
+  , queryCurrentSenderChatLogTool
+  , recallRecentSelfMessagesTool
+  , sendReplyTool
+  , sendFileTool
+  , mentionUserTool
+  , senderMemberInfoTool
+  , memberInfoTool
+  , userAvatarTool
+  , listGroupMembersTool
+  , currentMessageInfoTool
+  )
+where
+
+import Bot.Agent.Tools.Common
+import Bot.Agent.Tool
+import Bot.Agent.Types
+import Bot.Core.Message
+import qualified Bot.Core.ReplyBody as ReplyBody
+import qualified Bot.Chat.Bridge.FM as FMBridge
+import qualified Bot.Effect.Chat as Chat
+import qualified Bot.Effect.ChatLog as ChatLog
+import qualified Bot.Effect.Media as Media
+import Bot.Prelude
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.Types as AesonTypes
+import qualified Data.Text as Text
+import Data.Time (TimeZone (..), UTCTime, defaultTimeLocale, formatTime, utcToLocalTime)
+
+queryChatLogTool :: ChatLog.ChatLog :> es => Tool (Eff es)
+queryChatLogTool =
+  tagged [chatTag]
+  . allowWhen hasExplicitChatLogIntent
+  . withDescription "Return recent messages recorded in the current chat, optionally filtered by exact sender id. Results are in chronological order and include timestamps, sender ids, message ids, image urls, and text. Use since or before to page through time."
+  $ tool "chat_log"
+      ( requiredInt "limit" "Maximum number of recent messages to return."
+      , optionalText "sender" "Optional exact sender id to include."
+      , withDefault False (optionalBoolean "include_bot_messages" "Whether to include bot messages. Defaults to false.")
+      , optionalArgument (fieldDateTime "since" "Return messages strictly after this ISO-8601 UTC timestamp.")
+      , optionalArgument (fieldDateTime "before" "Return messages strictly before this ISO-8601 UTC timestamp.")
+      )
+      \limit sender includeBotMessages since before -> do
+        context <- askToolContext
+        if not (hasExplicitChatLogIntent context)
+          then pure (toolText "未查询聊天记录：当前消息没有明确的查询记录请求。")
+          else do
+            let senderFilter = do
+                  value <- Text.strip <$> sender
+                  guard (not (Text.null value))
+                  pure value
+            case chatLogTimeRange since before of
+              Left err ->
+                pure (argumentFailure err)
+              Right timeRange -> do
+                entries <- ChatLog.queryChat context.message senderFilter (max 0 limit) includeBotMessages timeRange
+                pure (toolText (jsonText (map chatLogToolEntry entries)))
+
+queryCurrentSenderChatLogTool :: ChatLog.ChatLog :> es => Tool (Eff es)
+queryCurrentSenderChatLogTool =
+  tagged [chatTag]
+  . noisy
+  . withDescription "Return messages from the current sender whose text matches any keyword group. scope=chat searches only the current chat; scope=global searches all chats on the current platform. Each keyword group is matched as a SQL LIKE pattern with '%' between its terms. Results are newest first and limited to at most 100."
+  $ tool "sender_log"
+      ( requiredArgument (fieldTextArrayArray "keywords" "Keyword groups. Each inner array is joined with '%' and wrapped with '%' for ordered fuzzy matching.")
+      , validateArgument validSenderLogLimit
+          (requiredArgument (fieldIntegerMax "limit" 100 "Maximum number of matching messages to return. Must be <= 100."))
+      , validateArgument parseSenderChatLogScope
+          (withDefault "chat" (optionalArgument
+            ("scope", Aeson.object
+          [ "type" Aeson..= ("string" :: Text)
+          , "enum" Aeson..= (["chat", "global"] :: [Text])
+          , "description" Aeson..= ("Search the current chat or all chats on the current platform. Defaults to chat." :: Text)
+          ])))
+      , optionalArgument (fieldDateTime "since" "Return messages strictly after this ISO-8601 UTC timestamp.")
+      , optionalArgument (fieldDateTime "before" "Return messages strictly before this ISO-8601 UTC timestamp.")
+      )
+      \keywords limit scope since before -> do
+        context <- askToolContext
+        case currentSenderChatLogScopeError scope context.message of
+          Just err ->
+              pure (argumentFailure err)
+          Nothing ->
+            case chatLogTimeRange since before of
+              Left err ->
+                pure (argumentFailure err)
+              Right timeRange -> do
+                entries <- ChatLog.queryCurrentSenderChatLog context.message scope keywords limit timeRange
+                pure (toolText (jsonText (map chatLogToolEntry entries)))
+
+recallRecentSelfMessagesTool :: Chat.Chat :> es => Tool (Eff es)
+recallRecentSelfMessagesTool =
+  tagged [chatTag]
+  . noisy
+  . allowWhen superuserOnly
+  . withDescription "Recall FM's own messages sent in the current QQ chat during the last two minutes. This works for normal answers, typing-practice articles, tool output, images, audio, and files. Use it whenever the owner naturally asks FM to 撤回刚才的回答、撤回最近几条消息、撤回刚才的图片 or 撤回全部刚发内容. Never use chat_log or recall-history query tools for deleting FM's own messages. For plural or 全部 requests, set count high enough, up to 50."
+  $ tool "recall_recent_self_messages"
+      (optionalInt "count" "Number of FM's recent messages to recall, from 1 to 50. Use 1 for singular requests and up to 50 for 全部.")
+      \requestedCount -> do
+        context <- askToolContext
+        let count = max 1 (min 50 (fromMaybe 1 requestedCount))
+        (recalled, failed) <- Chat.recallRecentSelfMessages context.message count
+        pure . toolText $
+          case (recalled, failed) of
+            (0, 0) -> "最近两分钟没有可撤回的 FM 消息。"
+            (0, failures) ->
+              "撤回失败，共 " <> show failures <> " 条；可能已经超过 QQ 的两分钟时限。"
+            (successes, 0) ->
+              "已成功撤回最近 " <> show successes <> " 条 FM 消息。"
+            (successes, failures) ->
+              "已撤回 " <> show successes <> " 条，另有 " <> show failures <> " 条撤回失败。"
+
+sendReplyTool :: Chat.Chat :> es => Tool (Eff es)
+sendReplyTool =
+  tagged [chatTag]
+  . noisy
+  . allowWhen hasExplicitAdditionalSendIntent
+  . withDescription "Send a reply message to the same chat as the current user message. Supports text and image URLs. Use image_urls when the user asks you to send an image found or generated elsewhere. Use only when the user asks you to send an additional message before the final answer."
+  $ tool "send_reply"
+      ( optionalText "text" "Message text to send. May be omitted when image_urls is non-empty."
+      , optionalTextArray "image_urls" "Image URLs to send as images in the same reply. The platform must be able to fetch these URLs."
+      )
+      \maybeText maybeImageUrls -> do
+        context <- askToolContext
+        let text = Text.strip (fromMaybe "" maybeText)
+            imageUrls = filter (not . Text.null) (map Text.strip (fromMaybe [] maybeImageUrls))
+            body = replyBodyWithImages text imageUrls
+        if not (hasExplicitAdditionalSendIntent context)
+          then pure (toolText "未发送：当前消息没有明确要求额外发送消息。")
+          else if Text.null body
+          then pure (argumentFailure "Either text or image_urls must be provided.")
+          else do
+            sent <- Chat.replyTo context.message (FMBridge.fmReplyRelayBody body)
+            case rights sent of
+              messageIds@(_:_) -> do
+                let sentText = show messageIds :: String
+                pure (toolText [i|Sent message ids: #{sentText}|])
+              [] ->
+                let err = Text.intercalate "\n" (lefts sent)
+                 in
+                pure (toolFailure Failure
+                  { category = ExternalServiceUnavailable
+                  , userMessage = [i|发送消息失败：#{err}|]
+                  , detail = err
+                  })
+
+sendFileTool :: Chat.Chat :> es => Tool (Eff es)
+sendFileTool =
+  tagged [chatTag]
+  . noisy
+  . allowWhen superuserOnly
+  . withDescriptionBy (\context ->
+      "Send a local file to the same chat as the current user message. "
+        <> case context.message.platform of
+          PlatformQQ ->
+            "First move or copy the file into the NapCat container, then pass its path inside that container. Do not pass the host path."
+          _ ->
+            "The path must be readable by the bot."
+        <> " Use only when the user explicitly asks you to send a file.")
+  $ tool "send_file"
+      (validateArgument validFilePath
+        (requiredText "path" "Local file path to send. A file:// prefix is accepted and stripped before upload."))
+      \path -> do
+        context <- askToolContext
+        result <- Chat.uploadFile context.message path Nothing
+        case result of
+          Right sent -> do
+            let sentText = show sent :: String
+            pure (toolText [i|Sent file #{Text.pack path}; message id: #{sentText}|])
+          Left err -> do
+            let failureText = "发送文件失败：" <> err
+            void $ Chat.replyTo context.message failureText
+            pure (toolFailure Failure
+              { category = ExternalServiceUnavailable
+              , userMessage = failureText
+              , detail = err
+              })
+
+mentionUserTool :: Chat.Chat :> es => Tool (Eff es)
+mentionUserTool =
+  tagged [chatTag]
+  . noisy
+  . withDescription "Send a reply in the current chat that mentions the given platform user id. Matrix user ids are textual, for example @user:server."
+  $ tool "mention_user"
+      ( userIdArgument "Platform user id to mention."
+      , requiredText "text" "Message text to send after the mention."
+      )
+      \userId text -> do
+        context <- askToolContext
+        Chat.mentionUser context.message userId text >>= \case
+          Right sent -> do
+            let sentText = show sent :: String
+            pure (toolText [i|Sent mention message id: #{sentText}|])
+          Left err ->
+            pure (toolFailure Failure
+              { category = ExternalServiceUnavailable
+              , userMessage = [i|发送提及消息失败：#{err}|]
+              , detail = err
+              })
+
+senderMemberInfoTool :: Chat.Chat :> es => Tool (Eff es)
+senderMemberInfoTool =
+  tagged [chatTag]
+  . withDescription "Get platform-provided member information for the sender of the current message in the current group chat."
+  $ tool "sender_info" noArguments do
+      context <- askToolContext
+      info <- Chat.getSenderMemberInfo context.message
+      pure (toolText (maybe "No member information is available for this message." jsonText info))
+
+memberInfoTool :: Chat.Chat :> es => Tool (Eff es)
+memberInfoTool =
+  tagged [chatTag]
+  . withDescription "Get platform-provided member information for any user id in the current group chat."
+  $ tool "member_info"
+      (userIdArgument "Platform user id to query in the current group.")
+      \userId -> do
+        context <- askToolContext
+        info <- Chat.getMemberInfo context.message userId
+        pure (toolText (maybe "No member information is available for this user in the current chat." jsonText info))
+
+userAvatarTool :: (Chat.Chat :> es, Media.Media :> es, KatipE :> es) => Tool (Eff es)
+userAvatarTool =
+  tagged [chatTag]
+  . noisy
+  . allowWhen hasExplicitAvatarIntent
+  . withDescription "Get avatar information for a platform user id and send the avatar image to the current chat."
+  $ tool "user_avatar"
+      (userIdArgument "Platform user id to query. Use message_info first when the target is the current sender or a mentioned user. 0 is invalid.")
+      \userId -> do
+        context <- askToolContext
+        if not (hasExplicitAvatarIntent context)
+          then pure (toolText "未发送头像：当前消息没有明确的头像请求。")
+          else do
+            avatar <- Chat.getUserAvatar context.message userId
+            case avatar of
+              Nothing ->
+                pure (toolText "No avatar is available for this user on this platform.")
+              Just value ->
+                userAvatarResult context value
+
+listGroupMembersTool :: Chat.Chat :> es => Tool (Eff es)
+listGroupMembersTool =
+  tagged [chatTag]
+  . withDescription "List members in the current group chat, including platform user ids and nicknames when available. QQ groups are supported. Telegram Bot API does not expose full member lists, so Telegram may return unavailable."
+  $ tool "group_members" noArguments do
+      context <- askToolContext
+      members <- Chat.listGroupMembers context.message
+      pure (toolText (maybe "Group member listing is not available for this platform or chat." jsonText members))
+
+currentMessageInfoTool :: Tool (Eff es)
+currentMessageInfoTool =
+  tagged [chatTag]
+  . withDescription "Return structured metadata for the current message, including platform, chat, sender, message ids, mentions, image URLs, and text."
+  $ tool "message_info" noArguments do
+      context <- askToolContext
+      pure (toolText (jsonText (currentMessageInfoValue context.message)))
+
+currentMessageInfoValue :: IncomingMessage -> Aeson.Value
+currentMessageInfoValue message =
+  Aeson.object
+    [ "platform" Aeson..= chatPlatformKey message.platform
+    , "chat_kind" Aeson..= (show message.kind :: Text)
+    , "chat_id" Aeson..= message.chatId
+    , "chat_aliases" Aeson..= message.chatAliases
+    , "message_id" Aeson..= message.messageId
+    , "reply_to_message_id" Aeson..= message.replyToMessageId
+    , "sender_id" Aeson..= message.senderId
+    , "sender_username" Aeson..= message.senderUsername
+    , "mentions" Aeson..= Aeson.object
+        [ "user_ids" Aeson..= message.mentions
+        , "text_user_ids" Aeson..= message.mentionUsernames
+        ]
+    , "image_urls" Aeson..= message.imageUrls
+    , "text" Aeson..= message.text
+    ]
+
+chatLogToolEntry :: ChatLog.ChatLogEntry -> Aeson.Value
+chatLogToolEntry entry =
+  Aeson.object
+    [ "timestamp" Aeson..= fmap formatChinaTimestamp entry.recordedAt
+    , "chatId" Aeson..= entry.chatId
+    , "senderId" Aeson..= entry.senderId
+    , "senderUsername" Aeson..= entry.senderUsername
+    , "messageId" Aeson..= entry.messageId
+    , "imageUrls" Aeson..= entry.imageUrls
+    , "text" Aeson..= entry.text
+    ]
+
+-- Chat-log records are stored in UTC; present them in the user's China timezone.
+formatChinaTimestamp :: UTCTime -> Text
+formatChinaTimestamp =
+  Text.pack . (<> " +08:00") . formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S" . utcToLocalTime chinaTimeZone
+
+chinaTimeZone :: TimeZone
+chinaTimeZone = TimeZone 480 False "CST"
+
+parseSenderChatLogScope :: Text -> Either Text ChatLog.SenderChatLogScope
+parseSenderChatLogScope = \case
+  "chat" ->
+    Right ChatLog.SenderChatLogChat
+  "global" ->
+    Right ChatLog.SenderChatLogGlobal
+  _ ->
+    Left "scope must be chat or global."
+
+validSenderLogLimit :: Int -> Either Text Int
+validSenderLogLimit limit
+  | limit < 0 =
+      Left "limit must be >= 0."
+  | limit > 100 =
+      Left "limit must be <= 100."
+  | otherwise =
+      Right limit
+
+chatLogTimeRange
+  :: Maybe UTCTime
+  -> Maybe UTCTime
+  -> Either Text ChatLog.ChatLogTimeRange
+chatLogTimeRange since before
+  | maybe False (uncurry (>=)) ((,) <$> since <*> before) =
+      Left "since must be earlier than before."
+  | otherwise =
+      Right ChatLog.ChatLogTimeRange{since, before}
+
+currentSenderChatLogScopeError :: ChatLog.SenderChatLogScope -> IncomingMessage -> Maybe Text
+currentSenderChatLogScopeError scope message
+  | isNothing message.senderId =
+      Just "Current message has no sender_id; cannot query sender-scoped chat log."
+  | scope == ChatLog.SenderChatLogChat
+  , isNothing message.chatId =
+      Just "Current message has no chat_id; cannot query chat-scoped chat log."
+  | otherwise =
+      Nothing
+
+hasExplicitChatLogIntent :: Context -> Bool
+hasExplicitChatLogIntent context =
+  any (`Text.isInfixOf` normalized)
+    [ "聊天记录", "聊天日志", "历史消息", "刚才谁说", "查记录", "查一下记录", "看看记录"
+    , "聊天历史", "search my history", "chat history", "recent messages" ]
+  where
+    normalized = Text.toLower context.input.text
+
+hasExplicitAvatarIntent :: Context -> Bool
+hasExplicitAvatarIntent context =
+  any (`Text.isInfixOf` normalized)
+    [ "头像", "头像图片", "看头像", "发头像", "用户头像" ]
+  where
+    normalized = Text.toLower context.input.text
+
+hasExplicitAdditionalSendIntent :: Context -> Bool
+hasExplicitAdditionalSendIntent context =
+  any (`Text.isInfixOf` normalized)
+    [ "再发", "另外发", "额外发", "发送一条", "发一条消息", "把图片发", "把文件发" ]
+  where
+    normalized = Text.toLower context.input.text
+
+userIdArgument :: Text -> ToolArgument Text
+userIdArgument description =
+  mapArgument
+    (parseUserIdValue >=> validateUserId)
+    (requiredArgument (fieldText "user_id" description))
+
+parseUserIdValue :: Aeson.Value -> AesonTypes.Parser Text
+parseUserIdValue value =
+  (Text.strip <$> Aeson.parseJSON value)
+    <|> (Text.pack . show <$> (Aeson.parseJSON value :: AesonTypes.Parser Integer))
+
+validateUserId :: Text -> AesonTypes.Parser Text
+validateUserId userId
+  | Text.null (Text.strip userId) =
+      fail "user_id must not be empty."
+  | Text.strip userId == "0" =
+      fail "user_id must not be 0."
+  | otherwise =
+      pure (Text.strip userId)
+
+avatarUrl :: Aeson.Value -> Maybe Text
+avatarUrl =
+  AesonTypes.parseMaybe $
+    Aeson.withObject "user avatar" (Aeson..: Key.fromText "avatar_url")
+
+userAvatarResult :: (Chat.Chat :> es, Media.Media :> es, KatipE :> es) => Context -> Aeson.Value -> Eff es ToolResult
+userAvatarResult context value =
+  case avatarUrl value of
+    Nothing ->
+      pure (toolText (jsonText value))
+    Just url -> do
+      ref <- Media.normalizeMediaRef url
+      Media.mediaFileInfoByRef ref >>= \case
+        Nothing ->
+          sendAvatar url
+        Just info
+          | "image/" `Text.isPrefixOf` Text.toLower info.mimeType -> do
+              sendAvatar ref
+        _ ->
+          pure (toolFailure (permanentArgumentFailure "头像地址没有返回图片，已阻止发送。" "头像地址没有返回图片，已阻止发送。"))
+  where
+    sendAvatar imageRef = do
+      let body = FMBridge.fmReplyRelayBody (ReplyBody.imageDirective imageRef)
+      sent <- Chat.replyTo context.message body
+      logInfo [i|user_avatar sent avatar image: url=#{imageRef} message_id=#{show sent :: Text}|]
+      pure (toolTextWithImages (jsonText value) [imageRef])
+
+validFilePath :: Text -> Either Text FilePath
+validFilePath rawPath
+  | Text.null (Text.strip path) =
+      Left "path must not be empty."
+  | otherwise =
+      Right (Text.unpack path)
+  where
+    stripped = Text.strip rawPath
+    path = fromMaybe stripped (Text.stripPrefix "file://" stripped)
+
+argumentFailure :: Text -> ToolResult
+argumentFailure err =
+  toolFailure (permanentArgumentFailure err err)
+
+replyBodyWithImages :: Text -> [Text] -> Text
+replyBodyWithImages text imageUrls =
+  Text.strip $ Text.unlines $
+    [ text | not (Text.null text) ]
+      <> map ReplyBody.imageDirective imageUrls

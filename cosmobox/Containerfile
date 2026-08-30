@@ -1,0 +1,52 @@
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cabal-install \
+        cmake \
+        curl \
+        fd-find \
+        file \
+        gdb \
+        ghc \
+        git \
+        hyperfine \
+        jq \
+        just \
+        less \
+        lsof \
+        make \
+        ninja-build \
+        parallel \
+        pkg-config \
+        procps \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        strace \
+        time \
+        tini \
+        tree \
+        unzip \
+        p7zip-full \
+        wget \
+        xz-utils \
+        zip \
+        ffmpeg \
+        imagemagick \
+        tesseract-ocr \
+        tesseract-ocr-chi-sim \
+        poppler-utils \
+        pandoc \
+        fonts-noto-cjk \
+        fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages \
+        edge-tts faster-whisper pillow pypdf python-docx openpyxl python-pptx \
+    && curl -LsSf https://astral.sh/uv/install.sh | \
+        XDG_BIN_HOME=/usr/bin UV_NO_MODIFY_PATH=1 sh
+
+WORKDIR /workspace

@@ -1,0 +1,5 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# China time: archive today's public contest texts shortly after midnight.
+5 0 * * * root docker exec fm-domain python3 /data/contest_daily_sync.py >> /var/log/fm-contest-daily.log 2>&1

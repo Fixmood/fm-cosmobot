@@ -1,0 +1,28 @@
+dist-newstyle/
+cosmobot.sqlite3*
+config.toml
+*.sh
+.ghcid-errors
+__pycache__/
+# FM runtime and secrets
+config.toml
+*.sqlite3
+runtime/
+work/
+tool-output/
+source-backups/
+*.log
+*.pem
+*.key
+.env
+.env.*
+.production-snapshot/
+.release/
+fm-domain/data/
+fm-domain/assets/
+
+# Local backups and build artifacts
+*.pre-*
+*.backup
+*.remote
+dist-newstyle/

@@ -1,0 +1,36 @@
+services:
+  fm-cosmobot:
+    image: ${FM_COSMOBOT_IMAGE:-fm-cosmobot:runtime-fm-tools}
+    container_name: fm-cosmobot
+    restart: unless-stopped
+    command: ["serve", "--config", "config.toml"]
+    environment:
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 38765), 3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - fm-runtime
+    dns:
+      - 223.5.5.5
+      - 223.6.6.6
+    volumes:
+      - ${FM_RUNTIME_DIR:-/opt/fm-cosmobot/runtime}:/data
+      - ${FM_WORK_DIR:-/opt/fm-cosmobot/work}:/work
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/www/html:/host-sites:ro
+      - /etc/nginx:/host-nginx:ro
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    cap_add:
+      - SYS_ADMIN
+
+networks:
+  fm-runtime:
+    external: true
+    name: fm-runtime

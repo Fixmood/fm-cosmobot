@@ -1,0 +1,28 @@
+services:
+  fm-domain:
+    image: ${FM_DOMAIN_IMAGE:-fm-domain:local}
+    container_name: fm-domain
+    restart: unless-stopped
+    command: ["serve", "--host", "0.0.0.0", "--port", "8077"]
+    environment:
+      TZ: Asia/Shanghai
+      FM_DOMAIN_DB: /data/fm-domain.sqlite3
+      FM_CONTEST_LIBRARY_ROOT: /data/contest-library
+      FM_REPORT_FONT: ${FM_REPORT_FONT:-/assets/msyh.ttc}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8077/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      fm-runtime:
+        ipv4_address: 172.20.0.4
+    volumes:
+      - ${FM_DOMAIN_DATA_DIR:-/opt/fm-domain/data}:/data
+      - ${FM_DOMAIN_ASSETS_DIR:-/opt/fm-domain/assets}:/assets:ro
+
+networks:
+  fm-runtime:
+    external: true
+    name: fm-runtime

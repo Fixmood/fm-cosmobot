@@ -1,0 +1,39 @@
+-- Production uses the pinned vendor checkout mounted at /build/vendor.
+-- Keep this overlay independent from the server-local LTS snapshot: that
+-- snapshot targets an older aeson/base combination than GHC 9.10.
+packages:
+  cosmobot
+  cosmocode
+  vendor/katip-effectful
+  vendor/amazonka/lib/amazonka
+  vendor/amazonka/lib/amazonka-core
+  vendor/amazonka/lib/services/amazonka-s3
+  vendor/amazonka/lib/services/amazonka-sso
+  vendor/amazonka/lib/services/amazonka-sts
+
+package amazonka
+  tests: False
+  benchmarks: False
+
+package amazonka-core
+  tests: False
+  benchmarks: False
+
+package amazonka-s3
+  tests: False
+  benchmarks: False
+
+package amazonka-sso
+  tests: False
+  benchmarks: False
+
+package amazonka-sts
+  tests: False
+  benchmarks: False
+
+package katip-effectful
+  tests: False
+  benchmarks: False
+
+package cosmobot
+  tests: True

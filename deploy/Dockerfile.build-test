@@ -1,0 +1,17 @@
+ARG FM_BUILD_IMAGE=fm-cosmobot:build-4c782b1
+FROM ${FM_BUILD_IMAGE} AS build-tools
+
+FROM fm-cosmobox:latest
+
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y zlib1g-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-tools /opt/ghc /opt/ghc
+COPY --from=build-tools /usr/local/bin/cabal /usr/local/bin/cabal
+
+RUN (sed -i 's|deb.debian.org/debian-security|mirrors.ustc.edu.cn/debian-security|g; s|deb.debian.org/debian|mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list 2>/dev/null || true) && \
+    (sed -i 's|deb.debian.org/debian-security|mirrors.ustc.edu.cn/debian-security|g; s|deb.debian.org/debian|mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) && \
+    apt-get update && \
+    apt-get install --no-install-recommends -y bubblewrap tree && \
+    rm -rf /var/lib/apt/lists/*

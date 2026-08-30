@@ -1,0 +1,33 @@
+name: FM Auto Pull Request
+
+on:
+  push:
+    branches:
+      - 'fm/pr-*'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create pull request if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if gh pr view "$BRANCH" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "Pull request already exists for $BRANCH"
+            exit 0
+          fi
+          TITLE="$(gh api "repos/$REPOSITORY/commits/$BRANCH" --jq '.commit.message' | head -n 1)"
+          if [ -z "$TITLE" ]; then TITLE="FM changes from $BRANCH"; fi
+          gh pr create \
+            --repo "$REPOSITORY" \
+            --base fm/main \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body "由 FM 提交。请在合并前完成代码审查和测试。"

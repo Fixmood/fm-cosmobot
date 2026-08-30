@@ -1,0 +1,48 @@
+[tool.mypy]
+python_version = "3.10"
+files = ["python/cosmobot_worker.py", "python/test_cosmobot_worker.py"]
+strict = true
+warn_unreachable = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812", # Conflicts with the formatter.
+  "CPY001", # This repository does not add per-file copyright notices.
+  "D203",   # Incompatible with D211.
+  "D213",   # Incompatible with D212.
+]
+
+[tool.ruff.lint.per-file-ignores]
+"python/cosmobot_worker.py" = [
+  "BLE001", # The fork boundary must reap on every BaseException, including controls.
+  "EM101",  # Protocol errors deliberately use stable literal messages.
+  "EM102",  # Validation errors deliberately interpolate their field label.
+  "N818",   # RunToolException is part of the injected public Python API.
+  "PLR0913", # Descriptor/stream ownership is clearer as explicit parameters.
+  "PLR0917", # Descriptor/stream ownership is clearer as explicit parameters.
+  "PLR2004", # Protocol limits are named in their validation messages.
+  "S102",   # Executing the caller's code is this sandbox worker's purpose.
+  "TRY003", # Protocol validation owns its precise wire-error messages here.
+  "TRY004", # Protocol type violations are wire-value errors, not Python API errors.
+]
+"python/test_cosmobot_worker.py" = [
+  "EM101",   # Assertion failures use stable local diagnostic messages.
+  "EM102",   # Assertion diagnostics name the malformed field.
+  "INP001",  # Standalone self-test, not an importable package.
+  "PLR2004", # Wire limits and expected protocol values are clearer inline.
+  "PLR0915", # Keeping the standalone self-test linear preserves scenario order.
+  "PT018",   # Combined assertions retain the relevant fixture context.
+  "PERF203", # Tiny malformed-input table favors direct exception assertions.
+  "S101",    # This standalone self-test intentionally uses assertions.
+  "S603",    # The test launches a fixed interpreter and repository script.
+  "TRY003",  # Assertion failures use precise local diagnostics.
+  "TRY004",  # AssertionError is intentional in this standalone self-test.
+]
+
+[tool.ruff.format]
+docstring-code-format = true

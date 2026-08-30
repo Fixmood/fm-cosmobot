@@ -1,0 +1,839 @@
+module Bot.Agent.Tools.FMDomain
+  ( fmGroupStatusTool
+  , fmLibrarySearchTool
+  , fmLibraryPickTool
+  , fmLibraryStartTool
+  , fmLibraryContinueTool
+  , fmLibraryContinueSameTool
+  , fmLibraryContinuePreviousTool
+  , fmLibraryStopTool
+  , fmLibraryRecallRecentTool
+  , fmLibraryStatsTool
+  , fmRecallQueryTool
+  , fmScoreQueryTool
+  , fmGroupSetOnlineTool
+  , fmGroupSetCapabilityTool
+  , fmContestSearchTool
+  , fmContestSendTool
+  , fmLiveCompetitionRankTool
+  , fmLiveCompetitionTextTool
+  , fmAiContestTextTool
+  , fmAiContestPublishTool
+  , fmAiContestLeaderboardTool
+  , fmAiContestLeaderboardImageTool
+  , fmCompetitionScoreQueryTool
+  , fmCompetitionScoreSummaryTool
+  , fmCompetitionScoreImageTool
+  , fmChartTool
+  , fmBotGuardAccountsTool
+  , fmDomainStatsTool
+  ) where
+
+import Bot.Agent.Tool
+import Bot.Agent.Tools.Common
+  ( jsonText
+  , fieldBoolean
+  , optionalInt
+  , optionalText
+  , requiredText
+  , superuserOnly
+  )
+import Bot.Agent.Types (Context (..), ToolResult, toolText)
+import Bot.Core.Message
+  ( ChatPlatform (PlatformQQ)
+  , IncomingMessage (..)
+  , MessageDigest (..)
+  , MessageInput (..)
+  , chatPlatformKey
+  , messageIdText
+  , textMessageId
+  )
+import qualified Bot.Core.ReplyBody as ReplyBody
+import qualified Bot.Effect.Chat as Chat
+import qualified Bot.Effect.HTTP as HTTP
+import Bot.Prelude
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as AesonTypes
+import qualified Data.Text as Text
+import Network.HTTP.Req
+
+fmGroupStatusTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmGroupStatusTool =
+  withDescription "Read FM group status and enabled capabilities from the migrated FM data service."
+    $ tool "fm_group_status" noArguments do
+      response <- HTTP.runReq $
+        req GET (http "172.20.0.4" /: "groups") NoReqBody jsonResponse (port 8077)
+      pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
+
+fmLibrarySearchTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmLibrarySearchTool =
+  allowWhen hasExplicitLibraryIntent
+  . withDescription "Search FM's migrated typing-practice library by title, topic, or content keyword. Available only when the current user message explicitly asks for typing-practice text, an article, 文来, 发文, or the FM library; never reinterpret an unrelated topic as a library search."
+    $ tool "fm_library_search"
+      ( requiredText "query" "Title, topic, or keyword."
+      , optionalInt "limit" "Maximum results, from 1 to 30."
+      )
+      \query requestedLimit -> do
+        context <- askToolContext
+        withCapability context "library" do
+          let limit = max 1 (min 30 (fromMaybe 10 requestedLimit))
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "library" /: "search") NoReqBody jsonResponse
+              ("q" =: query <> "limit" =: limit <> port 8077)
+          pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
+
+fmLibraryPickTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmLibraryPickTool =
+  allowWhen hasExplicitLibraryIntent
+  . withDescription "Select one complete typing-practice text from FM's library matching a natural-language source, date, or topic. Available only for an explicit typing-practice article or FM-library request."
+    $ tool "fm_library_pick" (requiredText "query" "Desired title, topic, style, or keyword.")
+      \query -> do
+        context <- askToolContext
+        withCapability context "library" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "library" /: "pick") NoReqBody jsonResponse
+              ("q" =: query <> port 8077)
+          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmLibraryStartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLibraryStartTool =
+  allowWhen hasExplicitLibraryIntent
+  . withDescription "Start a persistent FM typing-practice article session in the current chat and send its first segment. Use only when the current message explicitly asks FM to send an article, 文来, 发文, 来一篇, or a difficulty command. A topic mentioned in ordinary conversation is not a request to search or send an article. For fm 淼/水/易/普/难/虐, pass that exact character in difficulty and leave query empty; each mode randomly selects only from its strict difficulty interval. For requests such as 恐怖文、修仙文、悬疑文、科幻文, pass the requested genre so the domain service selects and remembers that genre for continuation. The selected mode persists after typing scores. The tool sends the article itself; do not repeat the article body in the final response. The service returns deterministic metadata for the complete article: whole-article difficulty, genre, form, confidence, and current-segment difficulty."
+  $ tool "fm_library_start"
+      ( optionalText "query" "Optional title, topic, style, or content keyword. Leave empty for 文来 and difficulty commands."
+      , optionalText "difficulty" "Optional strict difficulty mode: 淼、水、易、普、难、虐. Empty means random 文来."
+      , optionalText "genre" "Optional article genre: 恐怖惊悚、悬疑推理、仙侠修真、玄幻奇幻、武侠江湖、言情爱情、科幻未来、历史古风、都市职场、校园青春、亲情家庭、励志成长、寓言童话、诗词古典、散文随笔、科普说明."
+      , optionalInt "length" "Optional segment length from 1 to 1400 characters; omitted means 200 to 400."
+      )
+      \query difficulty genre requestedLength -> do
+        context <- askToolContext
+        withCapability context "library" do
+          response <- postLibrarySession "start" (libraryStartPayload context
+            (fromMaybe "" query) (fromMaybe "" difficulty) (fromMaybe "" genre)
+            (fromMaybe 0 requestedLength))
+          sendLibrarySegment context response
+
+fmLibraryContinueTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLibraryContinueTool =
+  withDescription "Continue the current FM typing-practice mode by selecting and sending a new article. Random mode selects another random article; a requested difficulty selects another article strictly inside that same difficulty interval. This is the default continuation after a typing score."
+  $ tool "fm_library_continue" noArguments do
+      context <- askToolContext
+      withCapability context "library" do
+        response <- postLibrarySession "continue" (librarySessionPayload context)
+        sendLibrarySegment context response
+
+fmLibraryContinueSameTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLibraryContinueSameTool =
+  withDescription "Continue with the next segment of the currently displayed FM library article. Use only for 当前这篇、这一篇、这篇文. Never use this for 上一篇、刚才成绩前那篇, because those require fm_library_continue_previous. If the article has ended, report the service's question about returning to the previous random or difficulty mode."
+  $ tool "fm_library_continue_same" noArguments do
+      context <- askToolContext
+      withCapability context "library" do
+        response <- postLibrarySession "continue-same" (librarySessionPayload context)
+        sendLibrarySegment context response
+
+fmLibraryContinuePreviousTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLibraryContinuePreviousTool =
+  withDescription "Restore and continue the article from before the current newly generated article. Use whenever the user says 上一篇、继续打上一篇、刚才成绩前那篇, especially after a typing score caused FM to auto-select a new article. This recalls the currently displayed new article first, then sends the previous article from its saved offset."
+  $ tool "fm_library_continue_previous" noArguments do
+      context <- askToolContext
+      withCapability context "library" do
+        response <- postLibrarySession "continue-previous" (librarySessionPayload context)
+        sendPreviousLibrarySegment context response
+
+fmLibraryStopTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLibraryStopTool =
+  withDescription "Stop the active FM typing-practice article session in the current chat. It also attempts to recall the most recently sent article segment. Use when the user naturally asks FM to stop sending the article."
+  $ tool "fm_library_stop" noArguments do
+      context <- askToolContext
+      withCapability context "library" do
+        response <- postLibrarySession "stop" (librarySessionPayload context)
+        let status = fromMaybe ("error" :: Text) $ AesonTypes.parseMaybe
+              (Aeson.withObject "FM library stop" (Aeson..: "status")) response
+            message = fromMaybe ("发文停止失败。" :: Text) $ AesonTypes.parseMaybe
+              (Aeson.withObject "FM library stop" \o -> o Aeson..:? "message" Aeson..!= "") response
+            maybeMessageId = AesonTypes.parseMaybe
+              (Aeson.withObject "FM library stop" \o -> o Aeson..:? "last_message_id") response
+              >>= id
+        if status /= "stopped"
+          then pure (toolText message)
+          else do
+            recalled <- case Text.strip <$> maybeMessageId of
+              Just messageId | not (Text.null messageId) ->
+                Chat.deleteMessage context.message (textMessageId messageId)
+              _ -> pure False
+            when recalled $
+              for_ (Text.strip <$> maybeMessageId) \messageId ->
+                void $ postLibrarySession "recalled" (libraryRecallPayload context 1 [messageId])
+            pure . toolText $
+              if recalled
+                then "发文已停止，最近一段也已撤回。"
+                else "发文已停止，但最近一段撤回失败。"
+
+fmLibraryRecallRecentTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLibraryRecallRecentTool =
+  withDescription "Recall FM's own recently sent typing-practice article messages in the current QQ chat. Use this tool whenever the user asks to 撤回刚刚的发文、撤回这几条文章、删除刚才 FM 发的练习文. Do not use chat_log or fm_recall_query for this request. QQ normally allows recalling FM's own messages only within two minutes."
+  $ tool "fm_library_recall_recent"
+      (optionalInt "count" "Number of recent article messages to recall, from 1 to 20; default 5.")
+      \requestedCount -> do
+        context <- askToolContext
+        withCapability context "library" do
+          let count = max 1 (min 20 (fromMaybe 5 requestedCount))
+          response <- postLibrarySession "recall-recent" (libraryRecallPayload context count [])
+          let messageIds = fromMaybe ([] :: [Text]) $ AesonTypes.parseMaybe
+                (Aeson.withObject "FM recent library messages" \o -> o Aeson..:? "message_ids" Aeson..!= []) response
+          results <- forM messageIds \messageId -> do
+            succeeded <- Chat.deleteMessage context.message (textMessageId messageId)
+            pure (messageId, succeeded)
+          let recalledIds = map fst (filter snd results)
+              failedCount = length results - length recalledIds
+          unless (null recalledIds) $
+            void $ postLibrarySession "recalled" (libraryRecallPayload context count recalledIds)
+          pure . toolText $
+            case (length recalledIds, failedCount) of
+              (0, 0) -> "最近两分钟没有可撤回的发文。"
+              (0, failed) -> "最近的发文撤回失败，共 " <> show failed <> " 条；可能已经超过 QQ 的两分钟撤回时限。"
+              (recalled, 0) -> "已成功撤回最近 " <> show recalled <> " 条发文。"
+              (recalled, failed) ->
+                "已撤回 " <> show recalled <> " 条发文，另有 " <> show failed <> " 条撤回失败，可能已经超过 QQ 的两分钟时限。"
+
+fmLibraryStatsTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmLibraryStatsTool =
+  withDescription "Read FM typing-practice library statistics, including total texts, characters, difficulty indexing, and active article sessions."
+  $ tool "fm_library_stats" noArguments do
+      response <- HTTP.runReq $
+        req GET (http "172.20.0.4" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
+      pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+librarySessionPayload :: Context -> Aeson.Value
+librarySessionPayload context =
+  Aeson.object
+    [ "platform" Aeson..= chatPlatformKey context.message.platform
+    , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
+    , "requester_id" Aeson..= fromMaybe "" context.message.senderId
+    , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
+    , "owner" Aeson..= context.message.digest.senderIsSuperuser
+    ]
+
+libraryRecallPayload :: Context -> Int -> [Text] -> Aeson.Value
+libraryRecallPayload context count messageIds =
+  Aeson.object
+    [ "platform" Aeson..= chatPlatformKey context.message.platform
+    , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
+    , "requester_id" Aeson..= fromMaybe "" context.message.senderId
+    , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
+    , "owner" Aeson..= context.message.digest.senderIsSuperuser
+    , "count" Aeson..= count
+    , "message_ids" Aeson..= messageIds
+    ]
+
+libraryStartPayload :: Context -> Text -> Text -> Text -> Int -> Aeson.Value
+libraryStartPayload context query difficulty genre length =
+    Aeson.object
+    [ "platform" Aeson..= chatPlatformKey context.message.platform
+    , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
+    , "requester_id" Aeson..= fromMaybe "" context.message.senderId
+    , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
+    , "owner" Aeson..= context.message.digest.senderIsSuperuser
+    , "query" Aeson..= query
+      , "difficulty" Aeson..= difficulty
+      , "genre" Aeson..= genre
+      , "length" Aeson..= length
+    ]
+
+postLibrarySession :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
+postLibrarySession action payload = do
+  response <- HTTP.runReq $
+    req POST (http "172.20.0.4" /: "library" /: "session" /: action)
+      (ReqBodyJson payload) jsonResponse (port 8077)
+  pure (responseBody response :: Aeson.Value)
+
+sendLibrarySegment
+  :: (Chat.Chat :> es, HTTP.HTTP :> es)
+  => Context
+  -> Aeson.Value
+  -> Eff es ToolResult
+sendLibrarySegment context response = do
+  let status = fromMaybe ("error" :: Text) $ AesonTypes.parseMaybe
+        (Aeson.withObject "FM library segment" (Aeson..: "status")) response
+      message = fromMaybe ("文章生成失败。" :: Text) $ AesonTypes.parseMaybe
+        (Aeson.withObject "FM library segment" \o -> o Aeson..:? "message" Aeson..!= "") response
+      sessionId = fromMaybe ("" :: Text) $ AesonTypes.parseMaybe
+        (Aeson.withObject "FM library segment" \o -> o Aeson..:? "session_id" Aeson..!= "") response
+      metadataSummary = AesonTypes.parseMaybe
+        (Aeson.withObject "FM library metadata" \o -> o Aeson..:? "metadata_summary" Aeson..!= "") response
+  if status /= "segment"
+    then pure (toolText message)
+    else do
+      sent <- Chat.replyTo (standaloneLibraryMessage context.message) message
+      case rights sent of
+        sentMessageIdRaw : _ -> do
+          let sentMessageId = messageIdText sentMessageIdRaw
+          unless (Text.null sessionId) $
+            void $ postLibrarySession "sent" (Aeson.object
+              [ "session_id" Aeson..= sessionId
+              , "message_id" Aeson..= sentMessageId
+              ])
+          pure . toolText $ "文章已发送。"
+            <> maybe "" (\summary -> "已记录：" <> summary <> "。") metadataSummary
+            <> "不要在最终回复中重复文章正文。"
+        [] ->
+          pure . toolText $
+            "文章已经生成，但发送失败：" <> Text.intercalate "；" (lefts sent)
+
+sendPreviousLibrarySegment
+  :: (Chat.Chat :> es, HTTP.HTTP :> es)
+  => Context
+  -> Aeson.Value
+  -> Eff es ToolResult
+sendPreviousLibrarySegment context response = do
+  let status = fromMaybe ("error" :: Text) $ AesonTypes.parseMaybe
+        (Aeson.withObject "FM previous library segment" (Aeson..: "status")) response
+      maybeMessageId = AesonTypes.parseMaybe
+        (Aeson.withObject "FM previous library segment" \o -> o Aeson..:? "recall_message_id") response
+        >>= id
+  recalled <- if status /= "segment"
+    then pure Nothing
+    else case Text.strip <$> maybeMessageId of
+      Just messageId | not (Text.null messageId) ->
+        Just <$> Chat.deleteMessage context.message (textMessageId messageId)
+      _ -> pure Nothing
+  when (recalled == Just True) $
+    for_ (Text.strip <$> maybeMessageId) \messageId ->
+      void $ postLibrarySession "recalled" (libraryRecallPayload context 1 [messageId])
+  sentResult <- sendLibrarySegment context response
+  pure case recalled of
+    Just False -> toolText "上一篇已恢复并发送，但刚才的新文章撤回失败；请明确告知用户。"
+    _ -> sentResult
+
+standaloneLibraryMessage :: IncomingMessage -> IncomingMessage
+standaloneLibraryMessage message =
+  message
+    { messageId = Nothing
+    , replyToMessageId = Nothing
+    , raw = Aeson.Null
+    }
+
+fmRecallQueryTool :: (HTTP.HTTP :> es, Chat.Chat :> es) => Tool (Eff es)
+fmRecallQueryTool =
+  withDescription "Query original QQ messages captured before recall. Use natural-language criteria; all users may query recall records."
+    $ tool "fm_recall_query"
+      ( optionalText "group_id" "Optional QQ group ID."
+      , optionalText "query" "Optional text keyword."
+      )
+      \groupId query -> do
+        context <- askToolContext
+        withCapability context "recall" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "recalls") NoReqBody jsonResponse
+              ( "group_id" =: fromMaybe "" groupId
+                <> "q" =: fromMaybe "" query
+                <> port 8077
+              )
+          let records = responseBody response :: [Aeson.Value]
+              imageUrls = concatMap recallImageUrls records
+          when (not (null imageUrls)) $
+            void $ Chat.replyTo context.message
+              (Text.intercalate "\n" (map ReplyBody.imageDirective imageUrls))
+          pure . toolText . jsonText $ records
+
+recallImageUrls :: Aeson.Value -> [Text]
+recallImageUrls =
+  fromMaybe [] . AesonTypes.parseMaybe
+    (Aeson.withObject "FM recall record" (\o -> o Aeson..:? "image_urls" Aeson..!= []))
+
+fmScoreQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmScoreQueryTool =
+  withDescription "Query archived typing score records by QQ group and/or sender."
+    $ tool "fm_score_query"
+      ( optionalText "group_id" "Optional QQ group ID."
+      , optionalText "sender_id" "Optional sender QQ ID."
+      , optionalInt "limit" "Maximum records, from 1 to 100."
+      )
+      \groupId senderId requestedLimit -> do
+        context <- askToolContext
+        withCapability context "scores" do
+          let limit = max 1 (min 100 (fromMaybe 20 requestedLimit))
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "scores") NoReqBody jsonResponse
+              ( "group_id" =: fromMaybe "" groupId
+                <> "sender_id" =: fromMaybe "" senderId
+                <> "limit" =: limit
+                <> port 8077
+              )
+          pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
+
+fmGroupSetOnlineTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmGroupSetOnlineTool =
+  allowWhen superuserOnly
+  . withDescription "Set FM online or offline for one QQ group. This changes persistent group runtime state and is restricted to the owner."
+  $ tool "fm_group_set_online"
+      ( requiredText "group_id" "QQ group ID."
+      , requiredArgument (fieldBoolean "online" "True to bring FM online; false to take FM offline.") :: ToolArgument Bool
+      )
+      \groupId online -> do
+        response <- HTTP.runReq $
+          req POST (http "172.20.0.4" /: "group-state")
+            (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
+            jsonResponse
+            (port 8077)
+        pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmGroupSetCapabilityTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmGroupSetCapabilityTool =
+  allowWhen superuserOnly
+  . withDescription "Enable or disable one persistent FM capability for a QQ group. Valid capabilities: agent, library, contest, ai_contest, scores, recall, repeat."
+  $ tool "fm_group_set_capability"
+      ( requiredText "group_id" "QQ group ID."
+      , requiredText "capability" "One of: agent, library, contest, ai_contest, scores, recall, repeat."
+      , requiredArgument (fieldBoolean "enabled" "True to enable the capability; false to disable it.") :: ToolArgument Bool
+      )
+      \groupId capability enabled -> do
+        response <- HTTP.runReq $
+          req POST (http "172.20.0.4" /: "group-capability")
+            (ReqBodyJson (Aeson.object
+              [ "group_id" Aeson..= groupId
+              , "capability" Aeson..= capability
+              , "enabled" Aeson..= enabled
+              ]))
+            jsonResponse
+            (port 8077)
+        pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmContestSearchTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmContestSearchTool =
+  allowWhen hasExplicitContestIntent
+  . withDescription "Search FM's preserved typing-contest text library by source group, date, title, topic, or content. Available only when the current message literally mentions a typing contest, 赛文, 比赛, 赛事, 555, a named cup, or a leaderboard. Role-play words such as 案子, 案件, 卷宗, 侦探, or 调查 never mean contest text."
+    $ tool "fm_contest_search"
+      ( optionalText "query" "Optional title, topic, or content keyword."
+      , optionalText "source" "Optional source group or contest name."
+      , optionalText "date" "Optional date in YYYY-MM-DD format."
+      , optionalInt "limit" "Maximum results, from 1 to 30."
+      )
+      \query source competitionDate requestedLimit -> do
+        context <- askToolContext
+        withCapability context "contest" do
+          let limit = max 1 (min 30 (fromMaybe 10 requestedLimit))
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "contest" /: "search") NoReqBody jsonResponse
+              ( "q" =: fromMaybe "" query
+                <> "source" =: fromMaybe "" source
+                <> "date" =: fromMaybe "" competitionDate
+                <> "limit" =: limit
+                <> port 8077
+              )
+          pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
+
+fmContestSendTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmContestSendTool =
+  allowWhen hasExplicitContestIntent
+  . withDescription "Send one complete preserved historical typing-contest text matching a source, date, title, or topic. This is FM's dedicated historical contest sending tool for requests to发/来一篇/练一篇历史赛文, or when the user does not ask for today's/current/online text. For today/current/online contest text use fm_live_competition_text. The tool sends the complete text itself, so do not repeat it."
+    $ tool "fm_contest_send"
+      ( optionalText "query" "Optional title, topic, or content keyword."
+      , optionalText "source" "Optional source group or contest name."
+      , optionalText "date" "Optional date in YYYY-MM-DD format."
+      )
+      \query source competitionDate -> do
+        context <- askToolContext
+        withCapability context "contest" do
+          response <- HTTP.runReq $
+            req POST (http "172.20.0.4" /: "contest" /: "session" /: "start")
+              (ReqBodyJson (Aeson.object
+                [ "platform" Aeson..= chatPlatformKey context.message.platform
+                , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
+                , "requester_id" Aeson..= fromMaybe "" context.message.senderId
+                , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
+                , "query" Aeson..= fromMaybe "" query
+                , "source" Aeson..= fromMaybe "" source
+                , "date" Aeson..= fromMaybe "" competitionDate
+                ])) jsonResponse (port 8077)
+          sendLibrarySegment context (responseBody response :: Aeson.Value)
+
+fmLiveCompetitionRankTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLiveCompetitionRankTool =
+  allowWhen hasExplicitContestIntent
+  . noisy
+  . withDescription "Query and send a complete live public typing-contest leaderboard as one PNG image. Use this autonomously when natural language asks for the current or dated leaderboard of 虎杯, a supported group, 极速杯, or 锦标赛. The source may be 虎杯, a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends the complete image itself, so do not repeat the rows in the final response."
+  $ tool "fm_live_competition_rank"
+      ( optionalText "source" "Optional public contest source: 虎杯, supported QQ group name/number, 极速杯, or 锦标赛."
+      , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
+      )
+      \source competitionDate -> do
+        context <- askToolContext
+        withCapability context "contest" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
+              ( "source" =: fromMaybe "" source
+                <> "group_id" =: contextChatId context
+                <> "date" =: fromMaybe "" competitionDate
+                <> "soft" =: True
+                <> port 8077
+              )
+          case AesonTypes.parseMaybe parseLiveRank (responseBody response :: Aeson.Value) of
+            Nothing -> pure (toolText "实时排行榜查询失败：领域服务返回格式不正确。")
+            Just (status, kind, groupId, actualDate, _, message)
+              | status /= "ok" -> pure (toolText ("实时排行榜查询失败：" <> fallback message "公开网站当前没有返回可用数据。"))
+              | otherwise -> do
+                  let sourceKey = if kind == "group" then groupId else kind
+                      imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
+                        <> "&date=" <> actualDate <> "&combined=1"
+                  sent <- Chat.replyTo context.message (ReplyBody.imageDirective imageUrl)
+                  pure . toolText $ case rights sent of
+                    _ : _ -> "实时排行榜图片已发送。不要在最终回复中重复排行榜内容。"
+                    [] -> "实时排行榜已生成，但图片发送失败：" <> Text.intercalate "；" (lefts sent)
+  where
+    parseLiveRank :: Aeson.Value -> AesonTypes.Parser (Text, Text, Text, Text, Int, Text)
+    parseLiveRank = Aeson.withObject "FM live competition rank" \o ->
+      (,,,,,)
+        <$> o Aeson..: "status"
+        <*> o Aeson..:? "kind" Aeson..!= ""
+        <*> o Aeson..:? "group_id" Aeson..!= ""
+        <*> o Aeson..:? "date" Aeson..!= ""
+        <*> o Aeson..:? "page_count" Aeson..!= 0
+        <*> o Aeson..:? "message" Aeson..!= ""
+    fallback value defaultValue = if Text.null (Text.strip value) then defaultValue else value
+
+fmLiveCompetitionTextTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmLiveCompetitionTextTool =
+  allowWhen hasExplicitLiveContestIntent
+  . withDescription "Fetch and send the exact live public typing-contest text for a supported group or 极速杯. Use only when the current message explicitly asks for 赛文, 比赛文章, 赛事文本, or a named typing contest. Never treat 案子, 案件, 卷宗, 侦探, or other persona metaphors as a contest request. 锦标赛 does not expose its text. The tool sends the exact text itself, so do not rewrite or repeat it."
+  $ tool "fm_live_competition_text"
+      ( optionalText "source" "Optional public contest source: supported QQ group name/number, 极速杯, or 锦标赛."
+      , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
+      )
+      \source competitionDate -> do
+        context <- askToolContext
+        withCapability context "contest" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "competition" /: "live" /: "text") NoReqBody jsonResponse
+              ( "source" =: fromMaybe "" source
+                <> "group_id" =: contextChatId context
+                <> "date" =: fromMaybe "" competitionDate
+                <> "soft" =: True
+                <> port 8077
+              )
+          case AesonTypes.parseMaybe parseLiveText (responseBody response :: Aeson.Value) of
+            Nothing -> pure (toolText "实时赛文查询失败：领域服务返回格式不正确。")
+            Just (status, sourceName, title, wordNumber, body, message)
+              | status /= "ok" -> pure (toolText ("实时赛文查询失败：" <> fallback message "公开网站当前没有返回赛文正文。"))
+              | Text.null (Text.strip body) -> pure (toolText "实时赛文查询失败：公开网站返回了空正文。")
+              | otherwise -> do
+                  let displaySource = fromMaybe sourceName source
+                      formatted =
+                        "[FM/赛文·" <> contestDisplayName displaySource <> "] 《" <> title <> "》 [字数" <> show wordNumber <> "]\n\n"
+                          <> body <> "\n\n-----第" <> contestShortName displaySource <> "段-FM发文"
+                  sent <- Chat.replyTo context.message formatted
+                  pure . toolText $ case rights sent of
+                    _ : _ -> "实时赛文已发送。不要在最终回复中重复正文。"
+                    [] -> "实时赛文已取得，但发送失败：" <> Text.intercalate "；" (lefts sent)
+  where
+    parseLiveText :: Aeson.Value -> AesonTypes.Parser (Text, Text, Text, Int, Text, Text)
+    parseLiveText = Aeson.withObject "FM live competition text" \o ->
+      (,,,,,)
+        <$> o Aeson..: "status"
+        <*> o Aeson..:? "source" Aeson..!= ""
+        <*> o Aeson..:? "title" Aeson..!= "实时赛文"
+        <*> o Aeson..:? "word_number" Aeson..!= 0
+        <*> (cleanLiveCompetitionBody
+          <$> o Aeson..:? "content" Aeson..!= ""
+          <*> o Aeson..:? "title" Aeson..!= "")
+        <*> o Aeson..:? "message" Aeson..!= ""
+    cleanLiveCompetitionBody rawBody title =
+      Text.intercalate "\n" . dropTrailingEmptyLines . dropTrailingMarker . dropTitle . Text.lines $ rawBody
+      where
+        dropTitle (firstLine : rest)
+          | Text.strip firstLine == Text.strip title = rest
+        dropTitle lines = lines
+        dropTrailingMarker = reverse . dropWhile (\line -> "-----" `Text.isPrefixOf` Text.strip line) . reverse
+        dropTrailingEmptyLines = reverse . dropWhile Text.null . reverse
+    contestDisplayName sourceName
+      | "极速杯" `Text.isInfixOf` sourceName = "极速杯"
+      | "虎杯" `Text.isInfixOf` sourceName = "虎杯"
+      | "锦标赛" `Text.isInfixOf` sourceName = "锦标赛"
+      | otherwise = "赛文"
+    contestShortName sourceName
+      | "极速杯" `Text.isInfixOf` sourceName = "jsb"
+      | "虎杯" `Text.isInfixOf` sourceName = "hb"
+      | "锦标赛" `Text.isInfixOf` sourceName = "jb"
+      | otherwise = "sw"
+    fallback value defaultValue = if Text.null (Text.strip value) then defaultValue else value
+
+contextChatId :: Context -> Text
+contextChatId context = maybe "" show context.message.chatId
+
+fmAiContestTextTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmAiContestTextTool =
+  allowWhen hasExplicitContestIntent
+  . withDescription "Read FM's persisted daily AI typing-contest text. Available only for an explicit AI赛文 or 555 request; ordinary cases and detective role-play are unrelated. When date is omitted, return the latest saved text."
+    $ tool "fm_ai_contest_text" (optionalText "date" "Optional date in YYYY-MM-DD format.")
+      \competitionDate -> do
+        context <- askToolContext
+        withCapability context "ai_contest" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "ai-contest" /: "text") NoReqBody jsonResponse
+              ("date" =: fromMaybe "" competitionDate <> port 8077)
+          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmAiContestPublishTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmAiContestPublishTool =
+  allowWhen hasExplicitContestIntent
+  . withDescription "Publish and send FM's daily AI typing contest text (segment 555). Use when the user naturally asks for today's AI contest text or uses the retained 555 workflow. If today's text already exists it is reused. When absent, provide a newly written 300-to-800-character Chinese typing text as body. The tool sends the text itself; do not repeat it in the final response."
+  $ tool "fm_ai_contest_publish"
+      ( requiredText "body" "A newly written 300-to-800-character Chinese typing text, used only if the requested date has no saved text."
+      , optionalText "title" "Optional short title."
+      , optionalText "difficulty" "Optional difficulty label."
+      , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
+      )
+      \body title difficulty competitionDate -> do
+        context <- askToolContext
+        withCapability context "ai_contest" do
+          response <- HTTP.runReq $
+            req POST (http "172.20.0.4" /: "ai-contest" /: "text")
+              (ReqBodyJson (Aeson.object
+                [ "body" Aeson..= body
+                , "title" Aeson..= fromMaybe "" title
+                , "difficulty" Aeson..= fromMaybe "普" difficulty
+                , "date" Aeson..= fromMaybe "" competitionDate
+                ]))
+              jsonResponse (port 8077)
+          sendAiContestText context (responseBody response :: Aeson.Value)
+
+fmAiContestLeaderboardTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmAiContestLeaderboardTool =
+  allowWhen hasExplicitContestIntent
+  . withDescription "Read FM's persisted 555 AI contest leaderboard for one date, keeping each participant's best score."
+    $ tool "fm_ai_contest_leaderboard" (optionalText "date" "Optional date in YYYY-MM-DD format.")
+      \competitionDate -> do
+        context <- askToolContext
+        withCapability context "ai_contest" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
+              ("date" =: fromMaybe "" competitionDate <> port 8077)
+          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmAiContestLeaderboardImageTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmAiContestLeaderboardImageTool =
+  allowWhen hasExplicitContestIntent
+  . withDescription "Generate and send FM's persisted 555 AI contest leaderboard as a PNG image to the current chat."
+    $ tool "fm_ai_contest_leaderboard_image" (optionalText "date" "Optional date in YYYY-MM-DD format.")
+      \competitionDate -> do
+        context <- askToolContext
+        withCapability context "ai_contest" do
+          resolvedDate <- case Text.strip <$> competitionDate of
+            Just date | not (Text.null date) -> pure date
+            _ -> do
+              response <- HTTP.runReq $
+                req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
+                  (port 8077)
+              pure $ fromMaybe "" $ AesonTypes.parseMaybe
+                (Aeson.withObject "FM AI leaderboard" (Aeson..: "date"))
+                (responseBody response :: Aeson.Value)
+          let cacheKey = fromMaybe "refresh" (messageIdText <$> context.message.messageId)
+              url = "http://172.20.0.4:8077/reports/ai-leaderboard.png?date="
+                <> resolvedDate <> "&v=" <> cacheKey
+          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
+          case rights sent of
+            _:_ -> pure (toolText "Leaderboard image sent successfully.")
+            [] -> pure (toolText ("Leaderboard image send failed: " <> Text.intercalate "; " (lefts sent)))
+
+fmCompetitionScoreQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmCompetitionScoreQueryTool =
+  withDescription "Query FM's preserved personal contest-score archive by QQ ID, display name, or contest source."
+    $ tool "fm_competition_score_query"
+      ( optionalText "user_id" "Optional QQ or platform user ID."
+      , optionalText "name" "Optional display-name fragment."
+      , optionalText "source" "Optional contest source group."
+      , optionalInt "limit" "Maximum records, from 1 to 100."
+      )
+      \userId name source requestedLimit -> do
+        context <- askToolContext
+        withCapability context "scores" do
+          let limit = max 1 (min 100 (fromMaybe 20 requestedLimit))
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "competition" /: "scores") NoReqBody jsonResponse
+              ( "user_id" =: fromMaybe "" userId
+                <> "name" =: fromMaybe "" name
+                <> "source" =: fromMaybe "" source
+                <> "limit" =: limit
+                <> port 8077
+              )
+          pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
+
+fmCompetitionScoreSummaryTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmCompetitionScoreSummaryTool =
+  withDescription "Summarize FM's preserved personal contest-score history by QQ ID, display name, or contest source, including best and average values."
+  $ tool "fm_competition_score_summary"
+      ( optionalText "user_id" "Optional QQ or platform user ID."
+      , optionalText "name" "Optional display-name fragment."
+      , optionalText "source" "Optional contest source group."
+      )
+      \userId name source -> do
+        context <- askToolContext
+        withCapability context "scores" do
+          response <- HTTP.runReq $
+            req GET (http "172.20.0.4" /: "competition" /: "summary") NoReqBody jsonResponse
+              ( "user_id" =: fromMaybe "" userId
+                <> "name" =: fromMaybe "" name
+                <> "source" =: fromMaybe "" source
+                <> port 8077
+              )
+          pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmCompetitionScoreImageTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmCompetitionScoreImageTool =
+  noisy
+  . withDescription "Generate and send a PNG report for one person's preserved contest-score history. Resolve the target from natural language and provide a QQ ID or display name."
+  $ tool "fm_competition_score_image"
+      ( optionalText "user_id" "Optional QQ or platform user ID."
+      , optionalText "name" "Optional display-name fragment."
+      , optionalText "source" "Optional contest source group."
+      )
+      \userId name source -> do
+        context <- askToolContext
+        withCapability context "scores" do
+          let url = "http://172.20.0.4:8077/reports/competition-score.png?user_id="
+                <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name <> "&source=" <> fromMaybe "" source
+          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
+          case rights sent of
+            _ : _ -> pure (toolText "成绩图片已发送。")
+            [] -> pure (toolText ("成绩图片发送失败：" <> Text.intercalate "；" (lefts sent)))
+
+fmChartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fmChartTool =
+  withDescription "Generate and send a professional high-resolution PNG chart from preserved contest scores. Use for requests for a score curve, trend chart, history chart, or data visualization; this is a chart tool, not image generation. Resolve the person by QQ ID or display name."
+  $ tool "fm_chart"
+      ( optionalText "user_id" "Optional QQ or platform user ID."
+      , optionalText "name" "Optional display-name fragment."
+      , optionalText "source" "Optional source, such as 虎杯 or 锦标赛."
+      , optionalInt "days" "Optional number of recent calendar days, from 1 to 3650."
+      , optionalText "metric" "Optional metric: speed, accuracy, or keystrokes. Defaults to speed."
+      )
+      \userId name source requestedDays metric -> do
+        context <- askToolContext
+        withCapability context "scores" do
+          let days = max 1 (min 3650 (fromMaybe 30 requestedDays))
+              url = "http://172.20.0.4:8077/reports/score-chart.png?user_id="
+                <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name
+                <> "&source=" <> fromMaybe "" source <> "&days=" <> show days
+                <> "&metric=" <> fromMaybe "speed" metric
+          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
+          case rights sent of
+            _ : _ -> pure (toolText "成绩图表已发送。")
+            [] -> pure (toolText ("成绩图表发送失败：" <> Text.intercalate "；" (lefts sent)))
+
+fmBotGuardAccountsTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmBotGuardAccountsTool =
+  allowWhen superuserOnly
+  . withDescription "List, add, or remove QQ bot accounts used by FM's loop protection. This changes persistent safety state and is restricted to the owner."
+  $ tool "fm_bot_guard_accounts"
+      ( requiredText "action" "One of: list, add, remove."
+      , optionalText "account_id" "QQ account ID; required for add and remove."
+      , optionalText "label" "Optional readable label when adding an account."
+      )
+      \action accountId label -> do
+        response <- HTTP.runReq $
+          req POST (http "172.20.0.4" /: "bot-guard" /: "accounts")
+            (ReqBodyJson (Aeson.object
+              [ "action" Aeson..= action
+              , "account_id" Aeson..= fromMaybe "" accountId
+              , "label" Aeson..= fromMaybe "" label
+              ]))
+            jsonResponse (port 8077)
+        pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+sendAiContestText
+  :: Chat.Chat :> es
+  => Context
+  -> Aeson.Value
+  -> Eff es ToolResult
+sendAiContestText context response =
+  case AesonTypes.parseMaybe parse response of
+    Nothing -> pure (toolText "AI 赛文保存失败，领域服务没有返回有效正文。")
+    Just (competitionDate, title, body, difficulty) -> do
+      let message =
+            "[FM/AI赛文·" <> difficulty <> "] 《" <> title <> "》 [字数" <> show (Text.length body) <> "]\n"
+            <> body <> "\n-----第555段 " <> competitionDate <> "-FM赛文"
+      sent <- Chat.replyTo context.message message
+      pure . toolText $ case rights sent of
+        _ : _ -> "AI 赛文已发送。不要在最终回复中重复正文。"
+        [] -> "AI 赛文已保存，但发送失败：" <> Text.intercalate "；" (lefts sent)
+  where
+    parse = Aeson.withObject "FM AI contest publish" \outer -> do
+      textValue <- outer Aeson..: "text"
+      Aeson.withObject "FM AI contest text" (\inner ->
+        (,,,)
+          <$> inner Aeson..: "date"
+          <*> inner Aeson..: "title"
+          <*> inner Aeson..: "body"
+          <*> inner Aeson..:? "difficulty" Aeson..!= "普") textValue
+
+fmDomainStatsTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmDomainStatsTool =
+  withDescription "Read record counts for FM's migrated library, contest, score, recall, and group data."
+    $ tool "fm_domain_stats" noArguments do
+      response <- HTTP.runReq $
+        req GET (http "172.20.0.4" /: "stats") NoReqBody jsonResponse (port 8077)
+      pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+hasExplicitLibraryIntent :: Context -> Bool
+hasExplicitLibraryIntent context =
+  not (hasExplicitContestIntent context)
+    && (any (`Text.isInfixOf` normalized) directTerms
+      || isGenreRequest normalized
+      || isGenericArticleRequest normalized
+      || isDifficultyCommand normalized)
+  where
+    normalized = Text.toLower . Text.filter (not . (`elem` [' ', '\t', '\r', '\n'])) $ context.input.text
+    directTerms =
+      [ "发文", "文来", "来一篇", "发一篇", "练习文", "文库"
+      , "续文", "续段", "上一篇", "这篇文", "停止发文", "单字练习"
+      ]
+    genreTerms =
+      [ "恐怖", "惊悚", "灵异", "悬疑", "推理", "修仙", "修真", "仙侠"
+      , "玄幻", "奇幻", "武侠", "言情", "爱情", "科幻", "历史", "古风"
+      , "都市", "职场", "校园", "青春", "童话", "寓言", "诗词", "散文"
+      , "随笔", "科普"
+      ]
+    requestTerms = [ "发", "来", "抽", "找", "练", "读", "继续", "开始", "给我", "想看" ]
+    isGenreRequest input =
+      any (`Text.isInfixOf` input) genreTerms
+        && any (`Text.isInfixOf` input) requestTerms
+    isGenericArticleRequest input =
+      any (`Text.isInfixOf` input) [ "文章", "故事", "小说" ]
+        && any (`Text.isInfixOf` input) requestTerms
+    isDifficultyCommand input =
+      any (`Text.isInfixOf` input)
+        [ "fm淼", "fm水", "fm易", "fm普", "fm难", "fm虐"
+        , "fm，淼", "fm，水", "fm，易", "fm，普", "fm，难", "fm，虐"
+        ]
+
+hasExplicitContestIntent :: Context -> Bool
+hasExplicitContestIntent context =
+  any (`Text.isInfixOf` normalized) contestTerms
+  where
+    normalized = Text.toLower context.input.text
+    contestTerms =
+      [ "赛文", "比赛", "赛事", "555", "虎杯", "极速杯", "锦标赛"
+      , "群赛", "赛榜", "排行榜", "ai赛文"
+      ]
+
+hasExplicitLiveContestIntent :: Context -> Bool
+hasExplicitLiveContestIntent context =
+  hasExplicitContestIntent context && any (`Text.isInfixOf` normalized) liveTerms
+  where
+    normalized = Text.toLower context.input.text
+    liveTerms = ["今天", "当天", "当前", "实时", "在线", "官网", "公开", "最新"]
+
+withCapability :: HTTP.HTTP :> es => Context -> Text -> Eff es ToolResult -> Eff es ToolResult
+withCapability context capability action =
+  case context.message of
+    IncomingMessage{platform = PlatformQQ, chatId = Just groupId} -> do
+      response <- HTTP.runReq $
+        req GET (http "172.20.0.4" /: "group-capability") NoReqBody jsonResponse
+          ("group_id" =: (show groupId :: Text) <> "capability" =: capability <> port 8077)
+      let enabled = fromMaybe True $ AesonTypes.parseMaybe
+            (Aeson.withObject "FM group capability" (Aeson..: "enabled"))
+            (responseBody response :: Aeson.Value)
+      if enabled
+        then action
+        else pure (toolText ("This capability is disabled in the current group: " <> capability))
+    _ -> action

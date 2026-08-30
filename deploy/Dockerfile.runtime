@@ -1,0 +1,32 @@
+ARG COSMOBOT_COMPILED_IMAGE=fm-cosmobot:compiled-current
+ARG COSMOBOX_IMAGE=fm-cosmobox:latest
+FROM ${COSMOBOT_COMPILED_IMAGE} AS cosmobot-build
+
+FROM ${COSMOBOX_IMAGE}
+
+ARG DOCKER_VERSION=27.5.1
+
+RUN (sed -i 's|deb.debian.org/debian-security|mirrors.ustc.edu.cn/debian-security|g; s|deb.debian.org/debian|mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list 2>/dev/null || true) && \
+    (sed -i 's|deb.debian.org/debian-security|mirrors.ustc.edu.cn/debian-security|g; s|deb.debian.org/debian|mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true) && \
+    apt-get update && \
+    apt-get install --no-install-recommends -y \
+      bubblewrap libgmp10 openssh-client libreoffice-core libreoffice-writer \
+      fonts-noto-color-emoji ffmpeg && \
+    curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+      "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
+      | tar -xz --strip-components=1 -C /usr/local/bin docker/docker && \
+    curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+      https://ghfast.top/https://github.com/typst/typst/releases/download/v0.13.1/typst-x86_64-unknown-linux-musl.tar.xz \
+      | tar -xJ --strip-components=1 -C /usr/local/bin typst-x86_64-unknown-linux-musl/typst && \
+    fc-cache -f && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=cosmobot-build /opt/cosmobot/cosmobot /opt/cosmobot/cosmobot
+COPY cosmobot/python/cosmobot_worker.py /opt/cosmobot/share/python/cosmobot_worker.py
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    cosmobot_datadir=/opt/cosmobot/share
+
+WORKDIR /data
+ENTRYPOINT ["/opt/cosmobot/cosmobot"]

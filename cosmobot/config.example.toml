@@ -1,0 +1,162 @@
+[log]
+level = "info"
+
+[storage]
+sqlite_path = "cosmobot.sqlite3"
+
+[resource.sandbox]
+image = "localhost/cosmobox:latest"
+
+[rpc]
+enabled = false
+host = "127.0.0.1"
+port = 38765
+token = ""
+
+[acp]
+enabled = false
+host = "127.0.0.1"
+port = 38766
+token = ""
+
+[driver.qq]
+host = "127.0.0.1"
+port = 3001
+path = "/"
+token = "xxx"
+bot_id = 0
+superusers = []
+allowed_groups = []
+allowed_users = []
+
+[driver.telegram]
+bot_token = ""
+bot_id = ""
+superusers = []
+allowed_chats = []
+
+[driver.matrix]
+homeserver = "https://matrix.org"
+login_user = ""
+login_password = ""
+device_id = "cosmobot"
+direct_rooms = []
+bot_id = "@bot:matrix.org"
+superusers = []
+allowed_rooms = []
+
+[driver.discord]
+bot_token = ""
+bot_id = ""
+application_id = ""
+allowed_guilds = []
+allowed_channels = []
+allowed_users = []
+superusers = []
+gateway_host = "gateway.discord.gg"
+gateway_path = "/?v=10&encoding=json"
+
+[llm]
+chat = "openrouter"
+image = "openai"
+audio = "openai"
+
+[llm.chat_provider.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key = ""
+model = "openai/gpt-4o-mini"
+reasoning_effort = "low"
+timeout = 60
+
+[llm.image_provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = ""
+model = "gpt-image-1.5"
+can_generate = true
+can_edit = false
+timeout = 300
+quality = "medium"
+size = "1024x1024"
+aspect_ratio = "1:1"
+background = "auto"
+moderation = "auto"
+
+[llm.audio_provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = ""
+model = "gpt-4o-mini-tts"
+voice = "coral"
+response_format = "mp3"
+timeout = 300
+# speed = 1.0
+# instructions = "Speak clearly."
+
+[media]
+cache_dir = "media-cache"
+public_base_url = "https://media.example.com/cosmobot-media"
+compression_format = "webp"
+compression_level = 80
+
+[media.gc]
+enabled = false
+older_than_days = 7
+interval_hours = 24
+
+[media.s3]
+enabled = false
+bucket = "cosmobot-media"
+region = "us-east-1"
+# endpoint = "https://s3.example.com"
+# For Cloudflare R2, use:
+# region = "auto"
+# endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+# addressing_style = "path"
+access_key_id = ""
+secret_access_key = ""
+prefix = "cosmobot/media"
+public_read_acl = false
+addressing_style = "auto"
+
+[memory]
+dir = "memory"
+
+[skills]
+dir = "skills"
+
+[tool]
+datetime = false
+
+[tool.python]
+enable = true
+wall_timeout_seconds = 30
+cpu_seconds = 20
+memory_mib = 512
+max_tool_calls = 64
+
+[tool.web_fetch]
+enable = false
+max_uses = 5
+max_content_tokens = 50000
+
+[tool.web_search]
+enable = false
+api = "tavily"
+max_results = 5
+tavily_api_key = ""
+brave_api_key = ""
+exa_api_key = ""
+
+[handler.saucenao]
+api_key = ""
+
+[handler.admin.upgrade]
+script = "./update.sh"
+
+[handler.shutup]
+delete_patterns = []
+
+[handler.ask]
+command = "!ask"
+draw_command = "!draw"
+agent_max_turns = 4
+context_compaction_threshold_ktokens = 1000

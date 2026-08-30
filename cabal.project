@@ -1,0 +1,21 @@
+packages:
+  cosmobot
+  cosmocode
+
+import: https://www.stackage.org/lts-24.42/cabal.config
+
+source-repository-package
+  type: git
+  location: https://github.com/eldritch-cookie/katip-effectful
+  tag: 180e82449c63b7788054dc3845b930996d35e052
+
+source-repository-package
+  type: git
+  location: https://github.com/brendanhay/amazonka.git
+  tag: c87e5cbb67d8116c8829c9f84db4f8da92734830
+  subdir:
+    lib/amazonka
+    lib/amazonka-core
+    lib/services/amazonka-s3
+    lib/services/amazonka-sso
+    lib/services/amazonka-sts
