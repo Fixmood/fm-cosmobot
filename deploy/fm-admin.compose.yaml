@@ -10,6 +10,11 @@ services:
       FM_ADMIN_TOKEN: ${FM_ADMIN_TOKEN:?FM_ADMIN_TOKEN is required}
       FM_ADMIN_STATE: /data/fm-admin-state.json
       FM_DOMAIN_URL: http://fm-domain:8077
+      FM_RPC_ENABLED: ${FM_RPC_ENABLED:-false}
+      FM_RPC_HOST: ${FM_RPC_HOST:-fm-cosmobot}
+      FM_RPC_PORT: ${FM_RPC_PORT:-38765}
+      FM_RPC_TOKEN: ${FM_RPC_TOKEN:-}
+      FM_RPC_TIMEOUT: ${FM_RPC_TIMEOUT:-4}
     networks:
       - fm-runtime
     volumes:

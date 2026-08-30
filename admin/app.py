@@ -19,6 +19,11 @@ ROOT = Path(__file__).resolve().parent
 STATE_PATH = Path(os.environ.get("FM_ADMIN_STATE", "/data/fm-admin-state.json"))
 DOMAIN_URL = os.environ.get("FM_DOMAIN_URL", "http://127.0.0.1:8077").rstrip("/")
 ADMIN_TOKEN = os.environ.get("FM_ADMIN_TOKEN", "").strip()
+RPC_ENABLED = os.environ.get("FM_RPC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+RPC_HOST = os.environ.get("FM_RPC_HOST", "127.0.0.1")
+RPC_PORT = int(os.environ.get("FM_RPC_PORT", "38765"))
+RPC_TOKEN = os.environ.get("FM_RPC_TOKEN", "").strip()
+RPC_TIMEOUT = float(os.environ.get("FM_RPC_TIMEOUT", "4"))
 LOCK = threading.RLock()
 COLLECTIONS = {"groups", "triggers", "personas", "models"}
 DOMAIN_READS = {
@@ -69,6 +74,35 @@ def fetch_domain(path: str) -> dict:
         with urlopen(request, timeout=4) as response:
             return {"ok": True, "data": json.loads(response.read().decode("utf-8"))}
     except Exception as error:  # The dashboard must show partial outages instead of failing entirely.
+        return {"ok": False, "error": str(error)}
+
+
+def fetch_rpc(method: str, params: dict | None = None) -> dict:
+    """Call one read-only RPC method without exposing the bearer token."""
+    if not RPC_ENABLED:
+        return {"ok": False, "error": "Cosmobot RPC 未启用。"}
+    if not RPC_TOKEN:
+        return {"ok": False, "error": "Cosmobot RPC 已启用，但未配置 FM_RPC_TOKEN。"}
+    try:
+        import websocket
+
+        request = {"jsonrpc": "2.0", "id": "fm-admin-1", "method": method, "params": params or {}}
+        connection = websocket.create_connection(
+            f"ws://{RPC_HOST}:{RPC_PORT}/rpc",
+            timeout=RPC_TIMEOUT,
+            header=[f"Authorization: Bearer {RPC_TOKEN}"],
+        )
+        try:
+            connection.send(json.dumps(request, ensure_ascii=False))
+            response = json.loads(connection.recv())
+        finally:
+            connection.close()
+        if "error" in response:
+            error = response["error"]
+            message = error.get("message", "RPC 请求失败") if isinstance(error, dict) else str(error)
+            return {"ok": False, "error": message}
+        return {"ok": True, "data": response.get("result")}
+    except Exception as error:  # Runtime telemetry must degrade independently.
         return {"ok": False, "error": str(error)}
 
 
@@ -141,6 +175,15 @@ class Api(BaseHTTPRequestHandler):
             else:
                 result = fetch_domain(path)
                 self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path == "/api/runtime/audit":
+            result = fetch_rpc("audit.recent", {"limit": 50})
+            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path == "/api/runtime/media":
+            result = fetch_rpc("media.stats", {"limit": 20})
+            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path == "/api/runtime/concurrency":
+            result = fetch_rpc("concurrency.list")
+            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
         elif request.path.startswith("/api/collections/"):
             self.collection_get(request.path.removeprefix("/api/collections/"), parse_qs(request.query))
         elif request.path == "/":

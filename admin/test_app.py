@@ -62,6 +62,29 @@ class AdminApiTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         fetch.assert_called_once_with("/contest/search?limit=50")
 
+    def test_runtime_rpc_is_gracefully_disabled_by_default(self):
+        old_enabled = app.RPC_ENABLED
+        app.RPC_ENABLED = False
+        try:
+            with self.assertRaises(Exception) as context:
+                self.request("GET", "/api/runtime/audit")
+            self.assertIn("502", str(context.exception))
+        finally:
+            app.RPC_ENABLED = old_enabled
+
+    def test_runtime_rpc_returns_data_without_leaking_token(self):
+        with patch.object(app, "fetch_rpc", return_value={"ok": True, "data": {"entries": []}}) as fetch:
+            status, payload = self.request("GET", "/api/runtime/concurrency")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"], {"entries": []})
+        fetch.assert_called_once_with("concurrency.list")
+
+    def test_runtime_rpc_failure_is_bad_gateway(self):
+        with patch.object(app, "fetch_rpc", return_value={"ok": False, "error": "timeout"}):
+            with self.assertRaises(Exception) as context:
+                self.request("GET", "/api/runtime/media")
+        self.assertIn("502", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

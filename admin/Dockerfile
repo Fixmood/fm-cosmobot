@@ -1,5 +1,7 @@
 FROM python:3.11-slim-bookworm
 
+RUN pip install --no-cache-dir websocket-client==1.8.0
+
 WORKDIR /app
 COPY app.py /app/app.py
 COPY static /app/static
