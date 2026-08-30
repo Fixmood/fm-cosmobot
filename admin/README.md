@@ -39,7 +39,7 @@ python3 admin/app.py
 - Cosmobot RPC 的工具审计、媒体缓存和后台任务只读状态；
 - 同源网页控制台。
 
-控制平面配置与 FM Domain 业务数据库分开保存。当前版本不会直接修改 Cosmobot 的生产配置；运行时接入应通过受认证的 RPC 或管理 API 完成，并保留配置版本和回滚能力。
+控制平面配置与 FM Domain 业务数据库分开保存。当前版本不会直接修改 Cosmobot 的生产配置；运行时接入应通过受认证的 RPC 或管理 API 完成，并保留配置版本和回滚能力。第四阶段的真实配置来源见 `admin/RUNTIME_CONFIG.md`。
 
 ## API
 
