@@ -2679,11 +2679,11 @@ testThreadStatsAccumulateRepliedBranch = do
   replies <- IORef.newIORef []
   runAgentWith answers (ChatMock (Just replies) (Just "stats-reply") Nothing) do
     threads <- newThreadStore
-    let key = threadMessageKey askHandlerMessage
-        user1 = key "user-1"
-        answer1 = key "answer-1"
-        user2 = key "user-2"
-        answer2 = key "answer-2"
+    let makeMessageKey = threadMessageKey askHandlerMessage
+        user1 = makeMessageKey "user-1"
+        answer1 = makeMessageKey "answer-1"
+        user2 = makeMessageKey "user-2"
+        answer2 = makeMessageKey "answer-2"
         transcript1 = appendAssistant "A1" (startWithUser "U1")
         transcript2 = appendAssistant "A2" (appendUser "U2" transcript1)
         resource = Concurrency.Handle (Concurrency.Id 1)
@@ -2757,10 +2757,10 @@ testThreadStatsShowActiveRunningTools = do
   replies <- IORef.newIORef []
   runAgentWith answers (ChatMock (Just replies) (Just "stats-reply") Nothing) do
     threads <- newThreadStore
-    let key = threadMessageKey askHandlerMessage
-        original = key "user-1"
-        assistant = key "assistant-1"
-        toolMessage = key "tool-message-1"
+    let makeMessageKey = threadMessageKey askHandlerMessage
+        original = makeMessageKey "user-1"
+        assistant = makeMessageKey "assistant-1"
+        toolMessage = makeMessageKey "tool-message-1"
         steer =
           askHandlerMessage
             { messageId = Just "user-2"

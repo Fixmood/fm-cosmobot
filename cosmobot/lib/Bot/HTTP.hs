@@ -19,7 +19,6 @@ import qualified Data.Text as Text
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Client
 import qualified Network.HTTP.Client.TLS as ClientTLS
-import qualified Data.ByteString.Char8 as ByteString
 import Network.HTTP.Req (HttpConfig (..), Option, Req, Url, useHttpsURI, (/:))
 import qualified Network.HTTP.Req as Req
 import qualified Network.TLS as TLS

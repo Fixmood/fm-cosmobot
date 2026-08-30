@@ -139,7 +139,7 @@ downloadQQMediaObject _manager ref request =
     freshQQMediaRequest =
       Exception.bracket
         (HTTP.newManager HTTPTLS.tlsManagerSettings)
-        HTTP.closeManager
+        HTTP.closeManager'
         (HTTP.httpLbs (qqMediaDownloadRequest request))
 
 requestSourceName :: HTTP.Request -> Text

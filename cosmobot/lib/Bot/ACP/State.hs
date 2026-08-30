@@ -139,13 +139,13 @@ writeClient AcpClientQueue{events} value =
 resolveClientResponse :: Concurrent :> es => AcpState -> AcpClientQueue -> JSONRPC.JSONRPCMessage -> Eff es Bool
 resolveClientResponse acpState queue message =
   STM.atomically do
-    let key = (queue.clientId, requestKey (responseId message))
+    let pendingKey = (queue.clientId, requestKey (responseId message))
     pending <- STM.readTVar acpState.pendingClientRequests
-    case Map.lookup key pending of
+    case Map.lookup pendingKey pending of
       Nothing ->
         pure False
       Just waiter -> do
-        STM.modifyTVar' acpState.pendingClientRequests (Map.delete key)
+        STM.modifyTVar' acpState.pendingClientRequests (Map.delete pendingKey)
         _ <- STM.tryPutTMVar waiter (responseResult message)
         pure True
 

@@ -263,7 +263,7 @@ matrixClientRequest driver Matrix.MatrixClientRequest{method, path, query, body}
     requestUrl :: forall scheme. Url scheme -> Url scheme
     requestUrl baseUrl = List.foldl' (/:) baseUrl path
     requestOptions :: forall scheme. Option scheme -> Option scheme
-    requestOptions options = List.foldl' (\current (key, value) -> current <> (key =: value)) options query
+    requestOptions options = List.foldl' (\current (optionKey, optionValue) -> current <> (optionKey =: optionValue)) options query
 
 matrixStreamingMessageLimit :: Int
 matrixStreamingMessageLimit = 4000

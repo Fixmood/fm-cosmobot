@@ -16,10 +16,6 @@ module Bot.Chat.Bridge.FM
   , fmStandaloneMessage
   , FMTakeoverAddress (..)
   , FMTakeoverState (..)
-  , takeoverPlatform
-  , takeoverKind
-  , takeoverChatId
-  , takeoverPeerId
   , takeoverAliases
   , takeoverEnabled
   , takeoverSource

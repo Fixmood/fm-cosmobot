@@ -949,11 +949,11 @@ testMatrixAudioMessageIncludesMessageFile = do
 
 testMatrixEncryptedImageBytesDecryptAndVerifyCiphertextHash :: IO ()
 testMatrixEncryptedImageBytesDecryptAndVerifyCiphertextHash = do
-  let key = StrictByteString.replicate 32 0
+  let cryptoKey = StrictByteString.replicate 32 0
       iv = StrictByteString.replicate 16 0
       plainText = "Matrix encrypted image bytes"
-      cipherText = matrixAes256Ctr key iv plainText
-      encryptedKey = TextEncoding.decodeUtf8 (Base64URL.encodeUnpadded key)
+      cipherText = matrixAes256Ctr cryptoKey iv plainText
+      encryptedKey = TextEncoding.decodeUtf8 (Base64URL.encodeUnpadded cryptoKey)
       encryptedIv = TextEncoding.decodeUtf8 (Base64.encode iv)
       encryptedSha256 = TextEncoding.decodeUtf8 (Base64.encode (matrixSha256 cipherText))
   chunks <- Matrix.decryptMatrixEncryptedBytesForTest encryptedKey encryptedIv encryptedSha256 [StrictByteString.take 7 cipherText, StrictByteString.drop 7 cipherText]
