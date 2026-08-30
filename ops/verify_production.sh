@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034,SC2148,SC1091
 set -euo pipefail
 
 BOT_CONTAINER=${FM_BOT_CONTAINER:-fm-cosmobot}

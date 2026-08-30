@@ -57,6 +57,28 @@ from app import (
 )
 
 
+def report_font():
+    if not importlib.util.find_spec("PIL"):
+        return None
+    candidates = [
+        Path(__file__).parent.parent / "msyh.ttc",
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("C:/Windows/Fonts/simhei.ttf"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def configure_report_font_or_skip(test_case):
+    candidate = report_font()
+    if candidate is None:
+        test_case.skipTest("Pillow 或报表字体不可用")
+    os.environ["FM_REPORT_FONT"] = str(candidate)
+
+
 class RetainedSnapshotImportTest(unittest.TestCase):
     def test_library_difficulty_modes_are_strict_and_persist_after_score(self):
         class FixedRanker:
@@ -331,8 +353,7 @@ class RetainedSnapshotImportTest(unittest.TestCase):
         self.assertEqual(result["rows"][0]["acc"], 92.35)
 
     def test_public_competition_rank_combined_renders_all_rows(self):
-        if not importlib.util.find_spec("PIL"):
-            self.skipTest("Pillow is not installed")
+        configure_report_font_or_skip(self)
         from PIL import Image
 
         result = {
@@ -386,8 +407,9 @@ class RetainedSnapshotImportTest(unittest.TestCase):
                 self.assertIn("90001", added["accounts"])
                 removed = update_bot_guard_account(db, {"action": "remove", "account_id": "90001"})
                 self.assertNotIn("90001", removed["accounts"])
-                if importlib.util.find_spec("PIL"):
-                    os.environ["FM_REPORT_FONT"] = str(Path(__file__).parent.parent / "msyh.ttc")
+                candidate = report_font()
+                if candidate:
+                    os.environ["FM_REPORT_FONT"] = str(candidate)
                     report = render_competition_score(db, "10001", "", "")
                     self.assertTrue(report.startswith(b"\x89PNG\r\n\x1a\n"))
             finally:
@@ -690,8 +712,9 @@ class RetainedSnapshotImportTest(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT source_group FROM contest_texts").fetchone()[0], "sample-group")
                 self.assertEqual(db.execute("SELECT speed FROM ai_contest_scores").fetchone()[0], 120.5)
                 self.assertEqual(db.execute("SELECT user_id FROM ai_contest_scores").fetchone()[0], "10001")
-                if importlib.util.find_spec("PIL"):
-                    os.environ["FM_REPORT_FONT"] = str(Path(__file__).parent.parent / "msyh.ttc")
+                candidate = report_font()
+                if candidate:
+                    os.environ["FM_REPORT_FONT"] = str(candidate)
                     report = render_ai_leaderboard(db, "2026-08-22")
                     self.assertTrue(report.startswith(b"\x89PNG\r\n\x1a\n"))
             finally:
@@ -779,8 +802,7 @@ class RetainedSnapshotImportTest(unittest.TestCase):
                 db.close()
 
     def test_score_chart_uses_full_history_and_requested_days(self):
-        if not importlib.util.find_spec("PIL"):
-            self.skipTest("Pillow is not installed")
+        configure_report_font_or_skip(self)
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as root:
