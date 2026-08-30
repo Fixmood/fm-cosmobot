@@ -35,10 +35,14 @@ configMethod request =
       private <- Memory.listPrivatePersonas
       groups <- Memory.listGroupPersonas
       styles <- Memory.listMemberStyles
+      privateDefault <- Memory.loadMemory MemoryStore.DefaultPrivatePersonaMemory
+      groupDefault <- Memory.loadMemory MemoryStore.DefaultGroupPersonaMemory
       triggers <- liftIO Trigger.listTriggerConfigs
       pure $ Aeson.object
         [ "models" Aeson..= map modelValue models
+        , "private_default" Aeson..= privateDefault
         , "private_personas" Aeson..= map pairValue private
+        , "group_default" Aeson..= groupDefault
         , "group_personas" Aeson..= map groupValue groups
         , "member_styles" Aeson..= map pairValue styles
         , "triggers" Aeson..= map triggerValue triggers

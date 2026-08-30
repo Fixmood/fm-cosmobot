@@ -82,6 +82,9 @@ GET /api/runtime/audit
 GET /api/runtime/media
 GET /api/runtime/concurrency
 GET /api/runtime/config
+GET /api/runtime/config/versions
+GET /api/runtime/config/versions/{id}
+GET /api/runtime/config/versions/{id}/diff
 POST /api/runtime/config/persona
 POST /api/runtime/config/trigger
 POST /api/runtime/config/model

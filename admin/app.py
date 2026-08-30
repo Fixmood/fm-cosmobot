@@ -26,6 +26,7 @@ RPC_TOKEN = os.environ.get("FM_RPC_TOKEN", "").strip()
 RPC_TIMEOUT = float(os.environ.get("FM_RPC_TIMEOUT", "4"))
 LOCK = threading.RLock()
 COLLECTIONS = {"groups", "triggers", "personas", "models"}
+VERSION_LIMIT = 100
 DOMAIN_READS = {
     "library": "/library/search?limit=50",
     "contests": "/contest/search?limit=50",
@@ -38,7 +39,7 @@ DOMAIN_READS = {
 def read_state() -> dict:
     with LOCK:
         if not STATE_PATH.exists():
-            return {"groups": {}, "triggers": {}, "personas": {}, "models": {}, "audit": []}
+            return {"groups": {}, "triggers": {}, "personas": {}, "models": {}, "audit": [], "config_versions": []}
         try:
             value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -46,6 +47,7 @@ def read_state() -> dict:
         return {
             **{name: value.get(name, {}) for name in COLLECTIONS},
             "audit": value.get("audit", [])[-200:],
+            "config_versions": value.get("config_versions", [])[-VERSION_LIMIT:],
         }
 
 
@@ -110,6 +112,95 @@ def runtime_config_result(kind: str, payload: dict | None = None) -> dict:
     if kind not in {"persona", "trigger", "model"}:
         return {"ok": False, "error": "运行时配置类型不存在。"}
     return fetch_rpc(f"config.{kind}", payload or {"action": "status"})
+
+
+def safe_payload(payload: object) -> object:
+    if isinstance(payload, dict):
+        return {key: "[redacted]" if key.lower() in {"api_key", "token", "password"} else safe_payload(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [safe_payload(value) for value in payload]
+    return payload
+
+
+def config_diff(before: object, after: object, path: str = "") -> list[dict]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        changes = []
+        for key in sorted(set(before) | set(after)):
+            child = f"{path}.{key}" if path else str(key)
+            changes.extend(config_diff(before.get(key), after.get(key), child))
+        return changes
+    if isinstance(before, list) and isinstance(after, list):
+        if before == after:
+            return []
+        return [{"path": path, "before": before, "after": after}]
+    if before != after:
+        return [{"path": path, "before": before, "after": after}]
+    return []
+
+
+def save_config_version(before: dict, after: dict, kind: str, payload: dict, actor: str) -> str | None:
+    changes = config_diff(before, after)
+    if not changes:
+        return None
+    version_id = f"cfg-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+    state = read_state()
+    state["config_versions"].append({
+        "id": version_id,
+        "at": time.time(),
+        "actor": actor,
+        "kind": kind,
+        "operation": payload.get("action", "update"),
+        "request": safe_payload(payload),
+        "before": before,
+        "after": after,
+        "changes": changes,
+    })
+    state["config_versions"] = state["config_versions"][-VERSION_LIMIT:]
+    write_state(state)
+    return version_id
+
+
+def snapshot_value(snapshot: dict, kind: str, request: dict) -> object:
+    action = request.get("action")
+    if kind == "persona":
+        scope = request.get("scope")
+        if scope == "private_default": return snapshot.get("private_default")
+        if scope == "group_default": return snapshot.get("group_default")
+        collection = {"private": "private_personas", "group": "group_personas", "member": "member_styles"}.get(scope)
+        if collection:
+            return next((item.get("content") for item in snapshot.get(collection, []) if str(item.get("id")) == str(request.get("id"))), None)
+    if kind == "trigger":
+        return next((item.get("config") for item in snapshot.get("triggers", []) if item.get("scope") == request.get("scope")), None)
+    if kind == "model":
+        return next((item for item in snapshot.get("models", []) if item.get("provider") == request.get("target") or item.get("model") == request.get("target")), None)
+    return None
+
+
+def rollback_payload(version: dict) -> tuple[str, dict] | tuple[None, str]:
+    kind = version.get("kind")
+    request = version.get("request") or {}
+    before = version.get("before") or {}
+    if kind == "persona":
+        content = snapshot_value(before, kind, request)
+        payload = dict(request)
+        payload["action"] = "clear" if content is None else "set"
+        if content is not None:
+            payload["content"] = content
+        return "persona", payload
+    if kind == "trigger":
+        config = snapshot_value(before, kind, request)
+        if config is None:
+            return "trigger", {"action": "clear", "scope": request.get("scope", "")}
+        return "trigger", {"action": "set", "scope": request.get("scope", ""), "modes": config.get("modes", []), "keywords": config.get("keywords", [])}
+    if kind == "model":
+        action = request.get("action")
+        if action in {"switch", "reset"}:
+            previous = next((item for item in before.get("models", []) if item.get("current")), None)
+            if previous and previous.get("provider"):
+                return "model", {"action": "switch", "target": previous["provider"]}
+            return None, "回滚模型选择失败：版本中没有可恢复的当前模型。"
+        return None, "模型配置变更的版本不保存 API Key，无法安全完整恢复；当前版本仍保留，可手动修复。"
+    return None, "不支持的配置版本类型。"
 
 
 def validate_item(item: object) -> tuple[dict | None, str | None]:
@@ -193,6 +284,22 @@ class Api(BaseHTTPRequestHandler):
         elif request.path == "/api/runtime/config":
             result = fetch_rpc("config.snapshot")
             self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path == "/api/runtime/config/versions":
+            self.send_json(HTTPStatus.OK, {"ok": True, "items": list(reversed(read_state()["config_versions"]))})
+        elif request.path.startswith("/api/runtime/config/versions/") and request.path.endswith("/diff"):
+            version_id = request.path.removeprefix("/api/runtime/config/versions/").removesuffix("/diff").strip("/")
+            version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
+            if version is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
+            else:
+                self.send_json(HTTPStatus.OK, {"ok": True, "version_id": version_id, "changes": version.get("changes", [])})
+        elif request.path.startswith("/api/runtime/config/versions/"):
+            version_id = request.path.removeprefix("/api/runtime/config/versions/").strip("/")
+            version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
+            if version is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
+            else:
+                self.send_json(HTTPStatus.OK, {"ok": True, "version": version})
         elif request.path.startswith("/api/collections/"):
             self.collection_get(request.path.removeprefix("/api/collections/"), parse_qs(request.query))
         elif request.path == "/":
@@ -223,7 +330,11 @@ class Api(BaseHTTPRequestHandler):
             return
         request = urlparse(self.path)
         if request.path.startswith("/api/runtime/config/"):
-            self.runtime_config_write(request.path.removeprefix("/api/runtime/config/"))
+            kind = request.path.removeprefix("/api/runtime/config/").strip("/")
+            if kind == "rollback":
+                self.runtime_config_rollback()
+            else:
+                self.runtime_config_write(kind)
         elif request.path.startswith("/api/collections/"):
             self.collection_write(request.path.removeprefix("/api/collections/"), replace=False)
         else:
@@ -242,8 +353,59 @@ class Api(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.NOT_FOUND, "接口不存在。")
 
     def runtime_config_write(self, raw_kind: str) -> None:
-        result = runtime_config_result(raw_kind.strip("/"), self.read_json())
+        kind = raw_kind.strip("/")
+        payload = self.read_json()
+        if not isinstance(payload, dict):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "运行时配置请求必须是 JSON 对象。")
+            return
+        before_result = fetch_rpc("config.snapshot")
+        result = runtime_config_result(kind, payload)
+        if result["ok"] and before_result["ok"]:
+            after_result = fetch_rpc("config.snapshot")
+            if after_result["ok"]:
+                actor = self.headers.get("X-FM-Admin-Actor", "admin").strip()[:80] or "admin"
+                version_id = save_config_version(before_result["data"], after_result["data"], kind, payload, actor)
+                if version_id:
+                    result["version_id"] = version_id
         self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+
+    def runtime_config_rollback(self) -> None:
+        payload = self.read_json()
+        version_id = payload.get("version_id") if isinstance(payload, dict) else None
+        version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
+        if version is None:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
+            return
+        kind, restore = rollback_payload(version)
+        if kind is None:
+            self.send_error_json(HTTPStatus.CONFLICT, restore)
+            return
+        before_result = fetch_rpc("config.snapshot")
+        if not before_result["ok"]:
+            self.send_json(HTTPStatus.BAD_GATEWAY, before_result)
+            return
+        result = runtime_config_result(kind, restore)
+        if not result["ok"]:
+            self.send_json(HTTPStatus.BAD_GATEWAY, result)
+            return
+        after_result = fetch_rpc("config.snapshot")
+        if not after_result["ok"]:
+            self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "回滚已执行，但无法确认当前生效状态。"})
+            return
+        actor = self.headers.get("X-FM-Admin-Actor", "admin").strip()[:80] or "admin"
+        rollback_record = {
+            "id": f"cfg-{int(time.time() * 1000)}-{secrets.token_hex(3)}",
+            "at": time.time(), "actor": actor, "kind": kind, "operation": "rollback",
+            "target_version_id": version_id, "request": safe_payload(restore),
+            "before": before_result["data"], "after": after_result["data"],
+            "changes": config_diff(before_result["data"], after_result["data"]),
+        }
+        state = read_state()
+        state["config_versions"].append(rollback_record)
+        state["config_versions"] = state["config_versions"][-VERSION_LIMIT:]
+        write_state(state)
+        result["version_id"] = rollback_record["id"]
+        self.send_json(HTTPStatus.OK, result)
 
     def collection_write(self, raw_path: str, replace: bool) -> None:
         parts = [part for part in raw_path.split("/") if part]

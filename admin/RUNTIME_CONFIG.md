@@ -32,6 +32,16 @@ returning API keys, and report application failures without claiming success.
 The existing `/api/collections/*` endpoints remain control-plane storage until
 this adapter is complete.
 
+## Versioning
+
+The control center stores at most 100 runtime configuration versions. Each
+version contains an id, actor, timestamp, operation, redacted request, before
+snapshot, after snapshot, and recursive changes. The diff endpoint exposes only
+those stored changes. Rollback restores only the affected persona scope,
+trigger scope, or active model selection; unrelated configuration is left
+untouched. Model profile mutation versions remain auditable, but cannot be
+fully restored because API keys are deliberately absent from snapshots.
+
 ## Application Contract
 
 Cosmobot exposes the narrow `config.*` RPC family. The admin container calls

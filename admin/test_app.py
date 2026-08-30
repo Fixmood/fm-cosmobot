@@ -104,6 +104,52 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         sync.assert_called_once_with("trigger", {"action": "clear"})
 
+    def test_runtime_config_write_records_version_and_actor(self):
+        snapshots = [
+            {"ok": True, "data": {"private_default": "old", "models": []}},
+            {"ok": True, "data": {"private_default": "new", "models": []}},
+        ]
+        with patch.object(app, "fetch_rpc", side_effect=snapshots), patch.object(
+            app, "runtime_config_result", return_value={"ok": True, "data": {"saved": True, "applied": True}}
+        ):
+            status, payload = self.request(
+                "POST", "/api/runtime/config/persona", {"action": "set", "scope": "private_default", "content": "new"}
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("version_id", payload)
+        _, versions = self.request("GET", "/api/runtime/config/versions")
+        self.assertEqual(versions["items"][0]["actor"], "admin")
+        self.assertEqual(versions["items"][0]["operation"], "set")
+        _, diff = self.request("GET", "/api/runtime/config/versions/" + payload["version_id"] + "/diff")
+        self.assertEqual(diff["version_id"], payload["version_id"])
+
+    def test_config_diff_is_recursive_and_excludes_unchanged_values(self):
+        self.assertEqual(app.config_diff({"a": 1, "same": 2}, {"a": 3, "same": 2}), [
+            {"path": "a", "before": 1, "after": 3}
+        ])
+
+    def test_runtime_config_rollback_restores_only_target_scope(self):
+        state = {
+            "config_versions": [{
+                "id": "cfg-1", "at": 1, "actor": "admin", "kind": "persona", "operation": "set",
+                "request": {"action": "set", "scope": "private_default", "content": "new"},
+                "before": {"private_default": "old", "group_default": "keep", "models": []},
+                "after": {"private_default": "new", "group_default": "keep", "models": []}, "changes": []
+            }]
+        }
+        app.write_state(state)
+        snapshots = [
+            {"ok": True, "data": {"private_default": "new", "group_default": "keep", "models": []}},
+            {"ok": True, "data": {"private_default": "old", "group_default": "keep", "models": []}},
+        ]
+        with patch.object(app, "fetch_rpc", side_effect=snapshots), patch.object(
+            app, "runtime_config_result", return_value={"ok": True, "data": {"saved": True, "applied": True}}
+        ) as sync:
+            status, payload = self.request("POST", "/api/runtime/config/rollback", {"version_id": "cfg-1"})
+        self.assertEqual(status, 200)
+        self.assertIn("version_id", payload)
+        sync.assert_called_once_with("persona", {"action": "set", "scope": "private_default", "content": "old"})
+
 
 if __name__ == "__main__":
     unittest.main()
