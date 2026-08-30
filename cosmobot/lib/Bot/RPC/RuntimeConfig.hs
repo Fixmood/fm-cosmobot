@@ -1,4 +1,5 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-|
 Module      : Bot.RPC.RuntimeConfig
 Description : Authenticated runtime configuration RPC operations
@@ -19,7 +20,7 @@ import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.Text as Text
 
 configMethod
-  :: (LLM.LLM :> es, Memory.Memory :> es, IOE :> es)
+  :: forall es. (LLM.LLM :> es, Memory.Memory :> es, IOE :> es)
   => RPC.RpcRequest
   -> Eff es (Maybe (Either RPC.RpcError Aeson.Value))
 configMethod request =
@@ -30,6 +31,7 @@ configMethod request =
     "config.model" -> Just <$> modelAction (RPC.requestParams request)
     _ -> pure Nothing
   where
+    snapshot :: Eff es Aeson.Value
     snapshot = do
       models <- LLM.listChatModels
       private <- Memory.listPrivatePersonas
@@ -48,9 +50,10 @@ configMethod request =
         , "triggers" Aeson..= map triggerValue triggers
         ]
 
+    personaAction :: Aeson.Value -> Eff es (Either RPC.RpcError Aeson.Value)
     personaAction value = case parsePersona value of
       Left message -> pure (Left (RPC.rpcError "invalid_params" message))
-      Right PersonaArgs{..} -> case personaScope scope ident of
+      Right PersonaArgs{..} -> case (personaScope scope ident :: Either Text MemoryStore.MemoryScope) of
         Left message -> pure (Left (RPC.rpcError "invalid_params" message))
         Right target -> case action of
           "get" -> do
@@ -68,6 +71,7 @@ configMethod request =
           "clear" -> Memory.clearMemory target >> pure (Right (savedValue target))
           _ -> pure (Left (RPC.rpcError "invalid_params" "action must be get, status, set, or clear"))
 
+    triggerAction :: Aeson.Value -> Eff es (Either RPC.RpcError Aeson.Value)
     triggerAction value = case parseTrigger value of
       Left message -> pure (Left (RPC.rpcError "invalid_params" message))
       Right TriggerArgs{..}
@@ -78,7 +82,7 @@ configMethod request =
             pure (Right (triggerResult scope current))
         | action == "clear" -> liftIO (Trigger.clearTriggerConfigByKey scope) >> pure (Right (savedValue scope))
         | action == "set" -> do
-            modes <- traverse parseMode modesRaw
+            let modes = traverse parseMode modesRaw :: Either Text [Trigger.TriggerMode]
             case modes of
               Left message -> pure (Left (RPC.rpcError "invalid_params" message))
               Right parsed
@@ -93,6 +97,7 @@ configMethod request =
         parseMode raw = maybe (Left ("unknown trigger mode: " <> raw)) Right (Trigger.parseTriggerMode raw)
         clean = filter (not . Text.null) . map Text.strip
 
+    modelAction :: Aeson.Value -> Eff es (Either RPC.RpcError Aeson.Value)
     modelAction value = case parseModel value of
       Left message -> pure (Left (RPC.rpcError "invalid_params" message))
       Right ModelArgs{..} -> case action of
@@ -110,8 +115,8 @@ configMethod request =
             , "model" Aeson..= (modelValue <$> result)
             ]
         "add" -> case (profileName, baseUrl, apiKey, modelName) of
-          (Just name, Just base, Just key, Just modelId) -> resultUnitToRpc =<< LLM.addChatModel LLM.ChatModelConfig
-            { profileName = name, baseUrl = base, apiKey = key, model = modelId
+          (Just name, Just base, Just modelApiKey, Just modelId) -> resultUnitToRpc =<< LLM.addChatModel LLM.ChatModelConfig
+            { profileName = name, baseUrl = base, apiKey = modelApiKey, model = modelId
             , reasoningEffort = fromMaybe "low" reasoning, requestTimeout = fromMaybe 60 timeout }
           _ -> pure (Left (RPC.rpcError "invalid_params" "add requires profile_name, base_url, api_key, and model"))
         "edit" -> case target of
@@ -122,9 +127,11 @@ configMethod request =
         "delete" -> maybe (pure (Left (RPC.rpcError "invalid_params" "target is required for delete"))) (resultUnitToRpc <=< LLM.deleteChatModel) target
         _ -> pure (Left (RPC.rpcError "invalid_params" "action must be status, add, edit, delete, switch, or reset"))
 
+    resultUnitToRpc :: Either Text () -> Eff es (Either RPC.RpcError Aeson.Value)
     resultUnitToRpc result = pure $ case result of
       Left err -> Left (RPC.rpcError "operation_failed" err)
       Right () -> Right (Aeson.object ["saved" Aeson..= True, "applied" Aeson..= True])
+    resultToRpc :: Either Text LLM.ChatModelInfo -> Eff es (Either RPC.RpcError Aeson.Value)
     resultToRpc result = pure $ case result of
       Left err -> Left (RPC.rpcError "operation_failed" err)
       Right info -> Right (Aeson.object ["saved" Aeson..= True, "applied" Aeson..= True, "model" Aeson..= modelValue info])
@@ -170,13 +177,13 @@ savedValue scope_ = Aeson.object ["scope" Aeson..= showScope scope_, "saved" Aes
 showScope = \case
   MemoryStore.PrivatePersonaMemory id_ -> "private:" <> id_
   MemoryStore.DefaultPrivatePersonaMemory -> "private_default"
-  MemoryStore.GroupPersonaMemory id_ -> "group:" <> showText id_
+  MemoryStore.GroupPersonaMemory id_ -> "group:" <> Text.pack (show id_)
   MemoryStore.DefaultGroupPersonaMemory -> "group_default"
   MemoryStore.MemberStyleMemory id_ -> "member:" <> id_
   _ -> "unsupported"
 
 triggerResult scope_ value = Aeson.object ["scope" Aeson..= scope_, "config" Aeson..= value, "saved" Aeson..= isJust value, "applied" Aeson..= isJust value]
-pairValue (key, value) = Aeson.object ["id" Aeson..= key, "content" Aeson..= value]
-groupValue (key, value) = Aeson.object ["id" Aeson..= key, "content" Aeson..= value]
-triggerValue (key, value) = Aeson.object ["scope" Aeson..= key, "config" Aeson..= value]
+pairValue (entryId, value) = Aeson.object ["id" Aeson..= entryId, "content" Aeson..= value]
+groupValue (entryId, value) = Aeson.object ["id" Aeson..= entryId, "content" Aeson..= value]
+triggerValue (scopeKey, value) = Aeson.object ["scope" Aeson..= scopeKey, "config" Aeson..= value]
 modelValue info = Aeson.object ["provider" Aeson..= info.provider, "model" Aeson..= info.model, "current" Aeson..= info.current, "configured_default" Aeson..= info.configuredDefault]
