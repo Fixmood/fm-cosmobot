@@ -141,9 +141,11 @@ testTranscriptPreservesSenderIdentity = do
       transcript = Transcript.appendIncomingMessage second input
         (Transcript.startWithIncomingMessage first input)
       texts = [content | message <- toList transcript.messages, Just (LLM.TextContent content) <- [message.content]]
-  length texts @?= 2
-  assertBool "first user turn has first sender id" ("sender_id=10001" `Text.isInfixOf` head texts)
-  assertBool "second user turn has second sender id" ("sender_id=20002" `Text.isInfixOf` last texts)
+  case texts of
+    [firstText, secondText] -> do
+      assertBool "first user turn has first sender id" ("sender_id=10001" `Text.isInfixOf` firstText)
+      assertBool "second user turn has second sender id" ("sender_id=20002" `Text.isInfixOf` secondText)
+    _ -> assertFailure "expected exactly two user transcript entries"
 
 testQqInvitationActions :: IO ()
 testQqInvitationActions = do
