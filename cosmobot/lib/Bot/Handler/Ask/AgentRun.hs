@@ -92,7 +92,9 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   systemPrompt <- askSystemPrompt cfg message
   let context = agentContext toolCfg cfg outputMessage input systemPrompt
       selectedTools = AgentTools.selectToolsForMessage context tools
-  logInfo [i|FM ask started: platform=#{show message.platform :: String} kind=#{show message.kind :: String} selected_tools=#{length selectedTools}/#{length tools}|]
+      platformText = show message.platform :: String
+      kindText = show message.kind :: String
+  logInfo [i|FM ask started: platform=#{platformText} kind=#{kindText} selected_tools=#{length selectedTools}/#{length tools}|]
   Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
@@ -108,7 +110,10 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
         withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text transcript \activeReply -> do
           reply <- streamAgentReply runtime activeReply outputMessage transcript
           finishedAt <- liftIO getCurrentTime
-          logInfo [i|FM ask completed: run=#{Agent.runIdOf runtime} elapsed_ms=#{elapsedMilliseconds startedAt finishedAt} status=#{reply.result.status} turns=#{reply.result.turnsUsed}|]
+          let replyResult = reply.result
+              replyStatus = replyResult.status
+              replyTurns = replyResult.turnsUsed
+          logInfo [i|FM ask completed: run=#{Agent.runIdOf runtime} elapsed_ms=#{elapsedMilliseconds startedAt finishedAt} status=#{replyStatus} turns=#{replyTurns}|]
           commitAgentReply observer activeReply message reply
 
 elapsedMilliseconds :: UTCTime -> UTCTime -> Integer
