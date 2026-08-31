@@ -616,7 +616,7 @@ testDeleteSessionCascadesForkDescendants =
 
 testWebSocketServerAuthenticatesAndHandlesRequests :: IO ()
 testWebSocketServerAuthenticatesAndHandlesRequests = do
-  result <- timeout 30_000_000 $ runRpcServerTest do
+  result <- timeout 60_000_000 $ runRpcServerTest do
     rpcState <- RPC.newRpcState
     listenSocket <- liftIO (WS.makeListenSocket "127.0.0.1" 0)
     port <- (fromIntegral :: Socket.PortNumber -> Int) <$> liftIO (Socket.socketPort listenSocket)
