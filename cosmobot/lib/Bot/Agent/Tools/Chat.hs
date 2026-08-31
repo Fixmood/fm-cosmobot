@@ -394,6 +394,8 @@ userAvatarResult context value =
     Just url -> do
       ref <- Media.normalizeMediaRef url
       Media.mediaFileInfoByRef ref >>= \case
+        Nothing ->
+          sendAvatar url
         Just info
           | "image/" `Text.isPrefixOf` Text.toLower info.mimeType -> do
               let body = FMBridge.fmReplyRelayBody (ReplyBody.imageDirective ref)
@@ -402,6 +404,12 @@ userAvatarResult context value =
               pure (toolTextWithImages (jsonText value) [ref])
         _ ->
           pure (toolFailure (permanentArgumentFailure "头像地址没有返回图片，已阻止发送。" "头像地址没有返回图片，已阻止发送。"))
+  where
+    sendAvatar imageRef = do
+      let body = FMBridge.fmReplyRelayBody (ReplyBody.imageDirective imageRef)
+      sent <- Chat.replyTo context.message body
+      logInfo [i|user_avatar sent avatar image: url=#{imageRef} message_id=#{show sent :: Text}|]
+      pure (toolTextWithImages (jsonText value) [imageRef])
 
 validFilePath :: Text -> Either Text FilePath
 validFilePath rawPath

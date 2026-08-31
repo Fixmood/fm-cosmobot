@@ -60,6 +60,7 @@ mediaToFileTool =
 sendMediaTool :: (Chat.Chat :> es, Media.Media :> es) => Tool (Eff es)
 sendMediaTool =
   tagged [chatTag]
+  . noisy
   . allowWhen hasExplicitMediaSendIntent
   . withDescription "Send a cached media object to the current chat. Use this when the user asks for a generated or cached file to be sent."
   $ tool "send_media"

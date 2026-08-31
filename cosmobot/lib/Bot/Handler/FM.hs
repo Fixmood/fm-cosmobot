@@ -1,10 +1,13 @@
 module Bot.Handler.FM
   ( fmHandlers
   , DirectLibraryCommand (..)
+  , DirectRecallCommand (..)
+  , DirectModelCommand (..)
   , isDirectLibraryMessage
   , isPotentialTypingScore
   , parseDirectLibraryCommand
   , parseDirectRecallCommand
+  , parseDirectModelCommand
   ) where
 
 import Bot.Core.Message
@@ -83,6 +86,11 @@ data DirectLibraryCommand
 data DirectRecallCommand
   = DirectRecallOne
   | DirectRecallAll
+  deriving (Eq, Show)
+
+data DirectModelCommand
+  = DirectModelStatus
+  | DirectModelSwitch Text
   deriving (Eq, Show)
 
 groupSwitchHandler
@@ -582,18 +590,36 @@ isDirectRecall message =
 
 parseDirectRecallCommand :: Text -> Maybe DirectRecallCommand
 parseDirectRecallCommand raw =
-  case compactCommand (Text.replace "@" "" raw) of
-    "fm撤回" -> Just DirectRecallOne
-    "fm撤回刚才" -> Just DirectRecallOne
-    "fm撤回最近" -> Just DirectRecallOne
-    "fm撤回最近消息" -> Just DirectRecallOne
-    "fm撤回全部" -> Just DirectRecallAll
-    "fm撤回所有" -> Just DirectRecallAll
-    "fm撤回最近所有消息" -> Just DirectRecallAll
-    "fm撤回最近全部消息" -> Just DirectRecallAll
-    "fm撤回全部消息" -> Just DirectRecallAll
-    "fm撤回所有消息" -> Just DirectRecallAll
+  case Text.toCaseFold (compactCommand (Text.replace "@" "" raw)) of
+    "撤回" -> Just DirectRecallOne
+    "撤回刚才" -> Just DirectRecallOne
+    "撤回最近" -> Just DirectRecallOne
+    "撤回最近消息" -> Just DirectRecallOne
+    "撤回全部" -> Just DirectRecallAll
+    "撤回所有" -> Just DirectRecallAll
+    "撤回最近所有消息" -> Just DirectRecallAll
+    "撤回最近全部消息" -> Just DirectRecallAll
+    "撤回全部消息" -> Just DirectRecallAll
+    "撤回所有消息" -> Just DirectRecallAll
     _ -> Nothing
+
+parseDirectModelCommand :: Text -> Maybe DirectModelCommand
+parseDirectModelCommand raw =
+  let normalized = Text.toCaseFold
+        (Text.filter (not . (`elem` [' ', '\t', '\x3000', '，', ',']))
+          (Text.replace "@" "" (Text.strip raw)))
+      visionModel = "deepseek-v4-flash-vision"
+  in if normalized == "fm模型列表" || normalized == "模型列表"
+       then Just DirectModelStatus
+       else if "fm切换模型" `Text.isPrefixOf` normalized
+         then Just (DirectModelSwitch (Text.drop (Text.length "fm切换模型") normalized))
+         else if "fm使用" `Text.isPrefixOf` normalized
+           then Just (DirectModelSwitch (Text.drop (Text.length "fm使用") normalized))
+           else if "让fm切换带视觉的模型" `Text.isInfixOf` normalized
+             then Just (DirectModelSwitch visionModel)
+             else if "fm切换视觉模型" `Text.isInfixOf` normalized
+               then Just (DirectModelSwitch visionModel)
+               else Nothing
 
 switchOnline :: Text -> Maybe Bool
 switchOnline text =
