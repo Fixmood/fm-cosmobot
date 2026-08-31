@@ -29,11 +29,13 @@ configMethod request =
     "config.persona" -> Just <$> personaAction (RPC.requestParams request)
     "config.trigger" -> Just <$> triggerAction (RPC.requestParams request)
     "config.model" -> Just <$> modelAction (RPC.requestParams request)
+    "config.image_model" -> Just <$> imageModelAction (RPC.requestParams request)
     _ -> pure Nothing
   where
     snapshot :: Eff es Aeson.Value
     snapshot = do
       models <- LLM.listChatModels
+      imageModels <- LLM.listImageModels
       private <- Memory.listPrivatePersonas
       groups <- Memory.listGroupPersonas
       styles <- Memory.listMemberStyles
@@ -42,6 +44,7 @@ configMethod request =
       triggers <- liftIO Trigger.listTriggerConfigs
       pure $ Aeson.object
         [ "models" Aeson..= map modelValue models
+        , "image_models" Aeson..= map imageModelValue imageModels
         , "private_default" Aeson..= privateDefault
         , "private_personas" Aeson..= map pairValue private
         , "group_default" Aeson..= groupDefault
@@ -127,6 +130,31 @@ configMethod request =
         "delete" -> maybe (pure (Left (RPC.rpcError "invalid_params" "target is required for delete"))) (resultUnitToRpc <=< LLM.deleteChatModel) target
         _ -> pure (Left (RPC.rpcError "invalid_params" "action must be status, add, edit, delete, switch, or reset"))
 
+    imageModelAction value = case parseImageModel value of
+      Left message -> pure (Left (RPC.rpcError "invalid_params" message))
+      Right ImageModelArgs{..} -> case imageAction of
+        "status" -> (Right . Aeson.object . (: []) . ("models" Aeson..=) . map imageModelValue) <$> LLM.listImageModels
+        "switch" -> maybe (pure (Left (RPC.rpcError "invalid_params" "target is required for switch"))) (fmap imageResultToRpc . LLM.selectImageModel) imageTarget
+        "fallback" -> imageFallbackResultToRpc <$> LLM.selectImageFallbackModel imageTarget
+        "reset" -> do
+          (primary, fallback) <- LLM.resetImageModels
+          pure (Right (Aeson.object ["saved" Aeson..= True, "applied" Aeson..= True, "primary" Aeson..= (imageModelValue <$> primary), "fallback" Aeson..= (imageModelValue <$> fallback)]))
+        "add" -> case (imageProfileNameArg, imageBaseUrlArg, imageApiKeyArg, imageModelNameArg) of
+          (Just name, Just base, Just key, Just modelId) -> resultUnitToRpc =<< LLM.addImageModel LLM.ImageModelConfig
+            { imageProfileName = name, imageBaseUrl = base, imageApiKey = key, imageModelId = modelId
+            , imageProtocol = fromMaybe "openai_images" imageProtocol
+            , imageCanGenerate = fromMaybe True imageCanGenerate, imageCanEdit = fromMaybe False imageCanEdit, imageTimeout = fromMaybe 300 imageTimeout }
+          _ -> pure (Left (RPC.rpcError "invalid_params" "add requires profile_name, base_url, api_key, and model"))
+        "delete" -> maybe (pure (Left (RPC.rpcError "invalid_params" "target is required for delete"))) (resultUnitToRpc <=< LLM.deleteImageModel) imageTarget
+        _ -> pure (Left (RPC.rpcError "invalid_params" "action must be status, add, delete, switch, fallback, or reset"))
+
+    imageResultToRpc result = case result of
+      Left err -> Left (RPC.rpcError "operation_failed" err)
+      Right info -> Right (Aeson.object ["saved" Aeson..= True, "applied" Aeson..= True, "model" Aeson..= imageModelValue info])
+    imageFallbackResultToRpc result = case result of
+      Left err -> Left (RPC.rpcError "operation_failed" err)
+      Right info -> Right (Aeson.object ["saved" Aeson..= True, "applied" Aeson..= True, "fallback" Aeson..= (imageModelValue <$> info)])
+
     resultUnitToRpc :: Either Text () -> Eff es (Either RPC.RpcError Aeson.Value)
     resultUnitToRpc result = pure $ case result of
       Left err -> Left (RPC.rpcError "operation_failed" err)
@@ -139,6 +167,7 @@ configMethod request =
 data PersonaArgs = PersonaArgs { action :: Text, scope :: Text, ident :: Maybe Text, content :: Maybe Text }
 data TriggerArgs = TriggerArgs { action :: Text, scope :: Text, modesRaw :: [Text], keywords :: [Text] }
 data ModelArgs = ModelArgs { action :: Text, target :: Maybe Text, profileName :: Maybe Text, baseUrl :: Maybe Text, apiKey :: Maybe Text, modelName :: Maybe Text, reasoning :: Maybe Text, timeout :: Maybe Int }
+data ImageModelArgs = ImageModelArgs { imageAction :: Text, imageTarget :: Maybe Text, imageProfileNameArg :: Maybe Text, imageBaseUrlArg :: Maybe Text, imageApiKeyArg :: Maybe Text, imageModelNameArg :: Maybe Text, imageProtocol :: Maybe Text, imageCanGenerate :: Maybe Bool, imageCanEdit :: Maybe Bool, imageTimeout :: Maybe Int }
 
 parsePersona :: Aeson.Value -> Either Text PersonaArgs
 parsePersona value = first toText
@@ -156,6 +185,12 @@ parseModel :: Aeson.Value -> Either Text ModelArgs
 parseModel value = first toText
   (AesonTypes.parseEither (Aeson.withObject "config.model params" (\o ->
     ModelArgs <$> o Aeson..:? "action" Aeson..!= "status" <*> o Aeson..:? "target" <*> o Aeson..:? "profile_name" <*> o Aeson..:? "base_url" <*> o Aeson..:? "api_key" <*> o Aeson..:? "model" <*> o Aeson..:? "reasoning_effort" <*> o Aeson..:? "timeout"
+  )) value)
+
+parseImageModel :: Aeson.Value -> Either Text ImageModelArgs
+parseImageModel value = first toText
+  (AesonTypes.parseEither (Aeson.withObject "config.image_model params" (\o ->
+    ImageModelArgs <$> o Aeson..:? "action" Aeson..!= "status" <*> o Aeson..:? "target" <*> o Aeson..:? "profile_name" <*> o Aeson..:? "base_url" <*> o Aeson..:? "api_key" <*> o Aeson..:? "model" <*> o Aeson..:? "protocol" <*> o Aeson..:? "can_generate" <*> o Aeson..:? "can_edit" <*> o Aeson..:? "timeout"
   )) value)
 
 personaScope :: Text -> Maybe Text -> Either Text MemoryStore.MemoryScope
@@ -192,3 +227,4 @@ pairValue (entryId, value) = Aeson.object ["id" Aeson..= entryId, "content" Aeso
 groupValue (entryId, value) = Aeson.object ["id" Aeson..= entryId, "content" Aeson..= value]
 triggerValue (scopeKey, value) = Aeson.object ["scope" Aeson..= scopeKey, "config" Aeson..= value]
 modelValue info = Aeson.object ["provider" Aeson..= info.provider, "model" Aeson..= info.model, "current" Aeson..= info.current, "configured_default" Aeson..= info.configuredDefault]
+imageModelValue info = Aeson.object ["provider" Aeson..= info.imageProfile, "model" Aeson..= info.imageModelId, "current" Aeson..= info.isImageCurrent, "fallback" Aeson..= info.isImageFallback, "configured_default" Aeson..= info.isImageConfiguredDefault, "can_generate" Aeson..= info.imageSupportsGenerate, "can_edit" Aeson..= info.imageSupportsEdit, "api_key_configured" Aeson..= info.imageApiKeyConfigured]

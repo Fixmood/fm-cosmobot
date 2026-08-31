@@ -30,7 +30,10 @@ data Config = Config
   , chatProviderName :: !(Maybe Text)
   , chatProviders :: !(Map Text ChatProviderConfig)
   , imageProvider :: !(Maybe ImageProviderConfig)
+  , imageProviderName :: !(Maybe Text)
+  , imageProviders :: !(Map Text ImageProviderConfig)
   , imageFallbackProvider :: !(Maybe ImageProviderConfig)
+  , imageFallbackProviderName :: !(Maybe Text)
   , audioProvider :: !(Maybe AudioProviderConfig)
   }
   deriving (Eq, Show)
@@ -45,7 +48,8 @@ data ChatProviderConfig = ChatProviderConfig
   deriving (Eq, Show)
 
 data ImageProviderConfig = ImageProviderConfig
-  { baseUrl :: !Text
+  { protocol :: !Text
+  , baseUrl :: !Text
   , apiKey :: !(Maybe Text)
   , model :: !Text
   , canGenerate :: !Bool
@@ -79,7 +83,10 @@ defaultConfig = Config
   , chatProviderName = Nothing
   , chatProviders = Map.empty
   , imageProvider = Nothing
+  , imageProviderName = Nothing
+  , imageProviders = Map.empty
   , imageFallbackProvider = Nothing
+  , imageFallbackProviderName = Nothing
   , audioProvider = Nothing
   }
 
@@ -94,7 +101,8 @@ defaultChatProviderConfig = ChatProviderConfig
 
 defaultImageProviderConfig :: ImageProviderConfig
 defaultImageProviderConfig = ImageProviderConfig
-  { baseUrl = "https://api.openai.com/v1"
+  { protocol = "openai_images"
+  , baseUrl = "https://api.openai.com/v1"
   , apiKey = Nothing
   , model = "gpt-image-1.5"
   , canGenerate = True
@@ -125,7 +133,10 @@ data FileConfig = FileConfig
   , chatProviderName :: !(Maybe Text)
   , chatProviders :: !(Map Text ChatProviderFileConfig)
   , imageProvider :: !(Maybe ImageProviderFileConfig)
+  , imageProviderName :: !(Maybe Text)
+  , imageProviders :: !(Map Text ImageProviderFileConfig)
   , imageFallbackProvider :: !(Maybe ImageProviderFileConfig)
+  , imageFallbackProviderName :: !(Maybe Text)
   , audioProvider :: !(Maybe AudioProviderFileConfig)
   }
   deriving (Show)
@@ -140,7 +151,8 @@ data ChatProviderFileConfig = ChatProviderFileConfig
   deriving (Show)
 
 data ImageProviderFileConfig = ImageProviderFileConfig
-  { baseUrl :: !Text
+  { protocol :: !Text
+  , baseUrl :: !Text
   , apiKey :: !(Maybe Text)
   , model :: !Text
   , canGenerate :: !Bool
@@ -185,7 +197,10 @@ instance FromValue FileConfig where
       , chatProviderName = nonBlank selectedChat
       , chatProviders = chatProviders
       , imageProvider = imageProvider
+      , imageProviderName = nonBlank selectedImage
+      , imageProviders = imageProviders
       , imageFallbackProvider = imageFallbackProvider
+      , imageFallbackProviderName = nonBlank selectedImageFallback
       , audioProvider = audioProvider
       }
 
@@ -232,6 +247,7 @@ instance FromValue ChatProviderFileConfig where
 
 instance FromValue ImageProviderFileConfig where
   fromValue = parseTableFromValue do
+    protocol <- fmap (fromMaybe "openai_images") (optKey "protocol")
     baseUrl <- fmap (fromMaybe defaultImageProviderConfig.baseUrl) (optKey "base_url")
     apiKey <- optToken "api_key"
     model <- fmap (fromMaybe defaultImageProviderConfig.model) (optKey "model")
@@ -246,7 +262,8 @@ instance FromValue ImageProviderFileConfig where
     moderation <- optKey "moderation"
     when (requestTimeout <= 0) (fail "llm.image_provider.<name>.timeout must be positive")
     pure ImageProviderFileConfig
-      { baseUrl = baseUrl
+      { protocol = protocol
+      , baseUrl = baseUrl
       , apiKey = apiKey
       , model = model
       , canGenerate = canGenerate
@@ -290,7 +307,10 @@ toRuntimeConfig cfg =
     , chatProviderName = cfg.chatProviderName
     , chatProviders = toRuntimeChatProviderConfig <$> cfg.chatProviders
     , imageProvider = toRuntimeImageProviderConfig <$> cfg.imageProvider
+    , imageProviderName = cfg.imageProviderName
+    , imageProviders = toRuntimeImageProviderConfig <$> cfg.imageProviders
     , imageFallbackProvider = toRuntimeImageProviderConfig <$> cfg.imageFallbackProvider
+    , imageFallbackProviderName = cfg.imageFallbackProviderName
     , audioProvider = toRuntimeAudioProviderConfig <$> cfg.audioProvider
     }
 
@@ -307,7 +327,8 @@ toRuntimeChatProviderConfig cfg =
 toRuntimeImageProviderConfig :: ImageProviderFileConfig -> ImageProviderConfig
 toRuntimeImageProviderConfig cfg =
   ImageProviderConfig
-    { baseUrl = cfg.baseUrl
+    { protocol = cfg.protocol
+    , baseUrl = cfg.baseUrl
     , apiKey = cfg.apiKey
     , model = cfg.model
     , canGenerate = cfg.canGenerate

@@ -128,6 +128,7 @@ defaultToolsWith extraTools = tools
       , fmRepositoryPRTool
       , accountBalanceTool
       , chatModelManageTool
+      , imageModelManageTool
       , chatModelAddTool
       , chatModelEditTool
       , chatModelDeleteTool

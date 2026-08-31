@@ -37,3 +37,9 @@ runLLMWith askTextStream askImageStream askImageEditStream askAudioStream askToo
       LLM.EditChatModel _ _ -> pure (Right ())
       LLM.DeleteChatModel _ -> pure (Right ())
       LLM.ResetChatModel -> pure Nothing
+      LLM.ListImageModels -> pure []
+      LLM.SelectImageModel _ -> pure (Left "Image model switching is unavailable in the test interpreter.")
+      LLM.SelectImageFallbackModel _ -> pure (Right Nothing)
+      LLM.ResetImageModels -> pure (Nothing, Nothing)
+      LLM.AddImageModel _ -> pure (Right ())
+      LLM.DeleteImageModel _ -> pure (Right ())

@@ -15,6 +15,7 @@ main =
     testGroup "llm-openai-config"
       [ testCase "selects named chat provider" testSelectsNamedChatProvider
       , testCase "retains all chat providers for runtime switching" testRetainsAllChatProviders
+      , testCase "retains all image providers for runtime switching" testRetainsAllImageProviders
       , testCase "resolves model switch targets by profile or model id" testResolvesModelSwitchTargets
       , testCase "selects named image provider" testSelectsNamedImageProvider
       , testCase "selects named audio provider" testSelectsNamedAudioProvider
@@ -65,6 +66,28 @@ testResolvesModelSwitchTargets = do
   OpenAI.resolveChatModelTarget cfg "GPT" @?= Right (Just "gpt")
   OpenAI.resolveChatModelTarget cfg "gpt-sol-5.6" @?= Right (Just "gpt")
   assertBool "unknown models should be rejected" (isLeft (OpenAI.resolveChatModelTarget cfg "missing"))
+
+testRetainsAllImageProviders :: IO ()
+testRetainsAllImageProviders = do
+  cfg <- parseRuntimeConfig $ Text.unlines
+    [ "image = \"weilai\""
+    , "image_fallback = \"botcf\""
+    , ""
+    , "[image_provider.weilai]"
+    , "protocol = \"volcengine_seedream\""
+    , "api_key = \"weilai-key\""
+    , "model = \"gpt-image-2\""
+    , ""
+    , "[image_provider.botcf]"
+    , "api_key = \"botcf-key\""
+    , "model = \"gpt-image-2-2k\""
+    ]
+  cfg.imageProviderName @?= Just "weilai"
+  cfg.imageFallbackProviderName @?= Just "botcf"
+  Map.keys cfg.imageProviders @?= ["botcf", "weilai"]
+  (.model) <$> Map.lookup "weilai" cfg.imageProviders @?= Just "gpt-image-2"
+  (.protocol) <$> Map.lookup "weilai" cfg.imageProviders @?= Just "volcengine_seedream"
+  (.model) <$> Map.lookup "botcf" cfg.imageProviders @?= Just "gpt-image-2-2k"
 
 twoChatProviderConfig :: IO LLMConfig.Config
 twoChatProviderConfig =

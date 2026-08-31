@@ -5,6 +5,7 @@ Stability   : experimental
 -}
 module Bot.Agent.Tools.Model
   ( chatModelStatusTool
+  , imageModelManageTool
   , accountBalanceTool
   , chatModelManageTool
   , chatModelAddTool
@@ -36,6 +37,70 @@ chatModelStatusTool =
   $ tool "chat_model_status" noArguments do
       models <- LLM.listChatModels
       pure . toolText $ renderModels models
+
+imageModelManageTool
+  :: (LLM.LLM :> es, Lifecycle.Lifecycle :> es)
+  => Tool (Eff es)
+imageModelManageTool =
+  allowWhen superuserOnly
+  . withDescription "Manage FM image-generation models independently from chat models. action can be status, add, delete, switch (primary), fallback, or reset. For add provide name, base_url, api_key, and model. API keys are never echoed. Use this when the user asks which image model is active, wants to add a provider, switch the primary image model, or choose a fallback."
+  $ tool "image_model_manage"
+      (requiredText "action" "status, add, delete, switch, fallback, or reset"
+       , optionalText "target" "Image provider profile name or exact model ID. Required for switch/delete; optional for fallback to clear it."
+       , optionalText "name" "New provider profile name for add."
+       , optionalText "base_url" "OpenAI-compatible image API base URL for add."
+       , optionalText "api_key" "API key for add; never echo it."
+       , optionalText "model" "Exact image model ID for add."
+       , withDefault "openai_images" (optionalText "protocol" "openai_images or volcengine_seedream.")
+       )
+      $ \action target name baseUrl apiKey model protocol -> do
+          let op = Text.toCaseFold (Text.strip action)
+              renderInfo info = info.imageProfile <> " (" <> info.imageModelId <> ")"
+          case op of
+            "status" -> LLM.listImageModels <&> toolText . renderImageModels
+            "查看" -> LLM.listImageModels <&> toolText . renderImageModels
+            "add" -> do
+              context <- askToolContext
+              case (name, baseUrl, apiKey, model) of
+                (Just profile, Just base, Just key, Just modelId) -> do
+                  result <- LLM.addImageModel LLM.ImageModelConfig
+                    { imageProtocol = Text.strip protocol, imageProfileName = Text.strip profile, imageBaseUrl = Text.strip base
+                    , imageApiKey = Text.strip key, imageModelId = Text.strip modelId
+                    , imageCanGenerate = True, imageCanEdit = False, imageTimeout = 300 }
+                  case result of
+                    Left err -> pure (toolFailure (permanentArgumentFailure ("生图模型未保存：" <> err) err))
+                    Right () -> do
+                      Lifecycle.requestRestart context.message "生图模型已保存，FM正在重启加载模型列表；当前主模型不会自动改变。"
+                      pure (toolText "生图模型已保存，FM正在重启加载模型列表；当前主模型不会自动改变。")
+                _ -> pure (toolFailure (permanentArgumentFailure "添加生图模型需要名称、API 地址、API Key 和模型 ID。" "请补全必要配置。"))
+            "switch" -> runTarget target LLM.selectImageModel "主生图模型已切换："
+            "切换" -> runTarget target LLM.selectImageModel "主生图模型已切换："
+            "fallback" -> LLM.selectImageFallbackModel (Text.strip <$> target) <&> \case
+              Left err -> toolFailure (permanentArgumentFailure ("备用生图模型未设置：" <> err) err)
+              Right Nothing -> toolText "已清除备用生图模型。"
+              Right (Just info) -> toolText ("备用生图模型已设置：" <> renderInfo info)
+            "delete" -> case target of
+              Nothing -> pure (toolFailure (permanentArgumentFailure "缺少要删除的生图模型。" "请提供配置名称或模型 ID。"))
+              Just value -> LLM.deleteImageModel (Text.strip value) <&> \case
+                Left err -> toolFailure (permanentArgumentFailure ("生图模型未删除：" <> err) err)
+                Right () -> toolText "生图模型已删除；重启 FM 后生效。"
+            "reset" -> LLM.resetImageModels <&> \(primary, fallback) -> toolText ("生图模型选择已恢复默认。主模型：" <> maybe "未配置" renderInfo primary <> "；备用模型：" <> maybe "未配置" renderInfo fallback)
+            _ -> pure (toolFailure (permanentArgumentFailure ("不支持的生图模型操作：" <> op) "请使用查看、添加、切换、fallback、删除或恢复默认。"))
+          where
+            runTarget Nothing _ _ = pure (toolFailure (permanentArgumentFailure "缺少目标生图模型。" "请提供配置名称或模型 ID。"))
+            runTarget (Just value) operation prefix = operation (Text.strip value) <&> \case
+              Left err -> toolFailure (permanentArgumentFailure ("生图模型未切换：" <> err) err)
+              Right info -> toolText (prefix <> info.imageProfile <> " (" <> info.imageModelId <> ")")
+
+renderImageModels :: [LLM.ImageModelInfo] -> Text
+renderImageModels [] = "没有配置生图模型。"
+renderImageModels models = Text.unlines ("已配置的生图模型：" : map render models)
+  where
+    render info = "- " <> info.imageProfile <> " (" <> info.imageModelId <> ")"
+      <> if info.isImageCurrent then " [主模型]" else ""
+      <> if info.isImageFallback then " [备用]" else ""
+      <> if info.imageSupportsGenerate then " [可生图]" else " [不可生图]"
+      <> if info.imageApiKeyConfigured then "" else " [未配置Key]"
 
 data ChatModelManageArgs = ChatModelManageArgs
   { manageAction :: !Text

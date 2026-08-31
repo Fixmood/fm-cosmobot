@@ -135,6 +135,8 @@ askImageOpenAIStreaming Config{imageProvider = Nothing} _ _ _ =
 askImageOpenAIStreaming Config{imageProvider = Just ImageProviderConfig{apiKey = Nothing}} _ _ _ =
   yieldTextResult (pure imageApiKeyNotConfiguredMessage)
 askImageOpenAIStreaming Config{imageProvider = Just provider@ImageProviderConfig{apiKey = Just key}} options messages storeImage
+  | provider.protocol == "volcengine_seedream" && provider.canGenerate =
+      storeImage provider key (streamImageGenerationVolcengineBytes provider key options messages)
   | provider.canGenerate =
       storeImage provider key (streamImageGenerationOpenAIBytes provider key options messages)
   | otherwise =
@@ -732,6 +734,49 @@ streamImageGenerationOpenAIBytes provider@ImageProviderConfig{baseUrl, model, re
     let request = imageGenerationStreamingRequestPayload provider options model (imagePromptFromMessages messages)
     httpRequest <- liftIO (sseJsonPostRequest baseUrl ["images", "generations"] apiKey (secondsToMicros requestTimeout) request)
     imageBytesFromCompletedEvent (streamSsePayloads (streamHttpResponseBody httpRequest))
+
+streamImageGenerationVolcengineBytes
+  :: (HTTP.HTTP :> es, IOE :> es)
+  => ImageProviderConfig
+  -> Text
+  -> LLM.ImageRequestOptions
+  -> [ChatMessage]
+  -> Q.ByteStream (Eff es) ()
+streamImageGenerationVolcengineBytes provider@ImageProviderConfig{baseUrl, model, requestTimeout} apiKey options messages =
+  Q.fromChunks do
+    let endpoint = endpointText baseUrl ["images", "generations"]
+        payload = Aeson.object
+          [ "model" Aeson..= model
+          , "prompt" Aeson..= imagePromptFromMessages messages
+          , "size" Aeson..= fromMaybe "2K" (options.size <|> provider.size)
+          , "watermark" Aeson..= False
+          ]
+    request <- liftIO (Client.parseRequest (Text.unpack endpoint))
+    let postRequest = request
+          { Client.method = "POST"
+          , Client.requestBody = Client.RequestBodyLBS (Aeson.encode payload)
+          , Client.requestHeaders =
+              [ ("Authorization", ByteString.pack [i|Bearer #{apiKey}|])
+              , ("Content-Type", "application/json") ]
+          , Client.responseTimeout = Client.responseTimeoutMicro (secondsToMicros requestTimeout) }
+    response <- HTTP.openResponse postRequest
+    body <- liftIO (Client.brConsume (Client.responseBody response))
+    liftIO (Client.responseClose response)
+    unless (HTTPStatus.statusIsSuccessful (Client.responseStatus response)) $
+      throwIO (LLMException "火山引擎 Seedream 图片接口返回错误，请检查 API Key、模型 ID 和 endpoint 配置。")
+    imageUrl <- maybe (throwIO (LLMException "火山引擎 Seedream 返回中没有图片 URL。")) pure (parseImageUrl (LazyByteString.fromChunks body))
+    imageRequest <- liftIO (Client.parseRequest (Text.unpack imageUrl))
+    imageResponse <- HTTP.openResponse imageRequest
+    imageBytes <- liftIO (Client.brConsume (Client.responseBody imageResponse))
+    liftIO (Client.responseClose imageResponse)
+    pure imageBytes
+  where
+    parseImageUrl body = do
+      value <- Aeson.decode body
+      AesonTypes.parseMaybe (Aeson.withObject "Seedream response" $ \object -> do
+        items <- (object Aeson..: "data" :: AesonTypes.Parser [Aeson.Value])
+        firstItem <- listToMaybe items
+        Aeson.withObject "Seedream image" (Aeson..: "url") firstItem) value
 
 streamImageEditOpenAIBytes
   :: (HTTP.HTTP :> es, IOE :> es, Timeout.Timeout :> es, FileSystem :> es, Fail :> es)

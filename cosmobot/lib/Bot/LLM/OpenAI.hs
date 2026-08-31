@@ -61,7 +61,9 @@ runLLM
   -> Eff es a
 runLLM cfg action = do
   initialSelection <- liftIO (loadChatModelSelection cfg)
+  initialImageSelection <- liftIO (loadImageModelSelection cfg)
   selection <- MVar.newMVar initialSelection
+  imageSelection <- MVar.newMVar initialImageSelection
   interpret
     (\localEnv operation ->
       case operation of
@@ -82,16 +84,19 @@ runLLM cfg action = do
               LLM.liftLocalStream liftLocal $
                 do
                   resolved <- lift (resolveChatMessagesTimed messages)
-                  imageStreamWithFallback cfg options resolved
+                  selectedImages <- lift (MVar.readMVar imageSelection)
+                  imageStreamWithFallback (activeImageConfig cfg selectedImages) options resolved
         LLM.AskImageEditStream options prompt imageRefs maskRef ->
           localSeqLift localEnv \liftLocal ->
             pure $
               LLM.liftLocalStream liftLocal $
                 do
+                  selectedImages <- lift (MVar.readMVar imageSelection)
+                  let selectedCfg = activeImageConfig cfg selectedImages
                   resolvedImageRefs <- lift (traverse Media.publicMediaRef imageRefs)
                   resolvedMaskRef <- lift (traverse Media.publicMediaRef maskRef)
                   Retry.retryLLMStreamRequest "LLM image edit streaming request" $
-                    askImageEditStreamingWithMedia cfg options prompt resolvedImageRefs resolvedMaskRef
+                    askImageEditStreamingWithMedia selectedCfg options prompt resolvedImageRefs resolvedMaskRef
         LLM.AskAudioStream options messages ->
           localSeqLift localEnv \liftLocal ->
             pure $
@@ -203,6 +208,56 @@ runLLM cfg action = do
                   saved <- trySync (liftIO (deleteChatProviderConfig name))
                   pure $ case saved of
                     Left (err :: SomeException) -> Left ("删除模型配置失败：" <> Text.pack (show err))
+                    Right _ -> Right ()
+        LLM.ListImageModels -> do
+          selected <- MVar.readMVar imageSelection
+          pure (imageModelInfos cfg selected)
+        LLM.SelectImageModel target -> do
+          case resolveImageModelTarget cfg target of
+            Left err -> pure (Left err)
+            Right name -> do
+              (_, fallback) <- MVar.readMVar imageSelection
+              liftIO (persistImageModelSelection imageSelectionFile (Just name))
+              MVar.modifyMVar_ imageSelection (const (pure (Just name, fallback)))
+              pure (maybe (Left "The selected image model is unavailable.") Right (find ((== name) . LLM.imageProfile) (imageModelInfos cfg (Just name, fallback))))
+        LLM.SelectImageFallbackModel target -> do
+          case target of
+            Nothing -> do
+              liftIO (persistImageModelSelection imageFallbackSelectionFile Nothing)
+              MVar.modifyMVar_ imageSelection (\(primary, _) -> pure (primary, Nothing))
+              pure (Right Nothing)
+            Just raw -> case resolveImageModelTarget cfg raw of
+              Left err -> pure (Left err)
+              Right name -> do
+                (primary, _) <- MVar.readMVar imageSelection
+                liftIO (persistImageModelSelection imageFallbackSelectionFile (Just name))
+                MVar.modifyMVar_ imageSelection (\(primary, _) -> pure (primary, Just name))
+                pure (maybe (Left "The selected fallback image model is unavailable.") (Right . Just) (find ((== name) . LLM.imageProfile) (imageModelInfos cfg (primary, Just name))))
+        LLM.ResetImageModels -> do
+          liftIO (persistImageModelSelection imageSelectionFile cfg.imageProviderName)
+          liftIO (persistImageModelSelection imageFallbackSelectionFile cfg.imageFallbackProviderName)
+          MVar.modifyMVar_ imageSelection (const (pure (cfg.imageProviderName, cfg.imageFallbackProviderName)))
+          let infos = imageModelInfos cfg (cfg.imageProviderName, cfg.imageFallbackProviderName)
+          pure (find LLM.isImageCurrent infos, find LLM.isImageFallback infos)
+        LLM.AddImageModel candidate -> do
+          case validateNewImageModel candidate of
+            Left err -> pure (Left err)
+            Right provider
+              | any (\name -> Text.toCaseFold name == Text.toCaseFold candidate.imageProfileName) (Map.keys cfg.imageProviders) -> pure (Left "这个生图模型配置名称已经存在，请换一个名称。")
+              | otherwise -> do
+                  saved <- trySync (liftIO (appendImageProviderConfig candidate provider))
+                  pure $ case saved of
+                    Left (err :: SomeException) -> Left ("保存生图模型配置失败：" <> Text.pack (show err))
+                    Right _ -> Right ()
+        LLM.DeleteImageModel target -> do
+          case resolveImageModelTarget cfg target of
+            Left err -> pure (Left err)
+            Right name
+              | Just name == cfg.imageProviderName || Just name == cfg.imageFallbackProviderName -> pure (Left "不能删除当前生图主模型或备用模型，请先切换到其他模型。")
+              | otherwise -> do
+                  saved <- trySync (liftIO (deleteImageProviderConfig name))
+                  pure $ case saved of
+                    Left (err :: SomeException) -> Left ("删除生图模型配置失败：" <> Text.pack (show err))
                     Right _ -> Right ()
         LLM.SelectChatModel target ->
           case resolveChatModelTarget cfg target of
@@ -443,7 +498,10 @@ visionChatConfig cfg = do
     , chatProviderName = Just name
     , chatProviders = cfg.chatProviders
     , imageProvider = cfg.imageProvider
+    , imageProviderName = cfg.imageProviderName
+    , imageProviders = cfg.imageProviders
     , imageFallbackProvider = cfg.imageFallbackProvider
+    , imageFallbackProviderName = cfg.imageFallbackProviderName
     , audioProvider = cfg.audioProvider
     }
 
@@ -533,6 +591,119 @@ persistChatModelSelection selectedName =
       Directory.createDirectoryIfMissing True (takeDirectory chatModelSelectionFile)
       TextIO.writeFile tempPath (fromMaybe "" selectedName <> "\n")
       Directory.renameFile tempPath chatModelSelectionFile
+
+imageSelectionFile :: FilePath
+imageSelectionFile = "image-model-selection"
+
+imageFallbackSelectionFile :: FilePath
+imageFallbackSelectionFile = "image-fallback-selection"
+
+loadImageModelSelection :: Config -> IO (Maybe Text, Maybe Text)
+loadImageModelSelection cfg = do
+  primary <- load imageSelectionFile cfg.imageProviderName
+  fallback <- load imageFallbackSelectionFile cfg.imageFallbackProviderName
+  pure (primary, fallback)
+  where
+    load path fallback = catchIOError
+      (do
+        exists <- Directory.doesFileExist path
+        if not exists then pure fallback else do
+          value <- Text.strip <$> TextIO.readFile path
+          pure $ if Map.member value cfg.imageProviders then Just value else fallback)
+      (const (pure fallback))
+
+persistImageModelSelection :: FilePath -> Maybe Text -> IO ()
+persistImageModelSelection path selected = do
+  let tempPath = path <> ".tmp"
+  TextIO.writeFile tempPath (fromMaybe "" selected <> "\n")
+  Directory.renameFile tempPath path
+
+activeImageConfig :: Config -> (Maybe Text, Maybe Text) -> Config
+activeImageConfig cfg (primary, fallback) =
+  cfg
+    { imageProvider = primary >>= (`Map.lookup` cfg.imageProviders)
+    , imageProviderName = primary
+    , imageFallbackProvider = fallback >>= (`Map.lookup` cfg.imageProviders)
+    , imageFallbackProviderName = fallback
+    }
+
+imageModelInfos :: Config -> (Maybe Text, Maybe Text) -> [LLM.ImageModelInfo]
+imageModelInfos cfg (primary, fallback) =
+  [ LLM.ImageModelInfo
+      { imageProfile = name
+      , imageModelId = provider.model
+      , isImageCurrent = Just name == primary
+      , isImageFallback = Just name == fallback
+      , isImageConfiguredDefault = Just name == cfg.imageProviderName
+      , imageSupportsGenerate = provider.canGenerate
+      , imageSupportsEdit = provider.canEdit
+      , imageApiKeyConfigured = isJust provider.apiKey
+      }
+  | (name, provider) <- Map.toAscList cfg.imageProviders
+  ]
+
+resolveImageModelTarget :: Config -> Text -> Either Text Text
+resolveImageModelTarget cfg raw
+  | Text.null target = Left "生图模型目标不能为空。"
+  | [name] <- matches = Right name
+  | otherwise = Left ("找不到生图模型配置或模型 ID：" <> target <> "。可用配置：" <> Text.intercalate ", " (Map.keys cfg.imageProviders))
+  where
+    target = Text.toCaseFold (Text.strip raw)
+    matches = [name | (name, provider) <- Map.toAscList cfg.imageProviders, Text.toCaseFold name == target || Text.toCaseFold provider.model == target]
+
+validateNewImageModel :: LLM.ImageModelConfig -> Either Text ImageProviderConfig
+validateNewImageModel candidate
+  | Text.null name = Left "生图模型配置名称不能为空。"
+  | not (Text.all validNameChar name) = Left "生图模型配置名称只能使用字母、数字、短横线或下划线。"
+  | Text.null base = Left "API 地址不能为空。"
+  | not (Text.isPrefixOf "http://" (Text.toCaseFold base) || Text.isPrefixOf "https://" (Text.toCaseFold base)) = Left "API 地址必须以 http:// 或 https:// 开头。"
+  | Text.null key = Left "API Key 不能为空。"
+  | Text.null modelName = Left "模型 ID 不能为空。"
+  | timeout <= 0 = Left "超时时间必须是正数。"
+  | otherwise = Right ImageProviderConfig
+      { protocol = Text.strip candidate.imageProtocol, baseUrl = base, apiKey = Just key, model = modelName
+      , canGenerate = candidate.imageCanGenerate, canEdit = candidate.imageCanEdit
+      , requestTimeout = timeout, outputFormat = Nothing, quality = Nothing
+      , size = Nothing, aspectRatio = Nothing, background = Nothing, moderation = Nothing }
+  where
+    name = Text.strip candidate.imageProfileName
+    base = Text.strip candidate.imageBaseUrl
+    key = Text.strip candidate.imageApiKey
+    modelName = Text.strip candidate.imageModelId
+    timeout = candidate.imageTimeout
+    validNameChar c = isAlphaNum c || c == '-' || c == '_'
+
+appendImageProviderConfig :: LLM.ImageModelConfig -> ImageProviderConfig -> IO ()
+appendImageProviderConfig candidate provider = do
+  content <- TextIO.readFile "config.toml"
+  let name = Text.strip candidate.imageProfileName
+      newline = if Text.isSuffixOf "\n" content then "" else "\n"
+      section = Text.concat
+        [ newline, "\n[llm.image_provider.", name, "]\n"
+        , "protocol = ", tomlString provider.protocol, "\n"
+        , "base_url = ", tomlString provider.baseUrl, "\n"
+        , "api_key = ", tomlString (fromMaybe "" provider.apiKey), "\n"
+        , "model = ", tomlString provider.model, "\n"
+        , "can_generate = ", if provider.canGenerate then "true\n" else "false\n"
+        , "can_edit = ", if provider.canEdit then "true\n" else "false\n"
+        , "timeout = ", showText provider.requestTimeout, "\n" ]
+  TextIO.writeFile "config.toml.fm-image-model.tmp" (content <> section)
+  Directory.renameFile "config.toml.fm-image-model.tmp" "config.toml"
+
+deleteImageProviderConfig :: Text -> IO ()
+deleteImageProviderConfig name = do
+  content <- TextIO.readFile "config.toml"
+  let header = "[llm.image_provider." <> Text.strip name <> "]"
+      remove [] = []
+      remove (line:rest)
+        | Text.strip line == header = skip rest
+        | otherwise = line : remove rest
+      skip [] = []
+      skip (line:rest)
+        | Text.isPrefixOf "[" (Text.strip line) = remove (line:rest)
+        | otherwise = skip rest
+  TextIO.writeFile "config.toml.fm-image-model.tmp" (Text.unlines (remove (Text.lines content)))
+  Directory.renameFile "config.toml.fm-image-model.tmp" "config.toml"
 
 validateNewChatModel :: LLM.ChatModelConfig -> Either Text ChatProviderConfig
 validateNewChatModel candidate

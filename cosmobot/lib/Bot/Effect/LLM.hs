@@ -31,12 +31,20 @@ module Bot.Effect.LLM
   , addChatModel
   , editChatModel
   , deleteChatModel
+  , listImageModels
+  , selectImageModel
+  , selectImageFallbackModel
+  , resetImageModels
+  , addImageModel
+  , deleteImageModel
   , liftLocalStream
   , LLMException (..)
   , llmExceptionSummary
   , ChatModelInfo (..)
   , ChatModelConfig (..)
   , ChatModelPatch (..)
+  , ImageModelInfo (..)
+  , ImageModelConfig (..)
   , AccountBalance (..)
   , AccountBalanceResult (..)
 
@@ -86,6 +94,12 @@ data LLM :: Effect where
   AddChatModel :: ChatModelConfig -> LLM m (Either Text ())
   EditChatModel :: Text -> ChatModelPatch -> LLM m (Either Text ())
   DeleteChatModel :: Text -> LLM m (Either Text ())
+  ListImageModels :: LLM m [ImageModelInfo]
+  SelectImageModel :: Text -> LLM m (Either Text ImageModelInfo)
+  SelectImageFallbackModel :: Maybe Text -> LLM m (Either Text (Maybe ImageModelInfo))
+  ResetImageModels :: LLM m (Maybe ImageModelInfo, Maybe ImageModelInfo)
+  AddImageModel :: ImageModelConfig -> LLM m (Either Text ())
+  DeleteImageModel :: Text -> LLM m (Either Text ())
 
 type instance DispatchOf LLM = Dynamic
 
@@ -114,6 +128,30 @@ data ChatModelPatch = ChatModelPatch
   , newModel :: !(Maybe Text)
   , newReasoningEffort :: !(Maybe Text)
   , newRequestTimeout :: !(Maybe Int)
+  }
+  deriving (Eq, Show)
+
+data ImageModelInfo = ImageModelInfo
+  { imageProfile :: !Text
+  , imageModelId :: !Text
+  , isImageCurrent :: !Bool
+  , isImageFallback :: !Bool
+  , isImageConfiguredDefault :: !Bool
+  , imageSupportsGenerate :: !Bool
+  , imageSupportsEdit :: !Bool
+  , imageApiKeyConfigured :: !Bool
+  }
+  deriving (Eq, Show)
+
+data ImageModelConfig = ImageModelConfig
+  { imageProtocol :: !Text
+  , imageProfileName :: !Text
+  , imageBaseUrl :: !Text
+  , imageApiKey :: !Text
+  , imageModelId :: !Text
+  , imageCanGenerate :: !Bool
+  , imageCanEdit :: !Bool
+  , imageTimeout :: !Int
   }
   deriving (Eq, Show)
 
@@ -279,6 +317,24 @@ editChatModel target patch =
 deleteChatModel :: LLM :> es => Text -> Eff es (Either Text ())
 deleteChatModel =
   send . DeleteChatModel
+
+listImageModels :: LLM :> es => Eff es [ImageModelInfo]
+listImageModels = send ListImageModels
+
+selectImageModel :: LLM :> es => Text -> Eff es (Either Text ImageModelInfo)
+selectImageModel = send . SelectImageModel
+
+selectImageFallbackModel :: LLM :> es => Maybe Text -> Eff es (Either Text (Maybe ImageModelInfo))
+selectImageFallbackModel = send . SelectImageFallbackModel
+
+resetImageModels :: LLM :> es => Eff es (Maybe ImageModelInfo, Maybe ImageModelInfo)
+resetImageModels = send ResetImageModels
+
+addImageModel :: LLM :> es => ImageModelConfig -> Eff es (Either Text ())
+addImageModel = send . AddImageModel
+
+deleteImageModel :: LLM :> es => Text -> Eff es (Either Text ())
+deleteImageModel = send . DeleteImageModel
 
 liftLocalStream
   :: Monad m
