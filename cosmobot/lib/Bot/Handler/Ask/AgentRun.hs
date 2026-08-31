@@ -44,6 +44,7 @@ import Bot.Storage.Thread
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Builder as TextBuilder
+import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import qualified Effectful.Prim.IORef as IORef
 import qualified Streaming.Prelude as S
 import Effectful.FileSystem
@@ -85,11 +86,13 @@ runAskAgentThread
   -> Transcript
   -> Eff es (Text, Transcript)
 runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message input transcript = do
+  startedAt <- liftIO getCurrentTime
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
   systemPrompt <- askSystemPrompt cfg message
   let context = agentContext toolCfg cfg outputMessage input systemPrompt
       selectedTools = AgentTools.selectToolsForMessage context tools
+  logInfo [i|FM ask started: platform=#{show message.platform :: String} kind=#{show message.kind :: String} selected_tools=#{length selectedTools}/#{length tools}|]
   Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
@@ -104,7 +107,13 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       \runtime ->
         withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text transcript \activeReply -> do
           reply <- streamAgentReply runtime activeReply outputMessage transcript
+          finishedAt <- liftIO getCurrentTime
+          logInfo [i|FM ask completed: run=#{Agent.runIdOf runtime} elapsed_ms=#{elapsedMilliseconds startedAt finishedAt} status=#{reply.result.status} turns=#{reply.result.turnsUsed}|]
           commitAgentReply observer activeReply message reply
+
+elapsedMilliseconds :: UTCTime -> UTCTime -> Integer
+elapsedMilliseconds startedAt finishedAt =
+  floor (realToFrac (diffUTCTime finishedAt startedAt) * (1000 :: Double))
 
 data AgentReply = AgentReply
   { responseId :: !(Maybe MessageId)
