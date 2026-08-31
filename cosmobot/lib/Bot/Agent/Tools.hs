@@ -40,6 +40,7 @@ import Bot.Agent.Tools.Web
 import Bot.Agent.Tools.Workspace
 import Bot.Agent.Tool
 import Bot.Agent.Types (Context (..))
+import Bot.Core.Message (MessageInput (..))
 import qualified Bot.Effect.ACP as ACP
 import qualified Bot.Effect.Agent as Agent
 import qualified Bot.Effect.AgentAudit as AgentAudit
