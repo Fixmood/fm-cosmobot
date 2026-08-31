@@ -15,6 +15,7 @@ where
 
 import qualified Bot.Agent as Agent
 import qualified Bot.Agent.Tool as AgentTool
+import qualified Bot.Agent.Tools as AgentTools
 import qualified Bot.Agent.Failure as Failure
 import qualified Bot.Agent.Middleware.Observation as AgentObservation
 import Bot.Core.Thread
@@ -87,6 +88,8 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
   systemPrompt <- askSystemPrompt cfg message
+  let context = agentContext toolCfg cfg outputMessage input systemPrompt
+      selectedTools = AgentTools.selectToolsForMessage context tools
   Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
@@ -96,8 +99,8 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
     Agent.withRun
       cfg.agentMaxTurns
       (compactionThresholdTokens cfg)
-      (agentContext toolCfg cfg outputMessage input systemPrompt)
-      tools
+      context
+      selectedTools
       \runtime ->
         withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text transcript \activeReply -> do
           reply <- streamAgentReply runtime activeReply outputMessage transcript

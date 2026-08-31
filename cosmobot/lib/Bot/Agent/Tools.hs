@@ -8,6 +8,7 @@ module Bot.Agent.Tools
   ( defaultTools
   , defaultToolsWith
   , acpTools
+  , selectToolsForMessage
   )
 where
 
@@ -38,6 +39,7 @@ import Bot.Agent.Tools.Typst
 import Bot.Agent.Tools.Web
 import Bot.Agent.Tools.Workspace
 import Bot.Agent.Tool
+import Bot.Agent.Types (Context)
 import qualified Bot.Effect.ACP as ACP
 import qualified Bot.Effect.Agent as Agent
 import qualified Bot.Effect.AgentAudit as AgentAudit
@@ -55,6 +57,7 @@ import qualified Bot.Effect.Scheduler as Scheduler
 import qualified Bot.Effect.Skills as Skills
 import qualified Bot.Effect.Typst as Typst
 import Bot.Prelude
+import qualified Data.Text as Text
 import Effectful.Timeout
 import Effectful.Process
 import Effectful.FileSystem
@@ -205,6 +208,85 @@ defaultToolsWith extraTools = tools
       , subagentTool tools
       , emacsEvalTool
       ] <> extraTools
+
+-- | Keep the full tool set for ordinary or ambiguous messages.  For an
+-- explicit FM domain request, hide unrelated tools from the model while
+-- retaining every tool that can participate in that domain.  This changes
+-- only model-visible schemas; dispatch and the registered tool definitions
+-- remain unchanged.
+selectToolsForMessage :: Context -> [Tool m] -> [Tool m]
+selectToolsForMessage context tools =
+  case requestDomain compact of
+    Nothing -> tools
+    Just domain -> filter (keepTool domain . toolName) tools
+  where
+    keepTool domain name =
+      name `elem` alwaysVisible
+        || name `elem` domainTools domain
+
+    alwaysVisible =
+      [ toolEnableName
+      , "datetime"
+      , "current_message_info"
+      ]
+
+    domainTools = \case
+      Library ->
+        [ "fm_library_search", "fm_library_pick", "fm_library_start"
+        , "fm_library_continue", "fm_library_continue_same"
+        , "fm_library_continue_previous", "fm_library_recall_recent"
+        , "fm_library_stop", "fm_library_stats"
+        ]
+      Contest ->
+        [ "fm_contest_search", "fm_contest_send"
+        , "fm_live_competition_rank", "fm_live_competition_text"
+        , "fm_ai_contest_text", "fm_ai_contest_publish"
+        , "fm_ai_contest_leaderboard", "fm_ai_contest_leaderboard_image"
+        , "fm_competition_score_query", "fm_competition_score_summary"
+        , "fm_score_analysis", "fm_competition_score_image", "fm_chart"
+        ]
+      Scores ->
+        [ "fm_score_query", "fm_competition_score_query"
+        , "fm_competition_score_summary", "fm_score_analysis"
+        , "fm_competition_score_image", "fm_chart"
+        ]
+      Admin ->
+        [ "fm_admin_status", "fm_domain_stats", "fm_group_status"
+        ]
+
+    normalized = Text.toCaseFold context.input.text
+    compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) normalized
+
+    requestDomain value
+      | explicitAdmin value = Just Admin
+      | explicitScores value = Just Scores
+      | explicitContest value = Just Contest
+      | explicitLibrary value = Just Library
+      | otherwise = Nothing
+
+    explicitLibrary value =
+      any (`Text.isInfixOf` value)
+        [ "文来", "发文", "来一篇", "来篇", "练一篇", "练文"
+        , "继续打", "上一篇", "这篇文"
+        ]
+
+    explicitContest value =
+      any (`Text.isInfixOf` value)
+        [ "赛文", "比赛文章", "赛事文本", "虎杯", "极速杯", "锦标赛"
+        , "555赛文", "ai赛文", "排行榜"
+        ]
+
+    explicitScores value =
+      any (`Text.isInfixOf` value)
+        [ "查成绩", "成绩如何", "成绩怎么样", "分析成绩", "成绩分析"
+        , "成绩曲线", "成绩图", "平均成绩", "最好成绩", "成绩排行"
+        ]
+
+    explicitAdmin value =
+      any (`Text.isInfixOf` value)
+        [ "后台地址", "后台在哪", "控制中心", "管理后台", "fm后台" ]
+
+data RequestDomain = Library | Contest | Scores | Admin
 
 acpTools :: ACP.ACP :> es => [Tool (Eff es)]
 acpTools =

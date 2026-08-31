@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedLabels #-}
 
 module Main (main) where
@@ -332,6 +333,8 @@ main =
       , testCase "agent omits large tool results only after one model turn consumes them" testAgentOmitsLargeToolResultAfterOneModelTurnConsumesIt
       , testCase "agent hard-limits immediate tool results" testAgentHardLimitsImmediateToolResults
       , testCase "agent audit records structured tool failure category" testAgentAuditRecordsStructuredToolFailureCategory
+      , testCase "explicit FM domain requests expose only relevant tools" testSelectToolsForExplicitDomainRequest
+      , testCase "ambiguous FM requests keep the complete tool set" testSelectToolsForAmbiguousRequest
       , testCase "chat answer JSON remains object compatible" testChatAnswerJsonRemainsObjectCompatible
       , testCase "reply body parses structured content" testReplyBodyParsesStructuredContent
       , testCase "LLM tool request content streams immediately when enabled" testLLMToolRequestContentStreamsImmediatelyWhenEnabled
@@ -5251,6 +5254,30 @@ agentContext =
     , askCommand = "!ask"
     , toolConfig = Agent.defaultToolConfig
     }
+
+testSelectToolsForExplicitDomainRequest :: Assertion
+testSelectToolsForExplicitDomainRequest = do
+  let tools =
+        [ AgentTool.tool "fm_library_start" AgentTool.noArguments (pure (Agent.toolText ""))
+        , AgentTool.tool "fm_score_analysis" AgentTool.noArguments (pure (Agent.toolText ""))
+        , AgentTool.tool "run_bash" AgentTool.noArguments (pure (Agent.toolText ""))
+        ] :: [AgentTool.Tool (Eff '[])]
+      selected = AgentTools.selectToolsForMessage
+        (agentContext{Agent.input = inputWithImages "fm 给我来一篇灵异的" []})
+        tools
+  map AgentTool.toolName selected @?= ["fm_library_start"]
+
+testSelectToolsForAmbiguousRequest :: Assertion
+testSelectToolsForAmbiguousRequest = do
+  let tools =
+        [ AgentTool.tool "fm_library_start" AgentTool.noArguments (pure (Agent.toolText ""))
+        , AgentTool.tool "fm_score_analysis" AgentTool.noArguments (pure (Agent.toolText ""))
+        , AgentTool.tool "run_bash" AgentTool.noArguments (pure (Agent.toolText ""))
+        ] :: [AgentTool.Tool (Eff '[])]
+      selected = AgentTools.selectToolsForMessage
+        (agentContext{Agent.input = inputWithImages "你最近怎么样" []})
+        tools
+  map AgentTool.toolName selected @?= map AgentTool.toolName tools
 
 superuserContext :: Agent.Context
 superuserContext =
