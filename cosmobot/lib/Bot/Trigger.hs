@@ -7,8 +7,12 @@ module Bot.Trigger
   ( TriggerMode (..)
   , TriggerConfig (..)
   , loadTriggerConfig
+  , loadTriggerConfigByKey
   , saveTriggerConfig
+  , saveTriggerConfigByKey
   , clearTriggerConfig
+  , clearTriggerConfigByKey
+  , listTriggerConfigs
   , triggerModeName
   , triggerConfigHasMode
   , parseTriggerMode
@@ -67,25 +71,40 @@ triggerConfigPath = "trigger-config.json"
 
 loadTriggerConfig :: IncomingMessage -> IO (Maybe TriggerConfig)
 loadTriggerConfig message = do
+  loadTriggerConfigByKey (scopeKey message)
+
+loadTriggerConfigByKey :: Text -> IO (Maybe TriggerConfig)
+loadTriggerConfigByKey requestedKey = do
   exists <- doesFileExist triggerConfigPath
   if not exists then pure Nothing else do
     raw <- TextIO.readFile triggerConfigPath
-    pure $ Aeson.decodeStrict (TextEncoding.encodeUtf8 raw) >>= lookupConfig (scopeKey message)
+    pure $ Aeson.decodeStrict (TextEncoding.encodeUtf8 raw) >>= lookupConfig requestedKey
   where
-    lookupConfig key (Aeson.Object object) = KeyMap.lookup (Key.fromText key) object >>= AesonTypes.parseMaybe Aeson.parseJSON
+    lookupConfig configKey (Aeson.Object object) = KeyMap.lookup (Key.fromText configKey) object >>= AesonTypes.parseMaybe Aeson.parseJSON
     lookupConfig _ _ = Nothing
 
 saveTriggerConfig :: IncomingMessage -> TriggerConfig -> IO ()
 saveTriggerConfig message config = do
+  saveTriggerConfigByKey (scopeKey message) config
+
+saveTriggerConfigByKey :: Text -> TriggerConfig -> IO ()
+saveTriggerConfigByKey key config = do
   existing <- loadAll
-  let updated = (scopeKey message, config) : filter ((/= scopeKey message) . fst) existing
-  TextIO.writeFile triggerConfigPath (TextEncoding.decodeUtf8 (LazyByteString.toStrict (Aeson.encode (Aeson.object [Key.fromText key Aeson..= value | (key, value) <- updated]))))
+  let updated = (key, config) : filter ((/= key) . fst) existing
+  TextIO.writeFile triggerConfigPath (TextEncoding.decodeUtf8 (LazyByteString.toStrict (Aeson.encode (Aeson.object [Key.fromText configKey Aeson..= value | (configKey, value) <- updated]))))
 
 clearTriggerConfig :: IncomingMessage -> IO ()
 clearTriggerConfig message = do
+  clearTriggerConfigByKey (scopeKey message)
+
+clearTriggerConfigByKey :: Text -> IO ()
+clearTriggerConfigByKey key = do
   existing <- loadAll
-  let remaining = filter ((/= scopeKey message) . fst) existing
-  TextIO.writeFile triggerConfigPath (TextEncoding.decodeUtf8 (LazyByteString.toStrict (Aeson.encode (Aeson.object [Key.fromText key Aeson..= value | (key, value) <- remaining]))))
+  let remaining = filter ((/= key) . fst) existing
+  TextIO.writeFile triggerConfigPath (TextEncoding.decodeUtf8 (LazyByteString.toStrict (Aeson.encode (Aeson.object [Key.fromText configKey Aeson..= value | (configKey, value) <- remaining]))))
+
+listTriggerConfigs :: IO [(Text, TriggerConfig)]
+listTriggerConfigs = loadAll
 
 loadAll :: IO [(Text, TriggerConfig)]
 loadAll = do
@@ -94,8 +113,8 @@ loadAll = do
     raw <- TextIO.readFile triggerConfigPath
     pure $ maybe [] (mapMaybe decodePair . objectPairs) (Aeson.decodeStrict (TextEncoding.encodeUtf8 raw) :: Maybe Aeson.Value)
   where
-    decodePair (key, value) = (key,) <$> AesonTypes.parseMaybe Aeson.parseJSON value
-    objectPairs (Aeson.Object object) = [(Key.toText key, value) | (key, value) <- KeyMap.toList object]
+    decodePair (configKey, value) = (configKey,) <$> AesonTypes.parseMaybe Aeson.parseJSON value
+    objectPairs (Aeson.Object object) = [(Key.toText configKey, value) | (configKey, value) <- KeyMap.toList object]
     objectPairs _ = []
 
 scopeKey :: IncomingMessage -> Text
