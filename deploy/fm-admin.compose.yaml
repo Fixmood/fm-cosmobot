@@ -1,27 +1,29 @@
 services:
   fm-admin:
+    build:
+      context: ../admin
+      dockerfile: Dockerfile
     image: ${FM_ADMIN_IMAGE:-fm-admin:local}
     container_name: fm-admin
     restart: unless-stopped
+    env_file:
+      - ../admin/.env
     environment:
       TZ: Asia/Shanghai
       FM_ADMIN_HOST: 0.0.0.0
       FM_ADMIN_PORT: 8090
-      FM_ADMIN_TOKEN: ${FM_ADMIN_TOKEN:?FM_ADMIN_TOKEN is required}
       FM_ADMIN_STATE: /data/fm-admin-state.json
       FM_DOMAIN_URL: http://fm-domain:8077
-      FM_RPC_ENABLED: ${FM_RPC_ENABLED:-false}
+      FM_RPC_ENABLED: ${FM_RPC_ENABLED:-true}
       FM_RPC_HOST: ${FM_RPC_HOST:-fm-cosmobot}
       FM_RPC_PORT: ${FM_RPC_PORT:-38765}
-      FM_RPC_TOKEN: ${FM_RPC_TOKEN:-}
       FM_RPC_TIMEOUT: ${FM_RPC_TIMEOUT:-4}
+    ports:
+      - "8090:8090"
     networks:
       - fm-runtime
     volumes:
       - ${FM_ADMIN_DATA_DIR:-/opt/fm-admin/data}:/data
-    depends_on:
-      fm-domain:
-        condition: service_healthy
 
 networks:
   fm-runtime:

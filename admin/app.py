@@ -31,6 +31,7 @@ COLLECTIONS = {"groups", "triggers", "personas", "models"}
 VERSION_LIMIT = 100
 ERROR_LIMIT = 100
 DOMAIN_READS = {
+    "groups": "/groups",
     "library": "/library/search?limit=50",
     "contests": "/contest/search?limit=50",
     "scores": "/scores?limit=50",
@@ -103,7 +104,8 @@ def record_audit(action: str, collection: str, item_id: str, actor: str = "admin
 def fetch_domain(path: str) -> dict:
     request = Request(DOMAIN_URL + path, headers={"Accept": "application/json"})
     try:
-        with urlopen(request, timeout=4) as response:
+        timeout = 20 if path.startswith("/contest/") else 4
+        with urlopen(request, timeout=timeout) as response:
             return {"ok": True, "data": json.loads(response.read().decode("utf-8"))}
     except Exception as error:  # The dashboard must show partial outages instead of failing entirely.
         result = {"ok": False, "error": sanitize_error(error)}
@@ -431,6 +433,27 @@ class Api(BaseHTTPRequestHandler):
         elif request.path == "/api/runtime/config":
             result = fetch_rpc("config.snapshot")
             self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path.startswith("/api/runtime/config/"):
+            resource = request.path.removeprefix("/api/runtime/config/").strip("/")
+            snapshot = fetch_rpc("config.snapshot")
+            if not snapshot["ok"]:
+                self.send_json(HTTPStatus.BAD_GATEWAY, snapshot)
+            else:
+                snapshot_data = snapshot.get("data", {})
+                if resource == "personas":
+                    values = {key: snapshot_data.get(key, {}) for key in ("group_default", "group_personas", "private_default", "private_personas", "member_styles")}
+                else:
+                    values = snapshot_data.get(resource)
+                if values is None:
+                    self.send_error_json(HTTPStatus.NOT_FOUND, "运行时配置资源不存在。")
+                elif isinstance(values, dict):
+                    items = [{"id": key, "value": value, "source": "cosmobot_runtime"} for key, value in values.items()]
+                    self.send_json(HTTPStatus.OK, {"ok": True, "items": items, "read_only": True})
+                elif isinstance(values, list):
+                    items = [dict(value, id=value.get("id", str(index)), source="cosmobot_runtime") if isinstance(value, dict) else {"id": str(index), "value": value, "source": "cosmobot_runtime"} for index, value in enumerate(values)]
+                    self.send_json(HTTPStatus.OK, {"ok": True, "items": items, "read_only": True})
+                else:
+                    self.send_json(HTTPStatus.OK, {"ok": True, "items": [{"id": resource, "value": values, "source": "cosmobot_runtime"}], "read_only": True})
         elif request.path == "/api/runtime/config/versions":
             self.send_json(HTTPStatus.OK, {"ok": True, "items": list(reversed(read_state()["config_versions"]))})
         elif request.path.startswith("/api/runtime/config/versions/") and request.path.endswith("/diff"):
