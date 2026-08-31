@@ -433,6 +433,22 @@ class Api(BaseHTTPRequestHandler):
         elif request.path == "/api/runtime/config":
             result = fetch_rpc("config.snapshot")
             self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
+        elif request.path == "/api/runtime/config/versions":
+            self.send_json(HTTPStatus.OK, {"ok": True, "items": list(reversed(read_state()["config_versions"]))})
+        elif request.path.startswith("/api/runtime/config/versions/") and request.path.endswith("/diff"):
+            version_id = request.path.removeprefix("/api/runtime/config/versions/").removesuffix("/diff").strip("/")
+            version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
+            if version is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
+            else:
+                self.send_json(HTTPStatus.OK, {"ok": True, "version_id": version_id, "changes": version.get("changes", [])})
+        elif request.path.startswith("/api/runtime/config/versions/"):
+            version_id = request.path.removeprefix("/api/runtime/config/versions/").strip("/")
+            version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
+            if version is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
+            else:
+                self.send_json(HTTPStatus.OK, {"ok": True, "version": version})
         elif request.path.startswith("/api/runtime/config/"):
             resource = request.path.removeprefix("/api/runtime/config/").strip("/")
             snapshot = fetch_rpc("config.snapshot")
@@ -454,22 +470,6 @@ class Api(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.OK, {"ok": True, "items": items, "read_only": True})
                 else:
                     self.send_json(HTTPStatus.OK, {"ok": True, "items": [{"id": resource, "value": values, "source": "cosmobot_runtime"}], "read_only": True})
-        elif request.path == "/api/runtime/config/versions":
-            self.send_json(HTTPStatus.OK, {"ok": True, "items": list(reversed(read_state()["config_versions"]))})
-        elif request.path.startswith("/api/runtime/config/versions/") and request.path.endswith("/diff"):
-            version_id = request.path.removeprefix("/api/runtime/config/versions/").removesuffix("/diff").strip("/")
-            version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
-            if version is None:
-                self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
-            else:
-                self.send_json(HTTPStatus.OK, {"ok": True, "version_id": version_id, "changes": version.get("changes", [])})
-        elif request.path.startswith("/api/runtime/config/versions/"):
-            version_id = request.path.removeprefix("/api/runtime/config/versions/").strip("/")
-            version = next((item for item in read_state()["config_versions"] if item["id"] == version_id), None)
-            if version is None:
-                self.send_error_json(HTTPStatus.NOT_FOUND, "配置版本不存在。")
-            else:
-                self.send_json(HTTPStatus.OK, {"ok": True, "version": version})
         elif request.path.startswith("/api/collections/"):
             self.collection_get(request.path.removeprefix("/api/collections/"), parse_qs(request.query))
         elif request.path == "/":
