@@ -28,6 +28,7 @@ module Bot.Agent.Tools.FMDomain
   , fmChartTool
   , fmBotGuardAccountsTool
   , fmDomainStatsTool
+  , fmAdminStatusTool
   ) where
 
 import Bot.Agent.Tool
@@ -801,6 +802,16 @@ fmDomainStatsTool =
       response <- HTTP.runReq $
         req GET (http "172.20.0.4" /: "stats") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+fmAdminStatusTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmAdminStatusTool =
+  allowWhen superuserOnly
+  . withDescription "Return the authoritative current FM Control Center address. Use this whenever the owner asks for FM's backend, admin panel, control center, or dashboard address. Never infer or reuse historical score-analyzer addresses or ports. The public address is fixed at http://117.72.34.77:8090. This tool is owner-only and does not expose RPC or admin tokens."
+    $ tool "fm_admin_status" noArguments do
+      pure . toolText $
+        "当前 FM Control Center 后台地址：http://117.72.34.77:8090\n"
+          <> "状态：已部署。\n"
+          <> "说明：这是 FM 当前使用的管理后台；不要使用历史 score-analyzer 地址或 8787、8788、8790 端口。"
 
 hasExplicitLibraryIntent :: Context -> Bool
 hasExplicitLibraryIntent context =

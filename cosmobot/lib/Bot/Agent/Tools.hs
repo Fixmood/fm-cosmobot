@@ -170,6 +170,7 @@ defaultToolsWith extraTools = tools
       , fmChartTool
       , fmBotGuardAccountsTool
       , fmDomainStatsTool
+      , fmAdminStatusTool
       , readMediaTextTool
       , mediaToFileTool
       , viewImageTool
