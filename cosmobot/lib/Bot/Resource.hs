@@ -658,7 +658,11 @@ reclaimExpired stateRef = forever do
   resourceIds <- Map.keys . (.resources) <$> readIORef stateRef
   for_ resourceIds \resourceId ->
     beginExpire stateRef now resourceId >>= traverse_ \(cleanup, persistent) ->
-      void (finishDestroy stateRef resourceId cleanup persistent)
+      -- Do not interrupt a cleanup after it has started. Persistent cleanup
+      -- includes a SQLite delete, and cancelling it can leave a statement
+      -- unfinished when the storage interpreter closes its connections.
+      uninterruptibleMask_ $
+        void (finishDestroy stateRef resourceId cleanup persistent)
 
 beginExpire
   :: Prim :> es
