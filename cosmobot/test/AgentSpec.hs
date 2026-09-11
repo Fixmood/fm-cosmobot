@@ -308,6 +308,9 @@ main =
       , testCase "agent steering waits for complete tool results" testAgentSteeringWaitsForToolResults
       , testCase "agent steering clears saved continuations" testAgentSteeringClearsContinuations
       , testCase "ask handler system context includes configured bot and sender ids" testAskHandlerSystemContextIncludesConfiguredBotAndSenderIds
+      , testCase "ask handler injects recent group chat context" testAskHandlerInjectsRecentGroupChatContext
+      , testCase "ask handler injects isolated private chat context" testAskHandlerInjectsPrivateChatContext
+      , testCase "ask handler retries and enforces requested reply opening" testAskHandlerEnforcesRequestedOpening
       , testCase "ask handler system context uses message bot id" testAskHandlerSystemContextUsesMessageBotId
       , testCase "ask handler injects startup skill metadata" testAskHandlerInjectsStartupSkillMetadata
       , testCase "ask handler routes replies to active aliases as steering" testAskHandlerRoutesActiveReplyAsSteering
@@ -1834,6 +1837,109 @@ testAskHandlerContinuesFinishedBotReply = do
     other ->
       assertFailure [i|expected two bot-reply model requests, got #{length other}|]
 
+testAskHandlerInjectsRecentGroupChatContext :: IO ()
+testAskHandlerInjectsRecentGroupChatContext = do
+  answers <- IORef.newIORef [chatAnswer "知道了" []]
+  captured <- IORef.newIORef ([] :: [[LLM.ChatMessage]])
+  replies <- IORef.newIORef ([] :: [Text])
+  let alice = askHandlerMessage
+        { senderId = Just "alice-id"
+        , senderUsername = Just "小明"
+        , messageId = Just "context-1"
+        , text = "今晚一起吃火锅"
+        }
+      bob = askHandlerMessage
+        { senderId = Just "bob-id"
+        , senderUsername = Just "小红"
+        , messageId = Just "context-2"
+        , text = "我想吃番茄锅"
+        }
+      current = (askHandlerMessage :: IncomingMessage)
+        { messageId = Just "current-question"
+        , text = "krkr 大家刚才在聊什么"
+        }
+  runAgentCapturingMessages captured answers (ChatMock (Just replies) (Just "reply-id") Nothing) do
+    ChatLog.recordMessage alice
+    ChatLog.recordMessage bob
+    ChatLog.recordSelfMessage current "这条机器人消息不应进入群聊背景"
+    ChatLog.recordMessage current
+    threads <- newThreadStore
+    runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads current
+  requests <- IORef.readIORef captured
+  case requests of
+    [request] -> case chatMessageTextsByRole "system" request of
+      [prompt] -> do
+        assertBool "recent context includes first group member" ("[小明]: 今晚一起吃火锅" `Text.isInfixOf` prompt)
+        assertBool "recent context includes second group member" ("[小红]: 我想吃番茄锅" `Text.isInfixOf` prompt)
+        assertBool "group context excludes bot messages" (not ("机器人消息不应进入" `Text.isInfixOf` prompt))
+        assertBool "group context excludes the current question" (not ("大家刚才在聊什么" `Text.isInfixOf` prompt))
+      other -> assertFailure [i|expected one system prompt, got #{length other}|]
+    other -> assertFailure [i|expected one model request, got #{length other}|]
+
+testAskHandlerInjectsPrivateChatContext :: IO ()
+testAskHandlerInjectsPrivateChatContext = do
+  answers <- IORef.newIORef [chatAnswer "记得" []]
+  captured <- IORef.newIORef ([] :: [[LLM.ChatMessage]])
+  let prior = (askHandlerMessage :: IncomingMessage)
+        { kind = ChatPrivate
+        , chatId = Just 295947730
+        , senderId = Just "295947730"
+        , senderUsername = Just "小明"
+        , messageId = Just "private-context-1"
+        , text = "我刚才说想吃火锅"
+        }
+      unrelated = prior
+        { chatId = Just 999999
+        , senderId = Just "999999"
+        , messageId = Just "other-private-context"
+        , text = "别人的私聊内容"
+        }
+      current = (prior :: IncomingMessage)
+        { messageId = Just "private-current"
+        , text = "你还记得吗"
+        }
+  runAgentCapturingMessages captured answers (ChatMock Nothing (Just "private-reply") Nothing) do
+    ChatLog.recordMessage prior
+    ChatLog.recordSelfMessage prior "当然记得"
+    ChatLog.recordMessage unrelated
+    ChatLog.recordMessage current
+    threads <- newThreadStore
+    runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads current
+  requests <- IORef.readIORef captured
+  case requests of
+    [request] -> case chatMessageTextsByRole "system" request of
+      [prompt] -> do
+        assertBool "private context includes the user history" ("[小明]: 我刚才说想吃火锅" `Text.isInfixOf` prompt)
+        assertBool "private context includes FM history" ("[FM]: 当然记得" `Text.isInfixOf` prompt)
+        assertBool "private context excludes another private chat" (not ("别人的私聊内容" `Text.isInfixOf` prompt))
+        assertBool "private context excludes current question" (not ("你还记得吗" `Text.isInfixOf` prompt))
+      other -> assertFailure [i|expected one private system prompt, got #{length other}|]
+    other -> assertFailure [i|expected one private model request, got #{length other}|]
+
+testAskHandlerEnforcesRequestedOpening :: IO ()
+testAskHandlerEnforcesRequestedOpening = do
+  answers <- IORef.newIORef [chatAnswer "狂到起飞！Fix哥发话" []]
+  captured <- IORef.newIORef ([] :: [[LLM.ChatMessage]])
+  replies <- IORef.newIORef ([] :: [Text])
+  let request = (askHandlerMessage :: IncomingMessage)
+        { messageId = Just "opening-request"
+        , text = "krkr 以 krkr 开头说句话"
+        }
+  runAgentCapturingMessages captured answers (ChatMock (Just replies) (Just "opening-reply") Nothing) do
+    threads <- newThreadStore
+    runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads request
+  sent <- IORef.readIORef replies
+  assertBool [i|visible reply starts with the requested literal opening; sent=#{show sent :: String}|]
+    (any ("krkr" `Text.isPrefixOf`) sent)
+  modelRequests <- IORef.readIORef captured
+  length modelRequests @?= 2
+  case modelRequests of
+    firstRequest : _ ->
+      assertBool "model receives the mandatory literal opening constraint"
+        (any (Text.isInfixOf "first visible character of the reply must begin this exact literal text: krkr")
+          (chatMessageTextsByRole "system" firstRequest))
+    _ -> assertFailure "expected the initial model request and one retry"
+
 testLLMFailureReplyLinksThread :: IO ()
 testLLMFailureReplyLinksThread = do
   answers <- IORef.newIORef [error "simulated LLM failure"]
@@ -2953,9 +3059,9 @@ testThreadAuditScope = do
         runTestLog $
           StorageSQLite.runStorageSQLitePath ":memory:" do
             AgentAuditStorage.ensureAgentAuditTable
-            let firstKey = ThreadMessageKey PlatformQQ (Just 1) "same-message"
-                secondKey = ThreadMessageKey PlatformQQ (Just 2) "same-message"
-                otherPlatformKey = ThreadMessageKey PlatformTelegram (Just 1) "same-message"
+            let firstKey = ThreadMessageKey PlatformQQ (Just 1) (Just "first") "same-message"
+                secondKey = ThreadMessageKey PlatformQQ (Just 2) (Just "second") "same-message"
+                otherPlatformKey = ThreadMessageKey PlatformTelegram (Just 1) (Just "first") "same-message"
             persistAuditOccurrence firstKey "first"
             persistAuditOccurrence secondKey "second"
             persistAuditOccurrence otherPlatformKey "other-platform"
@@ -3785,7 +3891,7 @@ testActiveThreadIdsAreStableAndChatScoped = runEff $ runConcurrent $ runPrim $ r
   remember testMessage 1 11 "first prompt"
   remember testMessage 2 12 "second prompt"
   remember otherChat 3 13 "other chat"
-  let outsider = testMessage{senderId = Just "other"}
+  let outsider = (testMessage :: IncomingMessage){senderId = Just "other"}
       superuser = outsider{digest = outsider.digest{senderIsSuperuser = True}}
   outsiderListed <- listActiveThreadsForMessage store outsider
   outsiderHalted <- haltActiveThreadsForMessage store cancel outsider [Concurrency.Id 11]
@@ -5478,6 +5584,11 @@ askHandlerConfig =
     , systemPrompt = "base system prompt"
     , agentMaxTurns = 4
     , contextCompactionThresholdKTokens = 1000
+    , recentChatContextEnabled = True
+    , recentChatContextLimit = 30
+    , recentChatContextMinutes = 30
+    , recentChatContextMaxChars = 2000
+    , recentChatContextDisabledGroups = []
     , botIds = [(PlatformQQ, "2044933066")]
     }
 

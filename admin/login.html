@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>登录 - FM Control Center</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="brand-mark login-mark">FM</div>
+    <h1>FM Control Center</h1>
+    <p class="muted">运营管理后台</p>
+    <div class="login-tabs">
+      <button class="login-tab active" data-login-type="admin">管理员登录</button>
+      <button class="login-tab" data-login-type="token">Token 登录</button>
+    </div>
+    <form id="login-form">
+      <div id="admin-fields">
+        <label class="field"><span>用户名</span><input id="login-username" autocomplete="username" required></label>
+        <label class="field"><span>密码</span><input id="login-password" type="password" autocomplete="current-password" required></label>
+      </div>
+      <div id="token-fields" class="hidden">
+        <label class="field"><span>访问 Token</span><input id="login-token" autocomplete="off"></label>
+      </div>
+      <p id="login-error" class="form-error hidden"></p>
+      <button class="button primary login-submit" type="submit">登录</button>
+    </form>
+  </main>
+  <script>
+    (() => {
+      let type = 'admin';
+      const form = document.getElementById('login-form');
+      const error = document.getElementById('login-error');
+      const tabs = document.querySelectorAll('[data-login-type]');
+      function setType(next) {
+        type = next;
+        tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.loginType === next));
+        document.getElementById('admin-fields').classList.toggle('hidden', next !== 'admin');
+        document.getElementById('token-fields').classList.toggle('hidden', next !== 'token');
+        document.getElementById('login-username').required = next === 'admin';
+        document.getElementById('login-password').required = next === 'admin';
+        document.getElementById('login-token').required = next === 'token';
+        error.classList.add('hidden');
+      }
+      tabs.forEach(tab => tab.addEventListener('click', () => setType(tab.dataset.loginType)));
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        const button = form.querySelector('button[type="submit"]');
+        button.disabled = true;
+        error.classList.add('hidden');
+        const payload = type === 'admin'
+          ? {type, username: document.getElementById('login-username').value, password: document.getElementById('login-password').value}
+          : {type, token: document.getElementById('login-token').value};
+        try {
+          const response = await fetch('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || '登录失败');
+          location.href = '/';
+        } catch (err) {
+          error.textContent = err.message;
+          error.classList.remove('hidden');
+        } finally {
+          button.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

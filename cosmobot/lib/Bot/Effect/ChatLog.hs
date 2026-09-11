@@ -16,6 +16,7 @@ module Bot.Effect.ChatLog
   , queryChat
   , lookupMessage
   , queryCurrentSenderChatLog
+  , queryBySenders
   , runChatLog
   )
 where
@@ -57,6 +58,11 @@ data ChatLog :: Effect where
     :: IncomingMessage
     -> SenderChatLogScope
     -> [[Text]]
+    -> Int
+    -> ChatLogTimeRange
+    -> ChatLog m [ChatLogEntry]
+  QueryBySenders
+    :: [Text]
     -> Int
     -> ChatLogTimeRange
     -> ChatLog m [ChatLogEntry]
@@ -103,6 +109,10 @@ queryCurrentSenderChatLog :: ChatLog :> es => IncomingMessage -> SenderChatLogSc
 queryCurrentSenderChatLog message scope keywords limit timeRange =
   send (QueryCurrentSenderChatLog message scope keywords limit timeRange)
 
+queryBySenders :: ChatLog :> es => [Text] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]
+queryBySenders senders limit timeRange =
+  send (QueryBySenders senders limit timeRange)
+
 -- | Interpret chat logging through the storage capability.
 runChatLog
   :: (IOE :> es, KatipE :> es, Storage.Storage :> es)
@@ -121,5 +131,7 @@ runChatLog inner =
         ChatLogStorage.lookupStoredMessage message messageId
       QueryCurrentSenderChatLog message scope keywords limit timeRange ->
         ChatLogStorage.queryCurrentSenderStored message scope keywords limit timeRange
+      QueryBySenders senders limit timeRange ->
+        ChatLogStorage.queryBySenders senders limit timeRange
     )
     inner

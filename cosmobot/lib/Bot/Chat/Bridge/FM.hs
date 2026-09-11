@@ -7,11 +7,17 @@ module Bot.Chat.Bridge.FM
   , readFMBridgeConfig
   , writeFMBridgeConfig
   , fmOwnerMatrixId
+  , fmOwnerMatrixIds
   , fmOwnerQQId
   , fmBotQQId
+  , isFMMatrixRoom
+  , qqBridgeNumericId
   , fmOwnerRelayBody
   , fmOwnerRelayBodyWithImages
   , fmReplyRelayBody
+  , fmReplyRelayBodyForRequest
+  , requestedReplyOpening
+  , enforceRequestedReplyOpening
   , fmReplyBody
   , fmStandaloneMessage
   , FMTakeoverAddress (..)
@@ -57,6 +63,7 @@ import Bot.Prelude
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.ByteString.Lazy as LazyByteString
+import Data.Char (isSpace)
 import qualified Data.IORef as IORef
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
@@ -71,7 +78,20 @@ fmQQGroupId :: Integer
 fmQQGroupId = 906230260
 
 fmOwnerMatrixId :: Text
-fmOwnerMatrixId = "@fixmood:g24.at"
+fmOwnerMatrixId = "@fixmood:matrix.fcxxz.com"
+
+fmOwnerMatrixIds :: [Text]
+fmOwnerMatrixIds =
+  [ fmOwnerMatrixId
+  , "@fixmood:matrix.org"
+  ]
+
+fmBotMatrixIds :: [Text]
+fmBotMatrixIds =
+  [ "@fm:matrix.fcxxz.com"
+  , "@fixmood-fm:matrix.org"
+  , "@fm:g24.at"
+  ]
 
 fmOwnerQQId :: Text
 fmOwnerQQId = "2822751355"
@@ -296,14 +316,14 @@ takeoverIsOwnerMessage :: IncomingMessage -> Bool
 takeoverIsOwnerMessage message =
   case message.platform of
     PlatformQQ -> message.senderId == Just fmOwnerQQId
-    PlatformMatrix -> message.senderId == Just fmOwnerMatrixId
+    PlatformMatrix -> message.senderId `elem` fmap Just fmOwnerMatrixIds
     _ -> False
 
 takeoverIsBotMessage :: IncomingMessage -> Bool
 takeoverIsBotMessage message =
   case message.platform of
     PlatformQQ -> message.senderId == Just fmBotQQId
-    PlatformMatrix -> message.senderId == Just "@fm:g24.at"
+    PlatformMatrix -> message.senderId `elem` fmap Just fmBotMatrixIds
     _ -> False
 
 takeoverIsControlMessage :: Text -> Bool
@@ -388,14 +408,117 @@ fmOwnerRelayBodyWithImages body images =
     }
 
 fmReplyRelayBody :: Text -> Text
-fmReplyRelayBody body =
+fmReplyRelayBody = fmReplyRelayBodyForRequest ""
+
+fmReplyRelayBodyForRequest :: Text -> Text -> Text
+fmReplyRelayBodyForRequest request body =
   let ReplyBody.ReplyContent{text, images} = ReplyBody.replyContentFromBody body
       cleanText = stripReplyPrefix text
+      suppressPrefix = requestsDirectOpening request
+      constrainedText = enforceRequestedReplyOpening request cleanText
       prefixedText =
         if Text.null (Text.strip text)
           then ""
-          else if isTypingPracticeBody cleanText then cleanText else "😻 FM：" <> cleanText
+          else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else "😻 FM：" <> constrainedText
   in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
+
+requestsDirectOpening :: Text -> Bool
+requestsDirectOpening request =
+  let clean = Text.toCaseFold (Text.strip request)
+  in isJust (requestedReplyOpening request) || any (`Text.isInfixOf` clean)
+       ["直接说", "直接回复", "只说", "只输出", "不要前缀", "不要加前缀", "不加前缀"]
+
+requestedReplyOpening :: Text -> Maybe Text
+requestedReplyOpening request =
+  firstJust
+    [ openingBeforeMarker "开头" request
+    , openingAfterMarker "开头说" request
+    , openingAfterMarker "开头写" request
+    , directOpening request
+    ]
+  where
+    firstJust = listToMaybe . catMaybes
+
+openingBeforeMarker :: Text -> Text -> Maybe Text
+openingBeforeMarker boundary request = do
+  let (before, rest) = Text.breakOn boundary request
+  guard (not (Text.null rest))
+  candidate <- shortestNonEmpty
+    [ Text.strip suffix
+    | marker <- ["使用", "以", "用"]
+    , let (matched, suffix) = Text.breakOnEnd marker before
+    , not (Text.null matched)
+    , not (Text.null suffix)
+    ]
+  nonEmptyOpening candidate
+
+openingAfterMarker :: Text -> Text -> Maybe Text
+openingAfterMarker marker request = do
+  let (_, rest) = Text.breakOn marker request
+  guard (not (Text.null rest))
+  nonEmptyOpening (directPhrase (Text.drop (Text.length marker) rest))
+
+directOpening :: Text -> Maybe Text
+directOpening request =
+  listToMaybe . mapMaybe extract $
+    ["直接说", "直接回复", "只说", "只输出"]
+  where
+    extract marker = do
+      let (_, rest) = Text.breakOn marker request
+      guard (not (Text.null rest))
+      nonEmptyOpening (directPhrase (Text.drop (Text.length marker) rest))
+
+directPhrase :: Text -> Text
+directPhrase =
+  Text.takeWhile (`notElem` ['，', '。', '；', ';', '\n', '\r'])
+    . Text.dropWhile isOpeningSeparator
+
+nonEmptyOpening :: Text -> Maybe Text
+nonEmptyOpening candidate =
+  let opening = Text.take 100 (Text.dropAround isOpeningWrapper (Text.strip candidate))
+  in opening <$ guard (not (Text.null opening))
+
+shortestNonEmpty :: [Text] -> Maybe Text
+shortestNonEmpty =
+  foldl' choose Nothing
+  where
+    choose current candidate
+      | Text.null candidate = current
+      | otherwise = case current of
+          Nothing -> Just candidate
+          Just existing
+            | Text.length candidate < Text.length existing -> Just candidate
+            | otherwise -> current
+
+isOpeningWrapper :: Char -> Bool
+isOpeningWrapper character =
+  isSpace character || character `elem` ['\'', '"', '“', '”', '‘', '’', '「', '」', '『', '』']
+
+isOpeningSeparator :: Char -> Bool
+isOpeningSeparator character =
+  isOpeningWrapper character || character `elem` ['：', ':']
+
+enforceRequestedReplyOpening :: Text -> Text -> Text
+enforceRequestedReplyOpening request reply =
+  case requestedReplyOpening request of
+    Nothing -> reply
+    Just opening
+      | opening `Text.isPrefixOf` cleaned -> cleaned
+      | otherwise ->
+          case Text.breakOn opening cleaned of
+            (_, fromOpening) | not (Text.null fromOpening) -> fromOpening
+            _ | Text.null cleaned -> opening
+              | otherwise -> opening <> openingJoiner opening cleaned <> cleaned
+  where
+    cleaned = Text.strip (stripReplyPrefix reply)
+
+openingJoiner :: Text -> Text -> Text
+openingJoiner opening reply
+  | maybe False isSpace (fst <$> Text.uncons reply) = ""
+  | maybe False (`elem` punctuation) (snd <$> Text.unsnoc opening) = ""
+  | otherwise = "，"
+  where
+    punctuation = ['，', '。', '！', '？', '：', ':', ',', '.', '!', '?', ';', '；', '、', '～', '~']
 
 fmReplyBody :: Text -> Text
 fmReplyBody body =
@@ -480,7 +603,7 @@ matrixOwnerAsQQ message = do
   guard config.enabled
   guard (isFMMatrixRoom message)
   guard (message.eventKind == IncomingMessageCreated)
-  guard (message.senderId == Just fmOwnerMatrixId)
+  guard (message.senderId `elem` fmap Just fmOwnerMatrixIds)
   pure message
     { platform = PlatformQQ
     , kind = ChatGroup
@@ -561,9 +684,13 @@ isFMMatrixRoom message =
 
 isQQBridgeUser :: Text -> Bool
 isQQBridgeUser userId =
+  isJust (qqBridgeNumericId userId)
+
+qqBridgeNumericId :: Text -> Maybe Text
+qqBridgeNumericId userId =
   case Text.stripPrefix "@qq_" userId >>= Text.stripSuffix ":pfeiwu.com" of
-    Just qqId -> not (Text.null qqId) && Text.all (`elem` ['0' .. '9']) qqId
-    Nothing -> False
+    Just qqId | not (Text.null qqId) && Text.all (`elem` ['0' .. '9']) qqId -> Just qqId
+    _ -> Nothing
 
 firstJust :: [Maybe a] -> Maybe a
 firstJust =

@@ -27,3 +27,13 @@ fm-domain/assets/
 *.backup
 *.remote
 dist-newstyle/
+
+# FM snapshot: backup copies
+*.before-*
+*.bak
+*.bak-*
+*.stage*.bak
+backups/
+*.orig
+*.rej
+*.pre-*

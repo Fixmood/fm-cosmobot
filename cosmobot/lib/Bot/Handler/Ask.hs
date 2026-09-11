@@ -127,7 +127,7 @@ voicePrompt raw =
   in fromMaybe cleaned (listToMaybe [Text.strip rest | marker <- markers, Just rest <- [Text.stripPrefix marker cleaned]])
 
 deletedMessageRoute
-  :: (Storage.Storage :> es, Concurrency.Concurrency :> es, KatipE :> es, Prim :> es, Concurrent :> es)
+  :: (Storage.Storage :> es, Concurrency.Concurrency :> es, KatipE :> es, Prim :> es, Concurrent :> es, IOE :> es)
   => ThreadStore
   -> RouteHandler es
 deletedMessageRoute threads =
@@ -153,6 +153,7 @@ data ReplyTarget
   = NoReply
   | ActiveThread !ThreadMessageKey !Transcript
   | FinishedThread !ThreadMessageKey !Transcript
+  | RecentUserThreadReply !ThreadMessageKey !Transcript !Int
   | OtherReply !MessageId
 
 data Action
@@ -173,6 +174,11 @@ decide policy
   -- Continuing a finished thread
   | FinishedThread parentKey transcript <- policy.replyTarget =
       if policy.triggered then Continue parentKey transcript else Ignore
+
+  -- Continue the current user's recent thread when a fresh prompt omits reply metadata.
+  | RecentUserThreadReply parentKey transcript _ <- policy.replyTarget
+  , policy.triggered =
+      Continue parentKey transcript
 
   -- In an allowed group chat, get a reply to a non-thread message
   -- and it does not continue, then start a new thread from the replied-to message
@@ -250,7 +256,7 @@ conversationRoute toolCfg tools cfg threads =
             startThreadFromReply toolCfg tools cfg threads resource policy.msg parentId
 
 classifyPolicy
-  :: (Storage.Storage :> es, Prim :> es, Concurrent :> es, IOE :> es)
+  :: (Storage.Storage :> es, Prim :> es, Concurrent :> es, IOE :> es, KatipE :> es)
   => AskHandlerConfig
   -> ThreadStore
   -> IncomingMessage
@@ -260,29 +266,54 @@ classifyPolicy cfg threads msg = do
       hasPrompt = not (Text.null (Text.strip msg.text))
       hasImages = not (null msg.imageUrls)
       hasFiles = not (null msg.files)
+      logPlatform = show msg.platform :: String
+      logChat = show msg.chatId :: String
+      logSender = fromMaybe "-" msg.senderId
   customTrigger <- liftIO (Trigger.loadTriggerConfig msg)
-  replyTarget <-
+  baseReplyTarget <-
     case threadMessageKey msg <$> msg.replyToMessageId of
       Nothing -> pure NoReply
-      Just key ->
+      Just key -> do
+        let logReplyId = messageIdText key.messageId
         lookupActiveThreadReply threads msg key >>= \case
           Just (isOwner, transcript)
-            | isOwner ->
+            | isOwner -> do
+                logInfo [i|FM reply lookup: source=active hit=True owner=True platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
                 pure (ActiveThread key transcript)
-            | otherwise ->
+            | otherwise -> do
+                logInfo [i|FM reply lookup: source=active hit=True owner=False platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
                 pure (FinishedThread key transcript)
           Nothing ->
             lookupThreadTranscript threads key >>= \case
-              Just transcript -> pure (FinishedThread key transcript)
-              Nothing ->
+              Just transcript -> do
+                logInfo [i|FM reply lookup: source=sqlite_or_finished hit=True platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
+                pure (FinishedThread key transcript)
+              Nothing -> do
+                logWarning [i|FM reply lookup: source=active_and_sqlite hit=False platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
                 pure (OtherReply key.messageId)
   let triggered = case customTrigger of
         Nothing -> isAllowedPrivate msg || (isAllowedGroup msg && (msg.digest.mentionsBot || calledByName))
         Just config ->
           (Trigger.triggerMatches (fromMaybe "FM" cfg.name) config msg
             || isTriggerManagementRequest cfg msg)
-            && not (Trigger.triggerConfigHasMode Trigger.TriggerReply config && isOtherReply replyTarget)
+            && not (Trigger.triggerConfigHasMode Trigger.TriggerReply config && isOtherReply baseReplyTarget)
+  replyTarget <-
+    if triggered && hasPrompt && isNoReply baseReplyTarget
+      then lookupRecentUserThread threads msg recentUserThreadWindowSeconds >>= \case
+        Just (parentKey, transcript, ageSeconds) -> do
+          let recentThreadId = messageIdText parentKey.messageId
+          logInfo [i|thread_resume=recent user_id=#{logSender} thread_id=#{recentThreadId} age=#{ageSeconds}|]
+          pure (RecentUserThreadReply parentKey transcript ageSeconds)
+        Nothing -> pure baseReplyTarget
+      else pure baseReplyTarget
   pure Policy{msg, calledByName, triggered, hasPrompt, hasImages, hasFiles, replyTarget}
+
+recentUserThreadWindowSeconds :: Int
+recentUserThreadWindowSeconds = 30 * 60
+
+isNoReply :: ReplyTarget -> Bool
+isNoReply NoReply = True
+isNoReply _ = False
 
 isOtherReply :: ReplyTarget -> Bool
 isOtherReply OtherReply{} = True
@@ -378,7 +409,7 @@ naturalAllHaltIntent text =
   in "全部停止" `Text.isInfixOf` input
 
 handleHalt
-  :: (Chat.Chat :> es, Storage.Storage :> es, Concurrency.Concurrency :> es, KatipE :> es, Prim :> es, Concurrent :> es)
+  :: (Chat.Chat :> es, Storage.Storage :> es, Concurrency.Concurrency :> es, KatipE :> es, Prim :> es, Concurrent :> es, IOE :> es)
   => ThreadStore
   -> IncomingMessage
   -> Text

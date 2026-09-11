@@ -14,6 +14,7 @@ import string
 import threading
 import time
 import unicodedata
+from queue import Queue
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,79 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+
+ARCHIVE_WORKER_LOCK = threading.Lock()
+ARCHIVE_QUEUES = {}
+DATABASE_INIT_LOCK = threading.Lock()
+INITIALIZED_DATABASES = set()
+SQLITE_BUSY_TIMEOUT_MS = 5000
+SQLITE_LOCK_RETRIES = 3
+SQLITE_LOCK_RETRY_DELAY = 0.1
+
+
+def is_sqlite_lock_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+class RetryingConnection(sqlite3.Connection):
+    def _with_lock_retry(self, operation, *args, **kwargs):
+        for retry in range(SQLITE_LOCK_RETRIES + 1):
+            try:
+                return operation(*args, **kwargs)
+            except sqlite3.OperationalError as error:
+                if not is_sqlite_lock_error(error) or retry >= SQLITE_LOCK_RETRIES:
+                    raise
+                print(
+                    f"[fm-domain][sqlite] database locked; retry={retry + 1}/{SQLITE_LOCK_RETRIES}",
+                    flush=True,
+                )
+                time.sleep(SQLITE_LOCK_RETRY_DELAY)
+
+    def execute(self, sql, parameters=(), /):
+        return self._with_lock_retry(super().execute, sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        return self._with_lock_retry(super().executemany, sql, parameters)
+
+    def executescript(self, sql_script, /):
+        return self._with_lock_retry(super().executescript, sql_script)
+
+    def commit(self):
+        return self._with_lock_retry(super().commit)
+
+
+def archive_message_worker(db_path, archive_queue):
+    while True:
+        values = archive_queue.get()
+        try:
+            if values is None:
+                return
+            db = connect(db_path)
+            try:
+                db.execute(
+                    "INSERT INTO message_archive (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(platform,message_id) DO UPDATE SET group_id=excluded.group_id,group_name=excluded.group_name,sender_id=excluded.sender_id,sender_name=excluded.sender_name,text=excluded.text,occurred_at=excluded.occurred_at,raw_json=excluded.raw_json,image_urls_json=excluded.image_urls_json",
+                    values,
+                )
+                db.commit()
+            finally:
+                db.close()
+        except Exception as error:
+            # Archive failures must not interrupt the live message path.
+            print(f"[fm-domain][archive] write failed: {error}", flush=True)
+        finally:
+            archive_queue.task_done()
+
+
+def start_archive_worker(db_path):
+    with ARCHIVE_WORKER_LOCK:
+        archive_queue = ARCHIVE_QUEUES.get(db_path)
+        if archive_queue is None:
+            archive_queue = ARCHIVE_QUEUES[db_path] = Queue()
+            threading.Thread(target=archive_message_worker, args=(db_path, archive_queue), daemon=True, name="message-archive").start()
+        return archive_queue
 
 
 SCHEMA = """
@@ -93,6 +167,15 @@ CREATE TABLE IF NOT EXISTS recent_messages (
   PRIMARY KEY(platform, message_id)
 );
 CREATE INDEX IF NOT EXISTS recent_message_time_idx ON recent_messages(occurred_at DESC);
+CREATE TABLE IF NOT EXISTS message_archive (
+  platform TEXT NOT NULL, message_id TEXT NOT NULL, group_id TEXT NOT NULL,
+  group_name TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
+  text TEXT NOT NULL, occurred_at REAL NOT NULL, raw_json TEXT NOT NULL,
+  image_urls_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY(platform, message_id)
+);
+CREATE INDEX IF NOT EXISTS message_archive_time_idx ON message_archive(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS message_archive_group_idx ON message_archive(group_id, occurred_at DESC);
 CREATE TABLE IF NOT EXISTS repeat_recent (
   id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, sender_id TEXT NOT NULL,
   normalized TEXT NOT NULL, text TEXT NOT NULL, occurred_at REAL NOT NULL
@@ -186,7 +269,7 @@ GROUP_CAPABILITIES = {
 
 AI_CONTEST_POLICY_DEFAULTS = {
     "min_chars": 200,
-    "max_chars": 300,
+    "max_chars": 350,
     "daily_refresh": True,
     "unique_topic": True,
     "unique_body": True,
@@ -641,28 +724,43 @@ def get_public_competition(source="", current_group="", period="", refresh=False
 
 
 def connect(path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000, factory=RetryingConnection)
     db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA)
-    ensure_column(db, "library_session_modes", "requested_length", "INTEGER NOT NULL DEFAULT 0")
-    ensure_column(db, "library_session_modes", "requested_genre", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(db, "library_previous_sessions", "requested_length", "INTEGER NOT NULL DEFAULT 0")
-    ensure_column(db, "library_previous_sessions", "requested_genre", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(db, "recall_records", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
-    ensure_column(db, "recent_messages", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
-    ranking_version = db.execute(
-        "SELECT value_json FROM settings WHERE key='library_ranking_version'"
-    ).fetchone()
-    if not ranking_version or ranking_version["value_json"] != json.dumps(LIBRARY_RANKING_VERSION):
-        # Rankings are derived data. Drop only this cache when the scoring
-        # algorithm changes; source texts and saved classification remain intact.
-        db.execute("DELETE FROM library_rankings")
-        db.execute(
-            "INSERT INTO settings(key,value_json) VALUES (?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
-            ("library_ranking_version", json.dumps(LIBRARY_RANKING_VERSION)),
-        )
-        db.commit()
+    db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    db.execute("PRAGMA synchronous=NORMAL")
+    database_key = os.path.abspath(path)
+    try:
+        with DATABASE_INIT_LOCK:
+            if database_key not in INITIALIZED_DATABASES:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.executescript(SCHEMA)
+                ensure_column(db, "library_session_modes", "requested_length", "INTEGER NOT NULL DEFAULT 0")
+                ensure_column(db, "library_session_modes", "requested_genre", "TEXT NOT NULL DEFAULT ''")
+                ensure_column(db, "library_previous_sessions", "requested_length", "INTEGER NOT NULL DEFAULT 0")
+                ensure_column(db, "library_previous_sessions", "requested_genre", "TEXT NOT NULL DEFAULT ''")
+                ensure_column(db, "recall_records", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
+                ensure_column(db, "recent_messages", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
+                db.execute(
+                    "INSERT OR IGNORE INTO message_archive SELECT platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json FROM recent_messages"
+                )
+                db.commit()
+                ranking_version = db.execute(
+                    "SELECT value_json FROM settings WHERE key='library_ranking_version'"
+                ).fetchone()
+                if not ranking_version or ranking_version["value_json"] != json.dumps(LIBRARY_RANKING_VERSION):
+                    # Rankings are derived data. Drop only this cache when the scoring
+                    # algorithm changes; source texts and saved classification remain intact.
+                    db.execute("DELETE FROM library_rankings")
+                    db.execute(
+                        "INSERT INTO settings(key,value_json) VALUES (?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                        ("library_ranking_version", json.dumps(LIBRARY_RANKING_VERSION)),
+                    )
+                    db.commit()
+                INITIALIZED_DATABASES.add(database_key)
+    except Exception:
+        db.close()
+        raise
     return db
 
 
@@ -2224,9 +2322,11 @@ def library_stats(db: sqlite3.Connection) -> dict:
         row["category"]: row["count"]
         for row in db.execute("SELECT category,COUNT(*) AS count FROM library_texts GROUP BY category")
     }
+    # Article classifications contain the difficulty even when the optional
+    # ranking cache is empty.
     difficulties = {
         row["difficulty"]: row["count"]
-        for row in db.execute("SELECT difficulty,COUNT(*) AS count FROM library_rankings GROUP BY difficulty")
+        for row in db.execute("SELECT difficulty,COUNT(*) AS count FROM library_classifications GROUP BY difficulty")
     }
     genres = {
         row["primary_genre"]: row["count"]
@@ -2326,7 +2426,7 @@ def library_session_status(db: sqlite3.Connection, payload: dict) -> dict:
 
 def archive_status(db: sqlite3.Connection) -> dict:
     sources = {
-        "messages": ("recent_messages", "occurred_at"),
+        "messages": ("message_archive", "occurred_at"),
         "recalls": ("recall_records", "recalled_ts"),
         "typing_scores": ("score_records", "occurred_at"),
         "ai_contest_scores": ("ai_contest_scores", "occurred_at"),
@@ -2602,7 +2702,7 @@ def publish_ai_contest_text(db: sqlite3.Connection, payload: dict) -> dict:
     if not isinstance(policy, dict):
         policy = dict(AI_CONTEST_POLICY_DEFAULTS)
     min_chars = int(policy.get("min_chars", 200))
-    max_chars = int(policy.get("max_chars", 300))
+    max_chars = int(policy.get("max_chars", 350))
     china_time = timezone(timedelta(hours=8))
     competition_date = str(payload.get("date") or datetime.now(china_time).date().isoformat()).strip()
     try:
@@ -2682,7 +2782,7 @@ def update_ai_contest_policy(db: sqlite3.Connection, payload: dict) -> dict:
         else:
             value = str(value).strip()[:160]
         policy[name] = value
-    if int(policy.get("min_chars", 200)) > int(policy.get("max_chars", 300)):
+    if int(policy.get("min_chars", 200)) > int(policy.get("max_chars", 350)):
         raise ValueError("min_chars cannot exceed max_chars")
     write_setting(db, "ai_contest_policy", policy)
     db.commit()
@@ -3402,6 +3502,40 @@ class Api(BaseHTTPRequestHandler):
             if request.path == "/groups":
                 rows = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id ORDER BY g.display_name,g.group_id").fetchall()
                 return self.json([dict(row) for row in rows])
+            if request.path.startswith("/group/") and request.path.endswith("/detail"):
+                group_id = request.path.removeprefix("/group/").removesuffix("/detail").strip("/")
+                group = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id WHERE g.group_id=?", (group_id,)).fetchone()
+                if not group:
+                    return self.json({"error":"group not found"}, HTTPStatus.NOT_FOUND)
+                start = time.time() - 7 * 86400
+                daily = db.execute("SELECT date(datetime(occurred_at,'unixepoch','localtime')) AS date,COUNT(*) AS count FROM message_archive WHERE group_id=? AND occurred_at>=? GROUP BY date ORDER BY date", (group_id,start)).fetchall()
+                users = db.execute("SELECT sender_id,MAX(sender_name) AS sender_name,COUNT(*) AS count FROM message_archive WHERE group_id=? AND occurred_at>=? GROUP BY sender_id ORDER BY count DESC LIMIT 10", (group_id,start)).fetchall()
+                events = db.execute("SELECT occurred_at,sender_name,text FROM message_archive WHERE group_id=? ORDER BY occurred_at DESC LIMIT 20", (group_id,)).fetchall()
+                features = group_features(db, group_id)
+                result = dict(group)
+                result["features"] = features
+                result["daily"] = [dict(x) for x in daily]
+                result["active_users"] = [dict(x) for x in users]
+                result["events"] = [dict(x) for x in events]
+                return self.json(result)
+            if request.path == "/recent_messages":
+                limit = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
+                before = float(query.get("before", ["0"])[0] or 0)
+                group_id = query.get("group_id", [""])[0].strip()
+                keyword = (query.get("q", query.get("keyword", [""]))[0]).strip()
+                where, args = [], []
+                if before:
+                    where.append("occurred_at < ?"); args.append(before)
+                if group_id:
+                    where.append("group_id=?"); args.append(group_id)
+                if keyword:
+                    where.append("(text LIKE ? OR sender_name LIKE ? OR sender_id LIKE ?)"); args.extend([f"%{keyword}%"] * 3)
+                clause = (" WHERE " + " AND ".join(where)) if where else ""
+                rows = db.execute("SELECT * FROM message_archive" + clause + " ORDER BY occurred_at DESC LIMIT ?", (*args, limit)).fetchall()
+                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
+                    total = db.execute("SELECT COUNT(*) FROM message_archive" + clause, args).fetchone()[0]
+                    return self.json({"items": [dict(row) for row in rows], "total": int(total)})
+                return self.json([dict(row) for row in rows])
             if request.path == "/group-state":
                 group_id = query.get("group_id", [""])[0].strip()
                 row = db.execute("SELECT paused,updated_at FROM group_runtime WHERE group_id=?", (group_id,)).fetchone()
@@ -3447,20 +3581,22 @@ class Api(BaseHTTPRequestHandler):
             if request.path == "/library/search":
                 text = query.get("q", [""])[0].strip()
                 limit = min(max(int(query.get("limit", ["10"])[0]), 1), 30)
+                offset = max(int(query.get("offset", ["0"])[0]), 0)
+                requested_difficulty = normalize_library_difficulty(query.get("difficulty", [""])[0]) if query.get("difficulty", [""])[0].strip() else ""
                 requested_genre = resolve_library_genre(query.get("genre", [""])[0]) or resolve_library_genre(text)
                 search_query = library_query_without_genre(text, requested_genre)
                 if search_query:
                     rows = db.execute(
                         "SELECT * FROM library_texts WHERE (title LIKE ? OR content LIKE ?) "
                         "ORDER BY char_count LIMIT ?",
-                        (f"%{search_query}%", f"%{search_query}%", max(limit * 8, 30)),
+                        (f"%{search_query}%", f"%{search_query}%", max((offset + limit) * 40, 200)),
                     ).fetchall()
                 else:
                     rows = db.execute(
                         "SELECT * FROM library_texts ORDER BY "
                         + ("RANDOM()" if requested_genre else "char_count")
                         + " LIMIT ?",
-                        (max(limit * 8, 1000) if requested_genre else max(limit * 8, 30),),
+                        (max((offset + limit) * 40, 1000) if requested_genre or requested_difficulty else max((offset + limit) * 8, 30),),
                     ).fetchall()
                 result = []
                 for row in rows:
@@ -3469,6 +3605,8 @@ class Api(BaseHTTPRequestHandler):
                     if requested_genre and not library_genre_matches(db, row, requested_genre):
                         continue
                     metadata = classify_library_row(db, row)
+                    if requested_difficulty and metadata["difficulty"] != requested_difficulty:
+                        continue
                     result.append({
                         "text_id": row["text_id"], "title": row["title"],
                         "category": row["category"], "relative_path": row["relative_path"],
@@ -3478,10 +3616,24 @@ class Api(BaseHTTPRequestHandler):
                         "difficulty_score": metadata["difficulty_score"],
                         "confidence": metadata["confidence"],
                     })
-                    if len(result) >= limit:
+                    if len(result) >= offset + limit:
                         break
                 db.commit()
-                return self.json(result)
+                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
+                    return self.json({"items": result[offset:offset + limit], "total": int(len(result))})
+                return self.json(result[offset:offset + limit])
+            if request.path == "/library/text":
+                text_id = query.get("text_id", [""])[0].strip()
+                row = db.execute("SELECT * FROM library_texts WHERE text_id=?", (text_id,)).fetchone()
+                if not row:
+                    return self.json(None)
+                item = dict(row)
+                metadata = classify_library_row(db, row)
+                item.update({"genre": metadata["primary_genre"], "genres": metadata["genres"],
+                             "form": metadata["form"], "difficulty": metadata["difficulty"],
+                             "difficulty_score": metadata["difficulty_score"],
+                             "confidence": metadata["confidence"]})
+                return self.json(item)
             if request.path == "/library/pick":
                 text = query.get("q", [""])[0].strip()
                 requested_genre = resolve_library_genre(query.get("genre", [""])[0]) or resolve_library_genre(text)
@@ -3547,28 +3699,57 @@ class Api(BaseHTTPRequestHandler):
             if request.path == "/scores":
                 group_id = query.get("group_id", [""])[0]
                 sender_id = query.get("sender_id", [""])[0]
-                limit = min(max(int(query.get("limit", ["20"])[0]), 1), 100)
+                search = query.get("q", [""])[0].strip()
+                try:
+                    limit = min(max(int(query.get("limit", ["100"])[0]), 1), 5000)
+                    offset = max(int(query.get("offset", ["0"])[0]), 0)
+                except ValueError:
+                    limit, offset = 100, 0
+                search_clause = " AND source_json LIKE ?" if search else ""
+                params = (f"%{group_id}%", f"%{sender_id}%") + ((f"%{search}%",) if search else ())
                 rows = db.execute(
                     "SELECT source_json FROM score_records "
                     "WHERE group_id LIKE ? AND sender_id LIKE ? "
+                    + search_clause +
                     "ORDER BY CASE WHEN typeof(occurred_at)='text' "
                     "THEN CAST(strftime('%s', occurred_at) AS REAL) "
-                    "ELSE CAST(occurred_at AS REAL) END DESC LIMIT ?",
-                    (f"%{group_id}%", f"%{sender_id}%", limit),
+                    "ELSE CAST(occurred_at AS REAL) END DESC LIMIT ? OFFSET ?",
+                    (*params, limit, offset),
                 ).fetchall()
-                return self.json([json.loads(row["source_json"]) for row in rows])
+                items = [json.loads(row["source_json"]) for row in rows]
+                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
+                    total = db.execute("SELECT COUNT(*) FROM score_records WHERE group_id LIKE ? AND sender_id LIKE ?" + search_clause, params).fetchone()[0]
+                    return self.json({"items": items, "total": int(total)})
+                return self.json(items)
             if request.path == "/contest/search":
                 text = query.get("q", [""])[0].strip()
                 source_group = query.get("source", [""])[0].strip()
                 competition_date = query.get("date", [""])[0].strip()
                 limit = min(max(int(query.get("limit", ["10"])[0]), 1), 30)
-                rows = db.execute(
-                    "SELECT text_id,title,source_group,competition_date,relative_path,char_count "
-                    "FROM contest_texts WHERE (title LIKE ? OR content LIKE ?) AND source_group LIKE ? "
-                    "AND competition_date LIKE ? ORDER BY competition_date DESC,title LIMIT ?",
-                    (f"%{text}%", f"%{text}%", f"%{source_group}%", f"%{competition_date}%", limit),
-                ).fetchall()
-                return self.json([dict(row) for row in rows])
+                if text:
+                    rows = db.execute(
+                        "SELECT text_id,title,source_group,competition_date,relative_path,char_count "
+                        "FROM contest_texts WHERE (title LIKE ? OR content LIKE ?) AND source_group LIKE ? "
+                        "AND competition_date LIKE ? ORDER BY competition_date DESC,title LIMIT ?",
+                        (f"%{text}%", f"%{text}%", f"%{source_group}%", f"%{competition_date}%", limit),
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT text_id,title,source_group,competition_date,relative_path,char_count "
+                        "FROM contest_texts WHERE source_group LIKE ? AND competition_date LIKE ? "
+                        "ORDER BY competition_date DESC,title LIMIT ?",
+                        (f"%{source_group}%", f"%{competition_date}%", limit),
+                    ).fetchall()
+                items = [dict(row) for row in rows]
+                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
+                    count_sql = "SELECT COUNT(*) FROM contest_texts WHERE source_group LIKE ? AND competition_date LIKE ?"
+                    count_args = [f"%{source_group}%", f"%{competition_date}%"]
+                    if text:
+                        count_sql = "SELECT COUNT(*) FROM contest_texts WHERE (title LIKE ? OR content LIKE ?) AND source_group LIKE ? AND competition_date LIKE ?"
+                        count_args = [f"%{text}%", f"%{text}%", f"%{source_group}%", f"%{competition_date}%"]
+                    total = db.execute(count_sql, count_args).fetchone()[0]
+                    return self.json({"items": items, "total": int(total)})
+                return self.json(items)
             if request.path == "/contest/pick":
                 text = query.get("q", [""])[0].strip()
                 source_group = query.get("source", [""])[0].strip()
@@ -3611,6 +3792,24 @@ class Api(BaseHTTPRequestHandler):
                     if user_id and user_id not in best:
                         best[user_id] = item
                 return self.json({"date": competition_date, "rows": list(best.values())})
+            if request.path == "/ai-contest/scores":
+                user_id = query.get("user_id", [""])[0].strip()
+                name = query.get("name", [""])[0].strip()
+                try:
+                    limit = min(max(int(query.get("limit", ["100"])[0]), 1), 5000)
+                except ValueError:
+                    limit = 100
+                params = (f"%{user_id}%", f"%{name}%")
+                total = db.execute("SELECT COUNT(*) FROM ai_contest_scores WHERE user_id LIKE ? AND user_name LIKE ?", params).fetchone()[0]
+                rows = db.execute(
+                    "SELECT source_json FROM ai_contest_scores WHERE user_id LIKE ? AND user_name LIKE ? "
+                    "ORDER BY occurred_at DESC LIMIT ?",
+                    (*params, limit),
+                ).fetchall()
+                items = [json.loads(row["source_json"]) for row in rows]
+                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
+                    return self.json({"items": items, "total": int(total)})
+                return self.json(items)
             if request.path == "/reports/ai-leaderboard.png":
                 competition_date = query.get("date", [""])[0].strip()
                 return self.bytes(render_ai_leaderboard(db, competition_date), "image/png")
@@ -3618,13 +3817,29 @@ class Api(BaseHTTPRequestHandler):
                 user_id = query.get("user_id", [""])[0].strip()
                 name = query.get("name", [""])[0].strip()
                 source_group = query.get("source", [""])[0].strip()
-                limit = min(max(int(query.get("limit", ["20"])[0]), 1), 100)
+                try:
+                    limit = min(max(int(query.get("limit", ["100"])[0]), 1), 5000)
+                except ValueError:
+                    limit = 100
+                try:
+                    offset = max(int(query.get("offset", ["0"])[0]), 0)
+                except ValueError:
+                    offset = 0
+                where = (
+                    "FROM competition_scores WHERE user_id LIKE ? AND user_name LIKE ? "
+                    "AND source_group LIKE ?"
+                )
+                params = (f"%{user_id}%", f"%{name}%", f"%{source_group}%")
+                total = db.execute("SELECT COUNT(*) " + where, params).fetchone()[0]
                 rows = db.execute(
                     "SELECT source_json FROM competition_scores WHERE user_id LIKE ? AND user_name LIKE ? "
-                    "AND source_group LIKE ? ORDER BY occurred_at DESC LIMIT ?",
-                    (f"%{user_id}%", f"%{name}%", f"%{source_group}%", limit),
+                    "AND source_group LIKE ? ORDER BY occurred_at DESC LIMIT ? OFFSET ?",
+                    (*params, limit, offset),
                 ).fetchall()
-                return self.json([json.loads(row["source_json"]) for row in rows])
+                items = [json.loads(row["source_json"]) for row in rows]
+                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
+                    return self.json({"items": items, "total": total})
+                return self.json(items)
             if request.path == "/competition/summary":
                 user_id = query.get("user_id", [""])[0].strip()
                 name = query.get("name", [""])[0].strip()
@@ -3681,10 +3896,60 @@ class Api(BaseHTTPRequestHandler):
                     combined = True
                 page = 1 if not requested_page else min(max(int(requested_page), 1), live["page_count"])
                 return self.bytes(render_public_competition_rank(live, page, combined), "image/png")
+            if request.path == "/stats/daily":
+                try:
+                    days = min(max(int(query.get("days", ["7"])[0]), 1), 31)
+                except (TypeError, ValueError):
+                    days = 7
+                now = time.time()
+                start = now - days * 86400
+                day_rows = db.execute(
+                    "SELECT date(datetime(occurred_at, 'unixepoch', 'localtime')) AS date, COUNT(*) AS count "
+                    "FROM message_archive WHERE occurred_at >= ? GROUP BY date ORDER BY date",
+                    (start,),
+                ).fetchall()
+                group_rows = db.execute(
+                    "SELECT group_id, MAX(group_name) AS group_name, COUNT(*) AS count "
+                    "FROM message_archive WHERE occurred_at >= ? GROUP BY group_id "
+                    "ORDER BY count DESC LIMIT 10",
+                    (start,),
+                ).fetchall()
+                local_today = datetime.now().date()
+                today_start = datetime.combine(local_today, datetime.min.time()).timestamp()
+                yesterday_start = today_start - 86400
+                today_count = db.execute(
+                    "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ?", (today_start,)
+                ).fetchone()[0]
+                yesterday_count = db.execute(
+                    "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ? AND occurred_at < ?",
+                    (yesterday_start, today_start),
+                ).fetchone()[0]
+                return self.json({
+                    "days": [dict(row) for row in day_rows],
+                    "groups": [dict(row) for row in group_rows],
+                    "today": today_count,
+                    "yesterday": yesterday_count,
+                })
+            if request.path == "/stats/advanced":
+                start = time.time() - 7 * 86400
+                heat_rows = db.execute("SELECT CAST(strftime('%w',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS weekday,CAST(strftime('%H',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS hour,COUNT(*) AS count FROM message_archive WHERE occurred_at>=? GROUP BY weekday,hour", (start,)).fetchall()
+                heat = [{"day": (int(x["weekday"])-1)%7, "hour": int(x["hour"]), "count": int(x["count"])} for x in heat_rows]
+                buckets = [(0,50),(50,80),(80,100),(100,120),(120,150),(150,None)]
+                speed = {"0-50":0,"50-80":0,"80-100":0,"100-120":0,"120-150":0,"150+":0}
+                for row in db.execute("SELECT source_json FROM score_records").fetchall():
+                    try:
+                        raw=json.loads(row["source_json"] or "{}")
+                        value=raw.get("speed",raw.get("速度",raw.get("wpm")))
+                        value=float(value)
+                    except (TypeError,ValueError,AttributeError,json.JSONDecodeError):
+                        continue
+                    for (low,high),key in zip(buckets,speed):
+                        if value>=low and (high is None or value<high): speed[key]+=1; break
+                return self.json({"heatmap":heat,"speed_distribution":[{"range":k,"count":v} for k,v in speed.items()]})
             if request.path == "/stats":
                 tables = [
                     "groups", "library_texts", "library_classifications", "contest_texts", "recall_records", "score_records",
-                    "ai_contest_texts", "ai_contest_scores", "competition_scores", "recent_messages",
+                    "ai_contest_texts", "ai_contest_scores", "competition_scores", "message_archive",
                 ]
                 return self.json({table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables})
             if request.path == "/archive/status":
@@ -3893,6 +4158,7 @@ class Api(BaseHTTPRequestHandler):
         raw_json = json.dumps(payload, ensure_ascii=False)
         db = connect(self.db_path)
         try:
+            message_values = (platform, message_id, group_id, group_name, sender_id, sender_name, text, occurred_at, raw_json, json.dumps(image_urls, ensure_ascii=False))
             db.execute(
                 "INSERT INTO recent_messages (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(platform,message_id) DO UPDATE SET group_id=excluded.group_id,group_name=excluded.group_name,sender_id=excluded.sender_id,sender_name=excluded.sender_name,text=excluded.text,occurred_at=excluded.occurred_at,raw_json=excluded.raw_json,image_urls_json=excluded.image_urls_json",
@@ -3953,8 +4219,8 @@ class Api(BaseHTTPRequestHandler):
                     ),
                 )
                 ai_contest_archived = bool(db.execute("SELECT changes()").fetchone()[0])
-            db.execute("DELETE FROM recent_messages WHERE occurred_at < ?", (time.time() - 172800,))
             db.commit()
+            start_archive_worker(self.db_path).put(message_values)
             return self.json({
                 "stored": True,
                 "score_archived": archived,
@@ -4032,6 +4298,7 @@ def main():
             database.close()
     else:
         Api.db_path = args.db
+        start_archive_worker(args.db)
         ThreadingHTTPServer((args.host, args.port), Api).serve_forever()
 
 

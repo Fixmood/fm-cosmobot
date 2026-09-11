@@ -26,19 +26,40 @@ import qualified Data.Map.Strict as Map
 --
 -- Platform message ids are not globally unique. Telegram message ids, for
 -- example, are scoped to a chat, so the key must carry the normalized platform
--- and chat identity together with the message id.
+-- and chat identity together with the initiating sender and message id.
 data ThreadMessageKey = ThreadMessageKey
   { platform :: !ChatPlatform
   , chatId :: !(Maybe Integer)
+  , senderId :: !(Maybe Text)
   , messageId :: !MessageId
   }
-  deriving (Eq, Ord, Show, Generic, Aeson.ToJSON, Aeson.FromJSON)
+  deriving (Eq, Ord, Show, Generic)
+
+instance Aeson.ToJSON ThreadMessageKey where
+  toJSON key =
+    Aeson.object
+      [ "platform" Aeson..= key.platform
+      , "chatId" Aeson..= key.chatId
+      , "senderId" Aeson..= key.senderId
+      , "messageId" Aeson..= key.messageId
+      ]
+
+instance Aeson.FromJSON ThreadMessageKey where
+  parseJSON = Aeson.withObject "ThreadMessageKey" \o -> do
+    camelSenderId <- o Aeson..:? "senderId"
+    snakeSenderId <- o Aeson..:? "sender_id"
+    ThreadMessageKey
+      <$> o Aeson..: "platform"
+      <*> o Aeson..:? "chatId"
+      <*> pure (camelSenderId <|> snakeSenderId)
+      <*> o Aeson..: "messageId"
 
 threadMessageKey :: IncomingMessage -> MessageId -> ThreadMessageKey
 threadMessageKey message messageId =
   ThreadMessageKey
     { platform = message.platform
     , chatId = message.chatId
+    , senderId = message.senderId
     , messageId = messageId
     }
 

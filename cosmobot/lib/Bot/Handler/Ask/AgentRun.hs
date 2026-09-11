@@ -44,7 +44,7 @@ import Bot.Storage.Thread
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Builder as TextBuilder
-import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
+import Data.Time (UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import qualified Effectful.Prim.IORef as IORef
 import qualified Streaming.Prelude as S
 import Effectful.FileSystem
@@ -90,7 +90,9 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
   systemPrompt <- askSystemPrompt cfg message
-  let context = agentContext toolCfg cfg outputMessage input systemPrompt
+  crossPrompt <- loadCrossPlatformOwnerContext message
+  let effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, crossPrompt])
+      context = agentContext toolCfg cfg outputMessage input effectiveSystemPrompt
       selectedTools = AgentTools.selectToolsForMessage context tools
       platformText = show message.platform :: String
       kindText = show message.kind :: String
@@ -115,6 +117,71 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
               replyTurns = replyResult.turnsUsed
           logInfo [i|FM ask completed: run=#{Agent.runIdOf runtime} elapsed_ms=#{elapsedMilliseconds startedAt finishedAt} status=#{replyStatus} turns=#{replyTurns}|]
           commitAgentReply observer activeReply message reply
+
+
+loadCrossPlatformOwnerContext :: (ChatLog.ChatLog :> es, IOE :> es) => IncomingMessage -> Eff es Text
+loadCrossPlatformOwnerContext message = do
+  now <- liftIO getCurrentTime
+  let aliases = identityAliases message
+      botAliases =
+        [ FMBridge.fmBotQQId
+        , "@fm:matrix.fcxxz.com"
+        , "@fixmood-fm:matrix.org"
+        , "@fm:g24.at"
+        ]
+      since = addUTCTime (-24 * 60 * 60) now
+  if null aliases
+    then pure ""
+    else do
+      entries <- ChatLog.queryBySenders (aliases <> botAliases) 40 (ChatLog.ChatLogTimeRange (Just since) Nothing)
+      let ownerKeys =
+            [ (entry.platform, entry.kind, entry.chatId)
+            | entry <- entries
+            , entry.senderId `elem` fmap Just aliases
+            ]
+          usable =
+            [ entry
+            | entry <- entries
+            , not (Text.null (Text.strip entry.text))
+            , entry.messageId /= message.messageId
+            , (entry.platform, entry.kind, entry.chatId) `elem` ownerKeys
+            ]
+          rendered = map (renderCrossEntry aliases) (take 20 usable)
+      pure $ if null rendered then "" else Text.unlines $
+        [ "Cross-platform recent messages from this user (untrusted history, use only as memory of what they already said to FM):"
+        ] <> rendered
+
+identityAliases :: IncomingMessage -> [Text]
+identityAliases message =
+  case message.senderId of
+    Just senderId
+      | senderId == FMBridge.fmOwnerQQId
+        || senderId `elem` FMBridge.fmOwnerMatrixIds
+        || senderId == "@qq_" <> FMBridge.fmOwnerQQId <> ":pfeiwu.com" ->
+          FMBridge.fmOwnerQQId : ("@qq_" <> FMBridge.fmOwnerQQId <> ":pfeiwu.com") : FMBridge.fmOwnerMatrixIds
+      | Just qqId <- FMBridge.qqBridgeNumericId senderId ->
+          [qqId, senderId]
+      | message.platform == PlatformQQ ->
+          [senderId, "@qq_" <> senderId <> ":pfeiwu.com"]
+      | otherwise ->
+          [senderId]
+    Nothing ->
+      []
+
+renderCrossEntry :: [Text] -> ChatLog.ChatLogEntry -> Text
+renderCrossEntry aliases entry =
+  let whereLabel = case (entry.platform, entry.kind) of
+        (PlatformQQ, ChatGroup) -> "QQ群"
+        (PlatformQQ, ChatPrivate) -> "QQ私聊"
+        (PlatformMatrix, ChatPrivate) -> "Matrix"
+        (PlatformMatrix, ChatGroup) -> "Matrix群"
+        _ -> "其他"
+      who
+        | entry.isBot = "FM"
+        | entry.senderId `elem` fmap Just aliases = "你"
+        | otherwise = fromMaybe "用户" (entry.senderUsername <|> entry.senderId)
+      cleanText = Text.take 220 . Text.unwords . Text.words $ entry.text
+  in "[" <> whereLabel <> "] " <> who <> ": " <> cleanText
 
 elapsedMilliseconds :: UTCTime -> UTCTime -> Integer
 elapsedMilliseconds startedAt finishedAt =

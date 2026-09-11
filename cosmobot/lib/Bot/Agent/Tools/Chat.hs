@@ -122,7 +122,7 @@ sendReplyTool =
   tagged [chatTag]
   . noisy
   . allowWhen hasExplicitAdditionalSendIntent
-  . withDescription "Send a reply message to the same chat as the current user message. Supports text and image URLs. Use image_urls when the user asks you to send an image found or generated elsewhere. Use only when the user asks you to send an additional message before the final answer."
+  . withDescription "Send a reply message to the same chat as the current user message. Supports text and image URLs. After search_web returns image_urls for an explicit image-search request, you MUST call this tool with image_urls so the platform sends actual images; never paste those URLs into the final answer. Also use it when the user explicitly asks you to send an additional message before the final answer."
   $ tool "send_reply"
       ( optionalText "text" "Message text to send. May be omitted when image_urls is non-empty."
       , optionalTextArray "image_urls" "Image URLs to send as images in the same reply. The platform must be able to fetch these URLs."
@@ -137,7 +137,7 @@ sendReplyTool =
           else if Text.null body
           then pure (argumentFailure "Either text or image_urls must be provided.")
           else do
-            sent <- Chat.replyTo context.message (FMBridge.fmReplyRelayBody body)
+            sent <- Chat.replyTo context.message (FMBridge.fmReplyRelayBodyForRequest context.input.text body)
             case rights sent of
               messageIds@(_:_) -> do
                 let sentText = show messageIds :: String
@@ -227,8 +227,7 @@ memberInfoTool =
 
 userAvatarTool :: (Chat.Chat :> es, Media.Media :> es, KatipE :> es) => Tool (Eff es)
 userAvatarTool =
-  tagged [chatTag]
-  . noisy
+  noisy
   . allowWhen hasExplicitAvatarIntent
   . withDescription "Get avatar information for a platform user id and send the avatar image to the current chat."
   $ tool "user_avatar"
@@ -358,8 +357,19 @@ hasExplicitAdditionalSendIntent :: Context -> Bool
 hasExplicitAdditionalSendIntent context =
   any (`Text.isInfixOf` normalized)
     [ "再发", "另外发", "额外发", "发送一条", "发一条消息", "把图片发", "把文件发" ]
+    || isExplicitImageSearch normalized
   where
     normalized = Text.toLower context.input.text
+
+isExplicitImageSearch :: Text -> Bool
+isExplicitImageSearch normalized =
+  any (`Text.isInfixOf` normalized)
+    [ "搜图", "搜索图片", "查找图片", "找张图", "找一张图"
+    , "找个图", "找一个图", "搜张图", "搜一张图"
+    ]
+  || (any (`Text.isInfixOf` normalized)
+        ["搜", "搜索", "找", "查找", "想看", "给我", "来张", "来一张", "发张", "发一张"]
+        && any (`Text.isInfixOf` normalized) ["图", "图片", "照片", "海报", "壁纸", "剧照"])
 
 userIdArgument :: Text -> ToolArgument Text
 userIdArgument description =
@@ -398,7 +408,7 @@ userAvatarResult context value =
           sendAvatar url
         Just info
           | "image/" `Text.isPrefixOf` Text.toLower info.mimeType -> do
-              let body = FMBridge.fmReplyRelayBody (ReplyBody.imageDirective ref)
+              let body = FMBridge.fmReplyRelayBodyForRequest context.input.text (ReplyBody.imageDirective ref)
               sent <- Chat.replyTo context.message body
               logInfo [i|user_avatar sent avatar image: url=#{ref} message_id=#{show sent :: Text}|]
               pure (toolTextWithImages (jsonText value) [ref])
@@ -406,7 +416,7 @@ userAvatarResult context value =
           pure (toolFailure (permanentArgumentFailure "头像地址没有返回图片，已阻止发送。" "头像地址没有返回图片，已阻止发送。"))
   where
     sendAvatar imageRef = do
-      let body = FMBridge.fmReplyRelayBody (ReplyBody.imageDirective imageRef)
+      let body = FMBridge.fmReplyRelayBodyForRequest context.input.text (ReplyBody.imageDirective imageRef)
       sent <- Chat.replyTo context.message body
       logInfo [i|user_avatar sent avatar image: url=#{imageRef} message_id=#{show sent :: Text}|]
       pure (toolTextWithImages (jsonText value) [imageRef])

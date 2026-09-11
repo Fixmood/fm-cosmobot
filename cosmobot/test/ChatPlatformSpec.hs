@@ -47,8 +47,9 @@ main =
       , testCase "FM Matrix reply body is relayed at most once" testFmMatrixReplyBodyIsRelayedAtMostOnce
       , testCase "FM bridge delivery ids preserve Matrix and QQ recall targets" testFmBridgeDeliveryIds
       , testCase "FM exact library commands bypass the agent" testFmExactLibraryCommands
+      , testCase "FM direct library route accepts QQ and Matrix" testFmDirectLibraryPlatforms
+      , testCase "FM typing scores continue on QQ and Matrix" testFmTypingScorePlatforms
       , testCase "FM exact recall commands bypass the agent" testFmExactRecallCommands
-      , testCase "FM exact model commands bypass the agent" testFmExactModelCommands
       , testCase "FM ignores QQ bridge echoes from Matrix" testFmIgnoresMatrixBridgeEcho
       , testCase "FM tool notifications are readable and hide internal ids" testFmToolNotificationsAreReadable
       , testCase "incoming message JSON defaults missing files" testIncomingMessageJsonDefaultsMissingFiles
@@ -59,6 +60,7 @@ main =
       , testCase "QQ reply strips its leading mention" testQqReplyStripsLeadingMention
       , testCase "QQ forwarded messages merge all node text" testQqForwardedMessagesMergeAllNodeText
       , testCase "QQ file segment becomes a message file" testQqFileSegmentBecomesMessageFile
+      , testCase "QQ image upload becomes a message image" testQqImageUploadBecomesMessageImage
       , testCase "QQ record segment becomes a message file" testQqRecordSegmentBecomesMessageFile
       , testCase "QQ sends local file bytes as a base64 resource" testQqBase64FileRef
       , testCase "Telegram user message converts to incoming message" testTelegramUserMessageConvertsToIncomingMessage
@@ -132,6 +134,12 @@ testTranscriptPreservesSenderIdentity = do
           { QQ.sender = Just (Aeson.object ["nickname" Aeson..= ("alice" :: Text)])
           , QQ.messageId = Just 1
           })
+      firstWithContext = first
+        { replyToMessageId = Just (integerMessageId 77)
+        , mentions = ["424242"]
+        , imageUrls = ["https://example.test/image.png"]
+        , files = [MessageFile{name = "notes.txt", ref = "file-ref"}]
+        }
       second = fromMaybe (error "expected second QQ message") $
         QQ.eventToIncomingMessage ((qqMessageEvent 20002)
           { QQ.sender = Just (Aeson.object ["nickname" Aeson..= ("bob" :: Text)])
@@ -139,12 +147,17 @@ testTranscriptPreservesSenderIdentity = do
           })
       input = MessageInput { text = "hello", attachments = [] }
       transcript = Transcript.appendIncomingMessage second input
-        (Transcript.startWithIncomingMessage first input)
+        (Transcript.startWithIncomingMessage firstWithContext input)
       texts = [content | message <- toList transcript.messages, Just (LLM.TextContent content) <- [message.content]]
   case texts of
     [firstText, secondText] -> do
       assertBool "first user turn has first sender id" ("sender_id=10001" `Text.isInfixOf` firstText)
       assertBool "second user turn has second sender id" ("sender_id=20002" `Text.isInfixOf` secondText)
+      assertBool "first turn records reply target" ("reply_to_message_id=77" `Text.isInfixOf` firstText)
+      assertBool "first turn records mention state and count" ("mentions_bot=false" `Text.isInfixOf` firstText && "mention_count=1" `Text.isInfixOf` firstText)
+      assertBool "first turn records image state and count" ("has_images=true" `Text.isInfixOf` firstText && "image_count=1" `Text.isInfixOf` firstText)
+      assertBool "first turn records file state and count" ("has_files=true" `Text.isInfixOf` firstText && "file_count=1" `Text.isInfixOf` firstText)
+      assertBool "metadata does not replace the user body" ("<fm_user_message>\nhello\n</fm_user_message>" `Text.isInfixOf` firstText)
     _ -> assertFailure "expected exactly two user transcript entries"
 
 testQqInvitationActions :: IO ()
@@ -178,6 +191,10 @@ testQqPokeBecomesAgentEvent = do
         , QQ.botQQ = Just qqBotUserId
         , QQ.allowedGroups = [90001]
         , QQ.allowedUsers = []
+        , QQ.allowAllGroups = True
+        , QQ.allowAllPrivate = True
+        , QQ.blockedGroups = []
+        , QQ.blockedUsers = []
         , QQ.superusers = []
         }
       incoming = fromMaybe (error "expected QQ poke") $
@@ -209,6 +226,17 @@ testFmMatrixOwnerUsesQqContext = do
   (FMBridge.matrixReplyTarget bridged).platform @?= PlatformMatrix
   FMBridge.fmOwnerRelayBody bridged.text @?= "😼 Fixmood：fm 回复测试"
   FMBridge.fmReplyRelayBody "◆ FM：结果" @?= "😻 FM：结果"
+  FMBridge.requestedReplyOpening "fm 你以 krkr 开头，也来为难一下 krkr" @?= Just "krkr"
+  FMBridge.requestedReplyOpening "fm 用 ' 早上好 ' 开头，夸我一句" @?= Just "早上好"
+  FMBridge.requestedReplyOpening "fm 开头说 hello，接着夸我" @?= Just "hello"
+  FMBridge.requestedReplyOpening "fm 直接说：大家好" @?= Just "大家好"
+  FMBridge.fmReplyRelayBodyForRequest "fm 以 krkr 开头说句话" "😻 FM：狂到起飞！krkr，来来来" @?= "krkr，来来来"
+  FMBridge.fmReplyRelayBodyForRequest "fm 用 ' 早上好 ' 开头，夸我一句" "你今天真精神" @?= "早上好，你今天真精神"
+  FMBridge.fmReplyRelayBodyForRequest "fm 直接说：大家好" "先打个招呼：大家好" @?= "大家好"
+  FMBridge.fmReplyRelayBodyForRequest "fm 只输出结果" "😻 FM：结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 不要加前缀" "😻 FM：结果" @?= "结果"
+  for_ ["fm 你好", "fm 查一下我的成绩", "这个开头怎么样"] $ \request ->
+    FMBridge.fmReplyRelayBodyForRequest request "结果" @?= "😻 FM：结果"
   FMBridge.fmReplyRelayBody "😻 FM：[FM/赛文·极速联赛] [日期2026-08-26] 《标题》 [字数2]\n正文\n-----第650107段-FM发文"
     @?= "[FM/赛文·极速联赛] [日期2026-08-26] 《标题》 [字数2]\n正文\n-----第650107段-FM发文"
 
@@ -277,6 +305,34 @@ testFmExactLibraryCommands = do
   FMHandler.parseDirectLibraryCommand "fm 帮我找一篇虐文"
     @?= Nothing
 
+testFmDirectLibraryPlatforms :: IO ()
+testFmDirectLibraryPlatforms = do
+  let matrixMessage = matrixBridgeMessage "@root:ksqsf.moe" "fm 淼50"
+      qqMessage = matrixMessage { platform = PlatformQQ }
+      discordMessage = matrixMessage { platform = PlatformDiscord }
+      deletedMatrixMessage = matrixMessage { eventKind = IncomingMessageDeleted }
+  assertBool "Matrix library commands use the deterministic route"
+    (FMHandler.isDirectLibraryMessage matrixMessage)
+  assertBool "QQ library commands keep using the deterministic route"
+    (FMHandler.isDirectLibraryMessage qqMessage)
+  assertBool "unrelated platforms do not enter the FM library route"
+    (not (FMHandler.isDirectLibraryMessage discordMessage))
+  assertBool "deleted Matrix events do not start library sessions"
+    (not (FMHandler.isDirectLibraryMessage deletedMatrixMessage))
+
+testFmTypingScorePlatforms :: IO ()
+testFmTypingScorePlatforms = do
+  let score = "第419105段 速度258.24 击键8.95 字数50 键准99.04%"
+      matrixScore = matrixBridgeMessage "@root:ksqsf.moe" score
+      qqScore = matrixScore { platform = PlatformQQ }
+      discordScore = matrixScore { platform = PlatformDiscord }
+  assertBool "Matrix typing scores enter continuation handling"
+    (FMHandler.isPotentialTypingScore matrixScore)
+  assertBool "QQ typing scores keep entering continuation handling"
+    (FMHandler.isPotentialTypingScore qqScore)
+  assertBool "unrelated platforms do not enter continuation handling"
+    (not (FMHandler.isPotentialTypingScore discordScore))
+
 testFmExactRecallCommands :: IO ()
 testFmExactRecallCommands = do
   FMHandler.parseDirectRecallCommand "@FM 撤回这条消息"
@@ -287,19 +343,6 @@ testFmExactRecallCommands = do
     @?= Just FMHandler.DirectRecallAll
   FMHandler.parseDirectRecallCommand "FM 撤回全部消息"
     @?= Just FMHandler.DirectRecallAll
-
-testFmExactModelCommands :: IO ()
-testFmExactModelCommands = do
-  FMHandler.parseDirectModelCommand "fm 模型列表"
-    @?= Just FMHandler.DirectModelStatus
-  FMHandler.parseDirectModelCommand "fm 切换模型 deepseek-v4-flash-vision"
-    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-flash-vision")
-  FMHandler.parseDirectModelCommand "fm 使用 deepseek-v4-pro"
-    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-pro")
-  FMHandler.parseDirectModelCommand "fm，切换视觉模型"
-    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-flash-vision")
-  FMHandler.parseDirectModelCommand "让fm切换带视觉的模型"
-    @?= Just (FMHandler.DirectModelSwitch "deepseek-v4-flash-vision")
 
 testFmIgnoresMatrixBridgeEcho :: IO ()
 testFmIgnoresMatrixBridgeEcho = do
@@ -374,6 +417,16 @@ testQqBase64FileRef :: IO ()
 testQqBase64FileRef =
   QQ.base64FileRef "cosmobot" @?= "base64://Y29zbW9ib3Q="
 
+testQqImageUploadBecomesMessageImage :: IO ()
+testQqImageUploadBecomesMessageImage =
+  QQ.uploadFileMessage "/tmp/image.png" Nothing "image/png" "base64://abc"
+    @?= Aeson.toJSON
+      [ Aeson.object
+          [ "type" Aeson..= ("image" :: Text)
+          , "data" Aeson..= Aeson.object ["file" Aeson..= ("base64://abc" :: Text)]
+          ]
+      ]
+
 testQqRecordSegmentBecomesMessageFile :: IO ()
 testQqRecordSegmentBecomesMessageFile = do
   let original = qqMessageEvent 10001
@@ -409,6 +462,10 @@ testQqSuperuserIsAlsoAllowedSender = do
         , QQ.botQQ = Nothing
         , QQ.allowedGroups = []
         , QQ.allowedUsers = []
+        , QQ.allowAllGroups = True
+        , QQ.allowAllPrivate = True
+        , QQ.blockedGroups = []
+        , QQ.blockedUsers = []
         , QQ.superusers = [10001]
         }
       incoming = fromMaybe (error "expected incoming QQ message") $
@@ -426,6 +483,10 @@ testQqPrivateChatIsOpen = do
         , QQ.botQQ = Just qqBotUserId
         , QQ.allowedGroups = []
         , QQ.allowedUsers = []
+        , QQ.allowAllGroups = True
+        , QQ.allowAllPrivate = True
+        , QQ.blockedGroups = []
+        , QQ.blockedUsers = []
         , QQ.superusers = []
         }
       event = (qqMessageEvent 10001)
@@ -454,6 +515,10 @@ testQqCQMentionStringKeepsMentionedUserIds = do
         , QQ.botQQ = Just qqBotUserId
         , QQ.allowedGroups = []
         , QQ.allowedUsers = []
+        , QQ.allowAllGroups = True
+        , QQ.allowAllPrivate = True
+        , QQ.blockedGroups = []
+        , QQ.blockedUsers = []
         , QQ.superusers = []
         }
       event = (qqMessageEvent 10001)

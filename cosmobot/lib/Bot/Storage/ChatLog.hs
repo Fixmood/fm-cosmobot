@@ -11,6 +11,7 @@ module Bot.Storage.ChatLog
   , queryStored
   , lookupStoredMessage
   , queryCurrentSenderStored
+  , queryBySenders
   )
 where
 
@@ -94,6 +95,67 @@ lookupStoredMessage message messageId = do
         order (row ! #id) descending
         pure row
   pure (chatLogEntryFromRow message <$> listToMaybe rows)
+
+
+queryBySenders :: Storage.Storage :> es => [Text] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]
+queryBySenders senders limitCount timeRange = do
+  ensureChatLogTable
+  if null senders || limitCount <= 0
+    then pure []
+    else do
+      rows <- runSelda $
+        query $
+          queryLimit 0 (min 80 (max 0 limitCount)) do
+            row <- select chatLogRows
+            restrict (sendersMatch senders row .&& timeRangeMatches timeRange row)
+            order (row ! #id) descending
+            pure row
+      pure (map chatLogEntryFromStoredRow (reverse rows))
+
+sendersMatch :: forall (backend :: Type). [Text] -> Row backend ChatLogRow -> Col backend Bool
+sendersMatch [] _ =
+  false
+sendersMatch (sender : rest) row =
+  foldl' (.||) (senderIdMatches sender row) [senderIdMatches next row | next <- rest]
+
+chatLogEntryFromStoredRow :: ChatLogRow -> ChatLogEntry
+chatLogEntryFromStoredRow row =
+  ChatLogEntry
+    { recordedAt = row.recorded_at
+    , platform = parsePlatformKey row.platform_key
+    , kind = parseKindKey row.kind_key
+    , chatId = fromIntegral <$> row.chat_id
+    , senderId = row.sender_id
+    , senderUsername = row.sender_username
+    , messageId = textMessageId <$> row.message_id
+    , replyToMessageId = textMessageId <$> row.reply_to_message_id
+    , isBot = row.is_bot
+    , mentions = decodeTextList row.mentions
+    , mentionUsernames = decodeTextList row.mention_usernames
+    , imageUrls = decodeTextList row.image_urls
+    , text = row.body_text
+    }
+
+parsePlatformKey :: Text -> ChatPlatform
+parsePlatformKey = \case
+  "PlatformQQ" -> PlatformQQ
+  "qq" -> PlatformQQ
+  "PlatformMatrix" -> PlatformMatrix
+  "matrix" -> PlatformMatrix
+  "PlatformTelegram" -> PlatformTelegram
+  "telegram" -> PlatformTelegram
+  "PlatformDiscord" -> PlatformDiscord
+  "discord" -> PlatformDiscord
+  "PlatformACP" -> PlatformACP
+  "acp" -> PlatformACP
+  _ -> PlatformRPC
+
+parseKindKey :: Text -> ChatKind
+parseKindKey = \case
+  "ChatPrivate" -> ChatPrivate
+  "ChatGroup" -> ChatGroup
+  "ChatChannel" -> ChatChannel
+  other -> ChatUnknown other
 
 queryCurrentSenderStored :: Storage.Storage :> es => IncomingMessage -> SenderChatLogScope -> [[Text]] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]
 queryCurrentSenderStored message scope keywords limitCount timeRange = do

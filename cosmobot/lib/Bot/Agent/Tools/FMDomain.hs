@@ -571,9 +571,9 @@ fmAiContestTextTool =
 fmAiContestPublishTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmAiContestPublishTool =
   allowWhen hasExplicitContestIntent
-  . withDescription "Publish and send FM's daily AI typing contest text (segment 555). Use when the user naturally asks for today's AI contest text or uses the retained 555 workflow. If today's text already exists it is reused. When absent, provide a newly written 300-to-800-character Chinese typing text as body. The tool sends the text itself; do not repeat it in the final response."
+  . withDescription "Publish and send FM's daily AI typing contest text (segment 555). Use when the user naturally asks for today's AI contest text or uses the retained 555 workflow. If today's text already exists it is reused. When absent, provide a newly written 200-to-350-character Chinese typing text as body, with a short title and the requested difficulty. The tool sends the text itself; do not repeat it in the final response."
   $ tool "fm_ai_contest_publish"
-      ( requiredText "body" "A newly written 300-to-800-character Chinese typing text, used only if the requested date has no saved text."
+      ( requiredText "body" "A newly written 200-to-350-character Chinese typing text, used only if the requested date has no saved text."
       , optionalText "title" "Optional short title."
       , optionalText "difficulty" "Optional difficulty label."
       , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."

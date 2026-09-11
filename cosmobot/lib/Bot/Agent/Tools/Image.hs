@@ -55,7 +55,7 @@ hasExplicitImageGenerationIntent context =
   where
     normalized = Text.toLower context.input.text
 
-editImageTool :: (Chat.Chat :> es, LLM.LLM :> es) => Tool (Eff es)
+editImageTool :: (Chat.Chat :> es, LLM.LLM :> es, Media.Media :> es) => Tool (Eff es)
 editImageTool =
   noisy
   . withDescription "Edit one or more existing images with the configured image edit model and send the result to the current chat. Use this when the user asks to modify, restyle, inpaint, combine, or use attached/reference images to create an edited image. Omit image_urls to edit images attached to the current message. Use mask_image_url only when the user supplies an explicit mask image; the mask applies to the first input image."
@@ -79,12 +79,22 @@ editImageTool =
           Just failure ->
             pure (toolFailure failure)
           Nothing -> do
-            edited <- S.effects (LLM.askImageEditStreamingWithOptions editArgs.options editArgs.prompt imageRefs editArgs.maskImageUrl)
+            uploadRefs <- traverse resolveImageEditRef imageRefs
+            uploadMask <- traverse resolveImageEditRef editArgs.maskImageUrl
+            edited <- S.effects (LLM.askImageEditStreamingWithOptions editArgs.options editArgs.prompt uploadRefs uploadMask)
             case ordNub (Chat.replyImageUrls edited) of
               [] ->
                 pure (toolText edited)
               editedRefs ->
                 sendImageToolResult context.message "Edited" editedRefs edited
+
+resolveImageEditRef :: Media.Media :> es => Text -> Eff es Text
+resolveImageEditRef ref
+  | isMediaRef ref = do
+      Media.localMediaPath ref >>= \case
+        Just path -> pure ("file://" <> Text.pack path)
+        Nothing -> pure ref
+  | otherwise = pure ref
 
 viewImageTool :: Media.Media :> es => Tool (Eff es)
 viewImageTool =

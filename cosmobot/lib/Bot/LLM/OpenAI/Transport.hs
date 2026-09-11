@@ -729,9 +729,8 @@ streamImageGenerationOpenAIBytes
   -> Q.ByteStream (Eff es) ()
 streamImageGenerationOpenAIBytes provider@ImageProviderConfig{baseUrl, model, requestTimeout} apiKey options messages =
   Q.fromChunks do
-    let requestPath = ["images", "generations"]
-        request = imageGenerationStreamingRequestPayload provider options model (imagePromptFromMessages messages)
-    httpRequest <- liftIO (sseJsonPostRequest baseUrl requestPath apiKey (secondsToMicros requestTimeout) request)
+    let request = imageGenerationStreamingRequestPayload provider options model (imagePromptFromMessages messages)
+    httpRequest <- liftIO (sseJsonPostRequest baseUrl ["images", "generations"] apiKey (secondsToMicros requestTimeout) request)
     imageBytesFromCompletedEvent (streamSsePayloads (streamHttpResponseBody httpRequest))
 
 streamImageEditOpenAIBytes
@@ -749,9 +748,8 @@ streamImageEditOpenAIBytes cfg@ImageProviderConfig{baseUrl, model, requestTimeou
       (acquireImageEditUploads requestTimeout imageRefs maskRef)
       releaseImageEditUploads
       \(imageUploads, maskUpload) -> do
-        let requestPath = imageEditsPath
-            parts = imageEditMultipartParts cfg options model prompt imageUploads maskUpload
-        imageBytesFromCompletedEvent (streamSseMultipartPost baseUrl requestPath key (secondsToMicros requestTimeout) parts)
+        let parts = imageEditMultipartParts cfg options model prompt imageUploads maskUpload
+        imageBytesFromCompletedEvent (streamSseMultipartPost baseUrl ["images", "edits"] key (secondsToMicros requestTimeout) parts)
 
 streamRawJsonPost
   :: (Aeson.ToJSON body, HTTP.HTTP :> es, IOE :> es)
@@ -778,11 +776,36 @@ streamSseMultipartPost baseUrl path apiKey timeoutMicros parts = do
   httpRequest <- liftIO (sseMultipartPostRequest baseUrl path apiKey timeoutMicros parts)
   streamSsePayloads (streamHttpResponseBody httpRequest)
 
+streamSseMultipartPostAtBase
+  :: (HTTP.HTTP :> es, IOE :> es)
+  => Text
+  -> Text
+  -> Int
+  -> [Multipart.Part]
+  -> Stream (Of StrictByteString.ByteString) (Eff es) ()
+streamSseMultipartPostAtBase baseUrl apiKey timeoutMicros parts = do
+  httpRequest <- liftIO (sseMultipartPostRequestAtBase baseUrl apiKey timeoutMicros parts)
+  streamSsePayloads (streamHttpResponseBody httpRequest)
+
 sseJsonPostRequest :: Aeson.ToJSON body => Text -> [Text] -> Text -> Int -> body -> IO Client.Request
 sseJsonPostRequest baseUrl path apiKey timeoutMicros request = do
   httpRequest <- HTTP.streamingJsonPostRequest baseUrl path apiKey timeoutMicros request
   pure httpRequest
     { Client.requestHeaders = ("Accept", "text/event-stream") : Client.requestHeaders httpRequest
+    }
+
+sseJsonPostRequestAtBase :: Aeson.ToJSON body => Text -> Text -> Int -> body -> IO Client.Request
+sseJsonPostRequestAtBase baseUrl apiKey timeoutMicros request = do
+  base <- Client.parseRequest (Text.unpack baseUrl)
+  pure base
+    { Client.method = "POST"
+    , Client.requestHeaders =
+        [ ("Authorization", ByteString.pack [i|Bearer #{apiKey}|])
+        , ("Content-Type", "application/json")
+        , ("Accept", "text/event-stream")
+        ]
+    , Client.requestBody = Client.RequestBodyLBS (Aeson.encode request)
+    , Client.responseTimeout = Client.responseTimeoutMicro timeoutMicros
     }
 
 rawJsonPostRequest :: Aeson.ToJSON body => Text -> [Text] -> Text -> Int -> ByteString.ByteString -> body -> IO Client.Request
@@ -795,6 +818,18 @@ rawJsonPostRequest baseUrl path apiKey timeoutMicros accept request = do
 sseMultipartPostRequest :: Text -> [Text] -> Text -> Int -> [Multipart.Part] -> IO Client.Request
 sseMultipartPostRequest baseUrl path apiKey timeoutMicros parts = do
   base <- Client.parseRequest (Text.unpack (endpointText baseUrl path))
+  Multipart.formDataBody parts base
+    { Client.method = "POST"
+    , Client.requestHeaders =
+        [ ("Authorization", ByteString.pack [i|Bearer #{apiKey}|])
+        , ("Accept", "text/event-stream")
+        ]
+    , Client.responseTimeout = Client.responseTimeoutMicro timeoutMicros
+    }
+
+sseMultipartPostRequestAtBase :: Text -> Text -> Int -> [Multipart.Part] -> IO Client.Request
+sseMultipartPostRequestAtBase baseUrl apiKey timeoutMicros parts = do
+  base <- Client.parseRequest (Text.unpack baseUrl)
   Multipart.formDataBody parts base
     { Client.method = "POST"
     , Client.requestHeaders =

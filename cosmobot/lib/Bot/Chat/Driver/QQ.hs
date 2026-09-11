@@ -66,6 +66,10 @@ data Config = Config
   , botQQ :: !(Maybe Integer)
   , allowedGroups :: ![Integer]
   , allowedUsers :: ![Integer]
+  , allowAllGroups :: !Bool
+  , allowAllPrivate :: !Bool
+  , blockedGroups :: ![Integer]
+  , blockedUsers :: ![Integer]
   , superusers :: ![Integer]
   }
   deriving (Show)
@@ -1504,19 +1508,38 @@ defaultMessageConfig =
     , botQQ = Nothing
     , allowedGroups = []
     , allowedUsers = []
+    , allowAllGroups = True
+    , allowAllPrivate = True
+    , blockedGroups = []
+    , blockedUsers = []
     , superusers = []
     }
 
 qqMessageDigest :: Config -> Event -> MessageDigest
 qqMessageDigest cfg event =
   MessageDigest
-    { chatIsAllowed = maybe False (`elem` cfg.allowedGroups) event.groupId
+    { chatIsAllowed = chatAllowed
     , senderIsAllowed = senderAllowed
     , senderIsSuperuser = senderSuperuser
     , mentionsBot = maybe False ((`elem` eventMentionIds event) . show) cfg.botQQ
     , botId = Text.pack . show <$> (event.selfId <|> cfg.botQQ)
     }
   where
+    chatAllowed =
+      case event.groupId of
+        Just groupId
+          | groupId `elem` cfg.blockedGroups -> False
+          | cfg.allowAllGroups -> True
+          | groupId `elem` cfg.allowedGroups -> True
+          | otherwise -> False
+        Nothing ->
+          case event.userId of
+            Just userId
+              | userId `elem` cfg.blockedUsers -> False
+              | cfg.allowAllPrivate -> True
+              | userId `elem` cfg.allowedUsers || userId `elem` cfg.superusers -> True
+              | otherwise -> False
+            Nothing -> False
     senderAllowed =
       isPrivateMessage
         || maybe False (\userId -> userId `elem` cfg.allowedUsers || userId `elem` cfg.superusers) event.userId

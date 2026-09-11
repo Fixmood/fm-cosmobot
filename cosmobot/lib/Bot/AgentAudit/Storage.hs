@@ -295,7 +295,9 @@ matchesConversation messageKeys = \case
         && messageKey.messageId `elem` (linkedMessageId : maybeToList parentMessageId)
 
     sameConversation left right =
-      left.platform == right.platform && left.chatId == right.chatId
+      left.platform == right.platform
+        && left.chatId == right.chatId
+        && (left.senderId == right.senderId || isNothing left.senderId || isNothing right.senderId)
 
 storedAuditRecord :: AgentAuditRow -> Maybe AgentAuditRecord
 storedAuditRecord row = do

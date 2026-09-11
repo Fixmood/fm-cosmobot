@@ -21,10 +21,12 @@ module Bot.Memory
   )
 where
 
+import qualified Bot.Chat.Bridge.FM as FMBridge
 import Bot.Core.Message
 import Bot.Prelude
 import qualified Data.List as List
 import qualified Data.Text as Text
+import Text.Read (readMaybe)
 import qualified Data.Text.Encoding as TextEncoding
 import Effectful.FileSystem (FileSystem)
 import qualified Effectful.FileSystem as FileSystem
@@ -56,19 +58,48 @@ memoryLimitChars = 1000
 
 senderMemoryScope :: IncomingMessage -> Either Text MemoryScope
 senderMemoryScope message =
-  case message.senderId of
-    Nothing ->
+  case canonicalSender message of
+    (platform, Just senderId) ->
+      Right (SenderMemory platform senderId)
+    _ ->
       Left "No sender id is available for this message."
-    Just senderId ->
-      Right (SenderMemory message.platform senderId)
 
 chatMemoryScope :: IncomingMessage -> Either Text MemoryScope
 chatMemoryScope message =
-  case message.chatId of
-    Nothing ->
+  case canonicalChat message of
+    (platform, Just chatId) ->
+      Right (ChatMemory platform chatId)
+    _ ->
       Left "No chat id is available for this message."
-    Just chatId ->
-      Right (ChatMemory message.platform chatId)
+
+canonicalSender :: IncomingMessage -> (ChatPlatform, Maybe Text)
+canonicalSender message
+  | message.platform == PlatformMatrix
+  , Just senderId <- message.senderId
+  , senderId `elem` FMBridge.fmOwnerMatrixIds =
+      (PlatformQQ, Just FMBridge.fmOwnerQQId)
+  | message.platform == PlatformMatrix
+  , Just senderId <- message.senderId
+  , Just qqId <- FMBridge.qqBridgeNumericId senderId =
+      (PlatformQQ, Just qqId)
+  | otherwise =
+      (message.platform, message.senderId)
+
+canonicalChat :: IncomingMessage -> (ChatPlatform, Maybe Integer)
+canonicalChat message
+  | FMBridge.isFMMatrixRoom message =
+      (PlatformQQ, Just FMBridge.fmQQGroupId)
+  | message.platform == PlatformMatrix
+  , message.kind == ChatPrivate
+  , Just senderId <- message.senderId
+  , senderId `elem` FMBridge.fmOwnerMatrixIds =
+      (PlatformQQ, readMaybe (Text.unpack FMBridge.fmOwnerQQId))
+  | message.platform == PlatformMatrix
+  , message.kind == ChatPrivate
+  , Just qqId <- message.senderId >>= FMBridge.qqBridgeNumericId =
+      (PlatformQQ, readMaybe (Text.unpack qqId))
+  | otherwise =
+      (message.platform, message.chatId)
 
 loadMemory :: FileSystem :> es => MemoryConfig -> MemoryScope -> Eff es (Maybe Text)
 loadMemory cfg scope = do

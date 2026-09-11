@@ -13,6 +13,7 @@ module Bot.Storage.Thread
   , ActiveThreadInfo (..)
   , newThreadStore
   , lookupThreadTranscript
+  , lookupRecentUserThread
   , lookupThreadMessageIds
   , lookupActiveThreadRunId
   , lookupActiveThreadReply
@@ -52,6 +53,10 @@ import Effectful.Prim.IORef
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
 import qualified Data.Text.Encoding as TextEncoding
+import qualified Data.Time.Clock as Time
+import qualified Data.Time.Clock.POSIX as POSIX
+import qualified Database.Selda.Backend as SeldaBackend
+import qualified Database.Selda.SQLite as SeldaSQLite
 
 data ThreadStore = ThreadStore
   { unThreadStore :: IORef ThreadState
@@ -67,6 +72,20 @@ data ThreadState = ThreadState
   { threadTree :: !ThreadTree
   , threadIds :: !(Map ThreadMessageKey Integer)
   , recentThreadIds :: ![ThreadMessageKey]
+  , recentUserThreads :: !(Map RecentUserKey RecentUserThread)
+  }
+
+data RecentUserKey = RecentUserKey
+  { recentPlatform :: !ChatPlatform
+  , recentChatId :: !(Maybe Integer)
+  , recentSenderId :: !Text
+  }
+  deriving (Eq, Ord, Show)
+
+data RecentUserThread = RecentUserThread
+  { recentMessageKey :: !ThreadMessageKey
+  , recentTranscript :: !Transcript
+  , recentAt :: !Time.UTCTime
   }
 
 data StoredThreadNode = StoredThreadNode
@@ -77,6 +96,7 @@ data StoredThreadNode = StoredThreadNode
 data ActiveThread = ActiveThread
   { activeChatScope :: !(Maybe ActiveChatScope)
   , activeSenderId :: !(Maybe Text)
+  , activeRequestMessageKey :: !(Maybe ThreadMessageKey)
   , activeRunId :: !Text
   , activePrompt :: !Text
   , activeParentMessageKey :: !(Maybe ThreadMessageKey)
@@ -116,6 +136,7 @@ data ThreadStorageRow = ThreadStorageRow
   { id :: ID ThreadStorageRow
   , platform_key :: Text
   , chat_id :: Maybe Int.Int64
+  , sender_id :: Maybe Text
   , message_id :: Text
   , thread_id :: Maybe Int.Int64
   , parent_chat_id :: Maybe Int.Int64
@@ -126,20 +147,44 @@ data ThreadStorageRow = ThreadStorageRow
 
 instance SqlRow ThreadStorageRow
 
+data RecentThreadStorageRow = RecentThreadStorageRow
+  { id :: ID RecentThreadStorageRow
+  , platform_key :: Text
+  , chat_id :: Maybe Int.Int64
+  , sender_id :: Text
+  , message_id :: Text
+  , recent_at :: Int.Int64
+  }
+  deriving (Generic)
+
+instance SqlRow RecentThreadStorageRow
+
 threadRows :: Table ThreadStorageRow
 threadRows =
   table "threads"
     [ #id :- autoPrimary
     , #platform_key :- index
     , #chat_id :- index
+    , #sender_id :- index
     , #message_id :- index
     , #thread_id :- index
     , #parent_message_id :- index
     ]
 
+recentThreadRows :: Table RecentThreadStorageRow
+recentThreadRows =
+  table "recent_user_threads"
+    [ #id :- autoPrimary
+    , #platform_key :- index
+    , #chat_id :- index
+    , #sender_id :- index
+    , #message_id :- index
+    , #recent_at :- index
+    ]
+
 newThreadStore :: Prim :> es => Eff es ThreadStore
 newThreadStore = do
-  ref <- newIORef ThreadState{threadTree = emptyThreadTree, threadIds = Map.empty, recentThreadIds = []}
+  ref <- newIORef ThreadState{threadTree = emptyThreadTree, threadIds = Map.empty, recentThreadIds = [], recentUserThreads = Map.empty}
   activeRef <- newIORef Map.empty
   pure ThreadStore{unThreadStore = ref, activeThreadStore = activeRef}
 
@@ -152,6 +197,45 @@ lookupThreadTranscript store@ThreadStore{activeThreadStore = activeRef} messageK
     Nothing -> do
       active <- Map.lookup (ActiveThreadMessage messageKey) <$> readIORef activeRef
       traverse (MVar.readMVar . (.activeDone)) active
+
+lookupRecentUserThread
+  :: (Prim :> es, IOE :> es, KatipE :> es, Concurrent :> es, Storage.Storage :> es)
+  => ThreadStore
+  -> IncomingMessage
+  -> Int
+  -> Eff es (Maybe (ThreadMessageKey, Transcript, Int))
+lookupRecentUserThread store@ThreadStore{unThreadStore = ref} message windowSeconds = do
+  now <- liftIO Time.getCurrentTime
+  let lookupKey = RecentUserKey
+        { recentPlatform = message.platform
+        , recentChatId = message.chatId
+        , recentSenderId = fromMaybe "-" message.senderId
+        }
+  memoryCandidate <- case message.senderId of
+    Nothing -> pure Nothing
+    Just senderId -> do
+      state <- readIORef ref
+      pure (Map.lookup lookupKey{recentSenderId = senderId} state.recentUserThreads)
+  persistedCandidate <- case memoryCandidate of
+    Just candidate -> pure (Just candidate)
+    Nothing -> loadPersistedRecentUserThread store message
+  let result = persistedCandidate >>= \RecentUserThread{recentMessageKey, recentTranscript, recentAt} -> do
+        let age = max 0 (floor (Time.diffUTCTime now recentAt) :: Int)
+        guard (age <= windowSeconds)
+        pure (recentMessageKey, recentTranscript, age)
+      lookupUserId = fromMaybe "-" message.senderId
+      lookupPlatform = show message.platform :: String
+      lookupChat = show message.chatId :: String
+      lookupFound = isJust result
+  logInfo [i|thread_lookup_recent user_id=#{lookupUserId} platform=#{lookupPlatform} chat=#{lookupChat} found=#{lookupFound}|]
+  for_ result \(messageKey, transcript, _) ->
+    case message.senderId of
+      Just senderId -> atomicModifyIORef' ref \state ->
+        (state{recentUserThreads = Map.insert lookupKey{recentSenderId = senderId}
+          RecentUserThread{recentMessageKey = messageKey, recentTranscript = transcript, recentAt = now}
+          state.recentUserThreads}, ())
+      Nothing -> pure ()
+  pure result
 
 lookupThreadMessageIds :: (Prim :> es, Storage.Storage :> es) => ThreadStore -> ThreadMessageKey -> Eff es [MessageId]
 lookupThreadMessageIds store@ThreadStore{activeThreadStore = activeRef} =
@@ -226,6 +310,7 @@ rememberActiveThread ThreadStore{activeThreadStore = activeRef} activeRunId pare
   let active = ActiveThread
         { activeChatScope = activeChatScopeFromMessage message
         , activeSenderId = message.senderId
+        , activeRequestMessageKey = messageKey
         , activeRunId
         , activePrompt = prompt
         , activeParentMessageKey = parentMessageKey
@@ -308,7 +393,7 @@ updateActiveThread (ActiveThreadHandle active) transcript =
   writeIORef active.activeCurrent transcript
 
 finishActiveThread
-  :: (Prim :> es, KatipE :> es, Concurrent :> es, Storage.Storage :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Concurrent :> es, Storage.Storage :> es)
   => ThreadStore
   -> ActiveThreadHandle
   -> Transcript
@@ -320,15 +405,118 @@ finishActiveThread store@ThreadStore{activeThreadStore = activeRef} (ActiveThrea
     _ -> do
       keys <- readIORef active.activeReplyMessageKeys
       pure (SteeringFinishing, Just keys)
-  for_ replyMessageKeys \keys -> do
-    updateActiveThread (ActiveThreadHandle active) transcript
-    traverse_ (\messageKey -> rememberThreadTranscriptFrom store active.activeParentMessageKey (Just messageKey) transcript) keys
-    void $ MVar.tryPutMVar active.activeDone transcript
-    atomicModifyIORef' activeRef \activeMap ->
-      (Map.filter ((/= active.activeHandle.handleId) . (.activeHandle.handleId)) activeMap, ())
+  let persistenceKeys = fromMaybe [] replyMessageKeys
+      recentKey = listToMaybe persistenceKeys <|> active.activeRequestMessageKey
+  updateActiveThread (ActiveThreadHandle active) transcript
+  traverse_ (\messageKey -> rememberThreadTranscriptFrom store active.activeParentMessageKey (Just messageKey) transcript) persistenceKeys
+  now <- liftIO Time.getCurrentTime
+  for_ recentKey \messageKey -> do
+    rememberRecentUserThread store active.activeChatScope active.activeSenderId messageKey transcript now
+    let persistedUserId = fromMaybe "-" active.activeSenderId
+        persistedMessageId = messageIdText messageKey.messageId
+        persistedSource = if null persistenceKeys then "request" else "response" :: Text
+    logInfo [i|thread_persist_recent user_id=#{persistedUserId} thread_id=#{persistedMessageId} source=#{persistedSource}|]
+  void $ MVar.tryPutMVar active.activeDone transcript
+  atomicModifyIORef' activeRef \activeMap ->
+    (Map.filter ((/= active.activeHandle.handleId) . (.activeHandle.handleId)) activeMap, ())
+
+rememberRecentUserThread
+  :: (Prim :> es, Storage.Storage :> es)
+  => ThreadStore
+  -> Maybe ActiveChatScope
+  -> Maybe Text
+  -> ThreadMessageKey
+  -> Transcript
+  -> Time.UTCTime
+  -> Eff es ()
+rememberRecentUserThread ThreadStore{unThreadStore = ref} chatScope senderId messageKey transcript now =
+  for_ (recentUserKey chatScope senderId) \key ->
+    do
+      let recent = RecentUserThread
+            { recentMessageKey = messageKey
+            , recentTranscript = transcript
+            , recentAt = now
+            }
+      atomicModifyIORef' ref \state ->
+        (state{recentUserThreads = Map.insert key recent state.recentUserThreads}, ())
+      persistRecentUserThread key recent
+
+loadPersistedRecentUserThread
+  :: (Prim :> es, Concurrent :> es, Storage.Storage :> es)
+  => ThreadStore
+  -> IncomingMessage
+  -> Eff es (Maybe RecentUserThread)
+loadPersistedRecentUserThread store message = do
+  ensureThreadTable
+  case (message.senderId, activeChatScopeFromMessage message) of
+    (Just senderId, Just (ActiveChatScope platform chatScope)) -> do
+      rows <- runSelda $ query do
+        row <- select recentThreadRows
+        restrict (row ! #platform_key .== literal (chatPlatformKey platform))
+        restrict (row ! #sender_id .== literal senderId)
+        case chatScope of
+          Left chatId -> restrict (row ! #chat_id .== literal (Just (fromIntegral chatId :: Int.Int64)))
+          Right alias -> restrict (row ! #chat_id .== literal (Nothing :: Maybe Int.Int64))
+        order (row ! #recent_at) descending
+        pure row
+      case listToMaybe rows of
+        Nothing -> pure Nothing
+        Just row -> do
+          let key = ThreadMessageKey
+                { platform = platform
+                , chatId = fromIntegral <$> row.chat_id
+                , senderId = Just row.sender_id
+                , messageId = textMessageId row.message_id
+                }
+          lookupThreadTranscript store key >>= \case
+            Just transcript -> pure (Just RecentUserThread
+              { recentMessageKey = key
+              , recentTranscript = transcript
+              , recentAt = recentTimestampToUtc row.recent_at
+              })
+            Nothing -> pure Nothing
+    _ -> pure Nothing
+
+persistRecentUserThread
+  :: Storage.Storage :> es
+  => RecentUserKey
+  -> RecentUserThread
+  -> Eff es ()
+persistRecentUserThread key RecentUserThread{recentMessageKey, recentAt} = do
+  ensureThreadTable
+  runSelda $ transaction do
+    deleteFrom_ recentThreadRows \row ->
+      row ! #platform_key .== literal (chatPlatformKey key.recentPlatform)
+        .&& row ! #chat_id .== literal (fromIntegral <$> key.recentChatId)
+        .&& row ! #sender_id .== literal key.recentSenderId
+    insert_ recentThreadRows [RecentThreadStorageRow
+      { id = def
+      , platform_key = chatPlatformKey key.recentPlatform
+      , chat_id = fromIntegral <$> key.recentChatId
+      , sender_id = key.recentSenderId
+      , message_id = messageIdText recentMessageKey.messageId
+      , recent_at = recentTimestamp recentAt
+      }]
+    pure ()
+
+recentTimestamp :: Time.UTCTime -> Int.Int64
+recentTimestamp timestamp =
+  floor (POSIX.utcTimeToPOSIXSeconds timestamp)
+
+recentTimestampToUtc :: Int.Int64 -> Time.UTCTime
+recentTimestampToUtc = POSIX.posixSecondsToUTCTime . fromIntegral
+
+recentUserKey :: Maybe ActiveChatScope -> Maybe Text -> Maybe RecentUserKey
+recentUserKey (Just (ActiveChatScope platform chatScope)) (Just senderId) =
+  Just RecentUserKey
+    { recentPlatform = platform
+    , recentChatId = either Just (const Nothing) chatScope
+    , recentSenderId = senderId
+    }
+recentUserKey _ _ = Nothing
 
 finishActiveThreadCurrent
-  :: (Prim :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
   => ThreadStore
   -> ActiveThreadHandle
   -> Eff es ()
@@ -337,7 +525,7 @@ finishActiveThreadCurrent store (ActiveThreadHandle active) = do
   finishActiveThread store (ActiveThreadHandle active) transcript
 
 haltThread
-  :: (Prim :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
   => ThreadStore
   -> (Id -> Eff es Bool)
   -> ThreadMessageKey
@@ -347,7 +535,7 @@ haltThread store@ThreadStore{activeThreadStore = activeRef} cancel messageKey = 
   maybe (pure False) (haltActiveThread store cancel) active
 
 haltActiveThread
-  :: (Prim :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
   => ThreadStore
   -> (Id -> Eff es Bool)
   -> ActiveThread
@@ -359,7 +547,7 @@ haltActiveThread store cancel activeThread = do
   pure True
 
 haltThreadForMessage
-  :: (Prim :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
   => ThreadStore
   -> (Id -> Eff es Bool)
   -> IncomingMessage
@@ -402,7 +590,7 @@ mayManageActiveThread message activeThread =
     || maybe False ((== activeThread.activeSenderId) . Just) message.senderId
 
 haltActiveThreadsForMessage
-  :: (Prim :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
   => ThreadStore
   -> (Id -> Eff es Bool)
   -> IncomingMessage
@@ -416,7 +604,7 @@ haltActiveThreadsForMessage store cancel message requestedIds = do
       else pure Nothing
 
 haltThreadById
-  :: (Prim :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
+  :: (Prim :> es, IOE :> es, KatipE :> es, Storage.Storage :> es, Concurrent :> es)
   => ThreadStore
   -> (Id -> Eff es Bool)
   -> Id
@@ -462,7 +650,12 @@ rememberThreadTranscriptFrom store@ThreadStore{unThreadStore = ref} parentMessag
     (Just <$> saveThreadMessages messageKey requestedThreadStorageId storageParentMessageKey (messagesJson storedMessages))
       `catchSync` \err ->
         logError [i|Failed to persist thread: #{show err :: String}|] $> Nothing
-  for_ persistedThreadStorageId \threadStorageId ->
+  for_ persistedThreadStorageId \threadStorageId -> do
+    let persistedPlatform = show messageKey.platform :: String
+        persistedChat = show messageKey.chatId :: String
+        persistedMessageId = messageIdText messageKey.messageId
+        persistedParentMessageId = maybe "-" (messageIdText . (.messageId)) parentMessageKey
+    logInfo [i|FM thread persisted: platform=#{persistedPlatform} chat=#{persistedChat} message_id=#{persistedMessageId} thread_id=#{threadStorageId} parent_message_id=#{persistedParentMessageId}|]
     atomicModifyIORef' ref \threadState ->
       let node =
             StoredThreadNode
@@ -545,7 +738,31 @@ decodeMessages =
 
 ensureThreadTable :: Storage.Storage :> es => Eff es ()
 ensureThreadTable =
-  runSelda (tryCreateTable threadRows)
+  runSelda (transaction migrateThreadTable)
+
+migrateThreadTable :: SeldaT SeldaSQLite.SQLite IO ()
+migrateThreadTable =
+  SeldaBackend.withBackend \backend -> liftIO do
+    runStatement backend
+      "CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, platform_key TEXT NOT NULL, chat_id BIGINT NULL, sender_id TEXT NULL, message_id TEXT NOT NULL, thread_id BIGINT NULL, parent_chat_id BIGINT NULL, parent_message_id TEXT NULL, messages_json TEXT NOT NULL)"
+    runStatement backend
+      "CREATE TABLE IF NOT EXISTS recent_user_threads (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, platform_key TEXT NOT NULL, chat_id BIGINT NULL, sender_id TEXT NOT NULL, message_id TEXT NOT NULL, recent_at BIGINT NOT NULL)"
+    (_, rows) <- SeldaBackend.runStmt backend "PRAGMA table_info(threads)" []
+    let columns = [name | _ : SeldaBackend.SqlString name : _ <- rows]
+    unless ("sender_id" `elem` columns) $
+      runStatement backend "ALTER TABLE threads ADD COLUMN sender_id TEXT NULL"
+    traverse_ (runStatement backend)
+      [ "CREATE INDEX IF NOT EXISTS threads_platform_key_idx ON threads(platform_key)"
+      , "CREATE INDEX IF NOT EXISTS threads_chat_id_idx ON threads(chat_id)"
+      , "CREATE INDEX IF NOT EXISTS threads_sender_id_idx ON threads(sender_id)"
+      , "CREATE INDEX IF NOT EXISTS threads_message_id_idx ON threads(message_id)"
+      , "CREATE INDEX IF NOT EXISTS threads_thread_id_idx ON threads(thread_id)"
+      , "CREATE INDEX IF NOT EXISTS threads_parent_message_id_idx ON threads(parent_message_id)"
+      , "CREATE INDEX IF NOT EXISTS threads_lookup_idx ON threads(platform_key, chat_id, sender_id, message_id)"
+      ]
+  where
+    runStatement backend statement =
+      void (SeldaBackend.runStmt backend statement [])
 
 loadThreadRows :: Storage.Storage :> es => Eff es [ThreadRow]
 loadThreadRows = do
@@ -560,6 +777,16 @@ loadThreadRows = do
 loadThreadRow :: Storage.Storage :> es => ThreadMessageKey -> Eff es (Maybe ThreadRow)
 loadThreadRow targetMessageKey = do
   ensureThreadTable
+  exact <- loadMatchingThreadRow targetMessageKey
+  case exact of
+    Just row -> pure (Just row)
+    Nothing
+      | isJust targetMessageKey.senderId ->
+          loadMatchingThreadRow targetMessageKey{senderId = Nothing}
+      | otherwise -> pure Nothing
+
+loadMatchingThreadRow :: Storage.Storage :> es => ThreadMessageKey -> Eff es (Maybe ThreadRow)
+loadMatchingThreadRow targetMessageKey = do
   rows <- runSelda $
     query $
       queryLimit 0 1 do
@@ -613,6 +840,7 @@ saveThreadMessages messageKey requestedThreadStorageId parentMessageKey storedMe
       { id = def
       , platform_key = chatPlatformKey messageKey.platform
       , chat_id = fromIntegral <$> messageKey.chatId
+      , sender_id = messageKey.senderId
       , message_id = messageIdText messageKey.messageId
       , thread_id = fromIntegral <$> threadStorageId
       , parent_chat_id = fromIntegral <$> (parentMessageKey >>= (.chatId))
@@ -622,7 +850,7 @@ saveThreadMessages messageKey requestedThreadStorageId parentMessageKey storedMe
 
 threadRowFromStorage :: ThreadStorageRow -> ThreadRow
 threadRowFromStorage row =
-  let messageKey = ThreadMessageKey{platform = platformFromKey row.platform_key, chatId = fromIntegral <$> row.chat_id, messageId = textMessageId row.message_id}
+  let messageKey = ThreadMessageKey{platform = platformFromKey row.platform_key, chatId = fromIntegral <$> row.chat_id, senderId = row.sender_id, messageId = textMessageId row.message_id}
   in ThreadRow
     { messageKey = messageKey
     , threadStorageId = fromIntegral <$> row.thread_id
@@ -631,6 +859,7 @@ threadRowFromStorage row =
         pure ThreadMessageKey
           { platform = messageKey.platform
           , chatId = fromIntegral <$> row.parent_chat_id
+          , senderId = messageKey.senderId
           , messageId = parentMessageId
           }
     , messagesJson = row.messages_json
@@ -640,6 +869,7 @@ threadKeyMatches :: forall (backend :: Type). ThreadMessageKey -> Row backend Th
 threadKeyMatches key row =
   row ! #platform_key .== literal (chatPlatformKey key.platform)
     .&& nullableIntegerMatches key.chatId (row ! #chat_id)
+    .&& nullableTextMatches key.senderId (row ! #sender_id)
     .&& row ! #message_id .== literal (messageIdText key.messageId)
 
 nullableIntegerMatches :: forall (backend :: Type). Maybe Integer -> Col backend (Maybe Int.Int64) -> Col backend Bool
@@ -647,6 +877,12 @@ nullableIntegerMatches Nothing column =
   isNull column
 nullableIntegerMatches (Just value) column =
   column .== literal (Just (fromIntegral value :: Int.Int64))
+
+nullableTextMatches :: forall (backend :: Type). Maybe Text -> Col backend (Maybe Text) -> Col backend Bool
+nullableTextMatches Nothing column =
+  isNull column
+nullableTextMatches (Just value) column =
+  column .== literal (Just value)
 
 platformFromKey :: Text -> ChatPlatform
 platformFromKey = \case

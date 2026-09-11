@@ -2440,9 +2440,7 @@ matrixMessageDigest cfg roomId _roomIsDirect event body =
   where
     roomAllowed =
       (senderSuperuser && isMatrixAccessCommand body)
-        || ( not roomDenied
-          && matrixRoomIdText roomId `elem` cfg.allowedRooms
-           )
+        || not roomDenied
     roomDenied =
       ("-" <> matrixRoomIdText roomId) `elem` cfg.allowedRooms
     senderSuperuser =

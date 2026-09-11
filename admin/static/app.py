@@ -11,14 +11,11 @@ import re
 import secrets
 import threading
 import time
-import subprocess
-import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse, unquote
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -32,7 +29,6 @@ RPC_HOST = os.environ.get("FM_RPC_HOST", "127.0.0.1")
 RPC_PORT = int(os.environ.get("FM_RPC_PORT", "38765"))
 RPC_TOKEN = os.environ.get("FM_RPC_TOKEN", "").strip()
 RPC_TIMEOUT = float(os.environ.get("FM_RPC_TIMEOUT", "4"))
-RUNTIME_CONFIG = os.environ.get("FM_RUNTIME_CONFIG", "").strip()
 LOCK = threading.RLock()
 SESSIONS: dict[str, dict] = {}
 LOGIN_FAILURES: dict[str, list[float]] = {}
@@ -224,54 +220,6 @@ def fetch_domain(path: str, query: str = "") -> dict:
         return result
 
 
-def global_search(keyword: str) -> dict:
-    """Search read-only domain indexes concurrently and return small result sets."""
-    q = keyword.strip()[:120]
-    if not q:
-        return {"groups": [], "users": [], "messages": [], "library": [], "contests": [], "scores": []}
-    jobs = {
-        "groups": lambda: fetch_domain("/groups"),
-        "messages": lambda: fetch_domain("/recent_messages", urlencode({"q": q, "limit": 20})),
-        "library": lambda: fetch_domain("/library/search", urlencode({"q": q, "limit": 20})),
-        "contests": lambda: fetch_domain("/contest/search", urlencode({"q": q, "limit": 20})),
-        "scores": lambda: fetch_domain("/scores", urlencode({"q": q, "limit": 20})),
-    }
-    def items(value):
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            for key in ("items", "rows", "results", "data"):
-                if isinstance(value.get(key), list):
-                    return value[key]
-        return []
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-        futures = {name: executor.submit(job) for name, job in jobs.items()}
-        for name, future in futures.items():
-            try:
-                result = future.result()
-                results[name] = items(result.get("data")) if result.get("ok") else []
-            except Exception:
-                results[name] = []
-    groups = [x for x in results.get("groups", []) if q.lower() in str(x.get("display_name", x.get("group_name", ""))).lower()]
-    messages = results.get("messages", [])
-    users = []
-    seen_users = set()
-    for item in messages:
-        user = str(item.get("sender_name") or item.get("sender_id") or "").strip()
-        if user and q.lower() in user.lower() and user not in seen_users:
-            seen_users.add(user)
-            users.append({"sender_name": user, "sender_id": item.get("sender_id")})
-    return {
-        "groups": groups[:5],
-        "users": users[:5],
-        "messages": [x for x in messages if q.lower() in str(x.get("text", "")).lower()][:5],
-        "library": results.get("library", [])[:5],
-        "contests": results.get("contests", [])[:5],
-        "scores": results.get("scores", [])[:5],
-    }
-
-
 def fetch_domain_binary(path: str, query: str = "") -> tuple[bytes, str] | None:
     target = DOMAIN_URL + path + (f"?{query}" if query else "")
     request = Request(target, headers={"Accept": "image/png"})
@@ -311,306 +259,6 @@ def test_model_connection(payload: dict) -> dict:
         return {"ok": False, "error": f"模型接口返回 HTTP {error.code}。"}
     except Exception as error:
         return {"ok": False, "error": sanitize_error(error)}
-
-
-def compare_models(payload: dict) -> dict:
-    prompt = str(payload.get("prompt") or "").strip()
-    requested = payload.get("models")
-    if not prompt:
-        return {"ok": False, "error": "测试 prompt 不能为空。"}
-    snapshot = fetch_rpc("config.snapshot")
-    snapshot_data = snapshot.get("data") if snapshot.get("ok") else {}
-    configured = snapshot_data.get("models", []) if isinstance(snapshot_data, dict) else []
-    if isinstance(requested, list) and requested:
-        names = {str(x.get("model") if isinstance(x, dict) else x) for x in requested}
-        configured = [x for x in configured if str(x.get("model") or x.get("name")) in names]
-    if not configured:
-        return {"ok": False, "error": "当前运行时没有可用于对比的模型。"}
-
-    def run(item):
-        name = str(item.get("model") or item.get("name") or item.get("provider") or "-")
-        base_url = str(item.get("base_url") or item.get("baseUrl") or "").rstrip("/")
-        api_key = str(item.get("api_key") or item.get("apiKey") or "").strip()
-        if not base_url or not api_key:
-            return {"model": name, "ok": False, "error": "运行时配置缺少接口地址或 API Key。"}
-        started = time.monotonic()
-        request = Request(base_url + "/chat/completions", data=json.dumps({"model": name, "messages": [{"role": "user", "content": prompt}], "max_tokens": 512}).encode(), headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}, method="POST")
-        try:
-            with urlopen(request, timeout=30) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            choices = result.get("choices") or []
-            message = choices[0].get("message", {}) if choices else {}
-            return {"model": name, "ok": True, "content": message.get("content", ""), "elapsed_ms": round((time.monotonic() - started) * 1000), "usage": result.get("usage")}
-        except HTTPError as error:
-            return {"model": name, "ok": False, "error": f"模型接口返回 HTTP {error.code}。", "elapsed_ms": round((time.monotonic() - started) * 1000)}
-        except Exception as error:
-            return {"model": name, "ok": False, "error": sanitize_error(error), "elapsed_ms": round((time.monotonic() - started) * 1000)}
-
-    with ThreadPoolExecutor(max_workers=min(3, len(configured))) as executor:
-        results = list(executor.map(run, configured[:3]))
-    return {"ok": True, "results": results}
-
-
-def test_persona(payload: dict) -> dict:
-    persona = str(payload.get("persona") or payload.get("content") or "").strip()
-    message = str(payload.get("message") or "").strip()
-    if not persona or not message:
-        return {"ok": False, "error": "人设内容和测试消息不能为空。"}
-    snapshot = fetch_rpc("config.snapshot")
-    config = snapshot.get("data") if snapshot.get("ok") else {}
-    models = config.get("models", []) if isinstance(config, dict) else []
-    model = next((x for x in models if isinstance(x, dict) and x.get("current")), None)
-    if not isinstance(model, dict):
-        model = models[0] if models and isinstance(models[0], dict) else {}
-    name = str(model.get("model") or model.get("name") or model.get("provider") or "").strip()
-    base_url = str(model.get("base_url") or model.get("baseUrl") or "").rstrip("/")
-    api_key = str(model.get("api_key") or model.get("apiKey") or "").strip()
-    if RUNTIME_CONFIG:
-        try:
-            with open(RUNTIME_CONFIG, "rb") as config_file:
-                providers = tomllib.load(config_file).get("llm", {}).get("chat_provider", {})
-            private_model = providers.get(str(model.get("provider") or ""), {})
-            if isinstance(private_model, dict):
-                base_url = str(private_model.get("base_url") or base_url).rstrip("/")
-                api_key = str(private_model.get("api_key") or api_key).strip()
-                name = str(private_model.get("model") or name).strip()
-        except (OSError, tomllib.TOMLDecodeError):
-            pass
-    if not name or not base_url or not api_key:
-        return {"ok": False, "error": "当前运行时模型缺少接口地址、模型 ID 或 API Key。"}
-    started = time.monotonic()
-    request = Request(base_url + "/chat/completions", data=json.dumps({
-        "model": name,
-        "messages": [{"role": "system", "content": persona}, {"role": "user", "content": message}],
-        "max_tokens": 512,
-    }).encode(), headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}, method="POST")
-    try:
-        with urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        choices = result.get("choices") or []
-        content = (choices[0].get("message") or {}).get("content", "") if choices else ""
-        return {"ok": True, "model": name, "content": content, "elapsed_ms": round((time.monotonic() - started) * 1000), "usage": result.get("usage")}
-    except HTTPError as error:
-        return {"ok": False, "error": f"模型接口返回 HTTP {error.code}。", "elapsed_ms": round((time.monotonic() - started) * 1000)}
-    except Exception as error:
-        return {"ok": False, "error": sanitize_error(error), "elapsed_ms": round((time.monotonic() - started) * 1000)}
-
-
-def score_user_detail(username: str) -> dict:
-    """Aggregate all competition scores for one user, including legacy raw shapes."""
-    result = fetch_domain("/competition/scores", urlencode({"name": username, "limit": 5000, "include_total": 1}))
-    payload = result.get("data") if result.get("ok") else {}
-    source_items = payload if isinstance(payload, list) else (payload.get("items", []) if isinstance(payload, dict) else [])
-    ai_result = fetch_domain("/ai-contest/scores", urlencode({"name": username, "limit": 5000, "include_total": 1}))
-    ai_payload = ai_result.get("data") if ai_result.get("ok") else {}
-    ai_items = ai_payload if isinstance(ai_payload, list) else (ai_payload.get("items", []) if isinstance(ai_payload, dict) else [])
-    for item in ai_items:
-        if isinstance(item, dict):
-            item = dict(item)
-            item["source_group"] = "AI赛文榜"
-            item["event_type"] = "AI赛文榜"
-            source_items.append(item)
-    def unwrap(item):
-        value = item
-        for key in ("raw", "source", "data", "record"):
-            if isinstance(value, dict) and isinstance(value.get(key), dict):
-                value = {**value, **value[key]}
-        return value if isinstance(value, dict) else {}
-    def text(item, *keys):
-        item = unwrap(item)
-        for key in keys:
-            value = item.get(key)
-            if value is not None and str(value).strip():
-                return str(value).strip()
-        return ""
-    def number(item, *keys):
-        value = text(item, *keys).replace("%", "").replace(",", "")
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    def event_name(item):
-        explicit = text(item, "event_type", "competition_type")
-        source = text(item, "source")
-        group = text(item, "source_group", "group_name")
-        value = explicit or source or group or text(item, "competition", "contest", "title", "name") or "其他赛事"
-        lowered = value.lower()
-        if group in {"AI每日赛文", "AI赛文榜"} or explicit == "AI赛文榜": return "AI赛文榜"
-        if value in {"tiger", "虎杯"} or "tiger" in lowered: return "虎杯榜"
-        if value in {"champ", "锦标赛"} or "champ" in lowered or "锦标赛" in value: return "锦标赛榜"
-        if value in {"comp", "speed", "fast", "极速杯"} or "极速杯" in value: return "极速杯榜"
-        if source in {"cosmobot_live", "qq_live", "cosmobot_backfill", ""} and group:
-            if group == "AI每日赛文" or group == "AI赛文榜": return "AI赛文榜"
-            if group in {"虎杯", "锦标赛", "极速杯"}: return group + "榜"
-            return group + "群赛文榜"
-        return value if value.endswith("榜") else value + "榜"
-    rows = []
-    needle = username.strip().lower()
-    seen_records = set()
-    for original in source_items:
-        item = unwrap(original)
-        identity = text(item, "user_name", "username", "sender_name", "name", "user_id", "sender_id")
-        if needle and needle not in identity.lower():
-            continue
-        record_key = text(item, "record_id", "message_id", "id")
-        if not record_key:
-            record_key = "|".join((text(item, "ts", "received_at", "occurred_at"), text(item, "speed"), text(item, "group_id", "group_name", "source_group")))
-        if record_key in seen_records:
-            continue
-        seen_records.add(record_key)
-        speed = number(item, "speed", "best_speed", "average_speed")
-        accuracy = number(item, "accuracy", "acc", "accuracy_rate", "key_rate")
-        occurred = text(item, "occurred_at", "ts", "received_at", "timestamp", "time", "created_at", "score_time", "date", "competition_date")
-        display_time = occurred
-        try:
-            stamp = float(occurred)
-            if stamp > 100000000:
-                display_time = time.strftime("%m-%d %H:%M", time.localtime(stamp))
-        except (TypeError, ValueError):
-            pass
-        rows.append({
-            "occurred_at": occurred, "date": display_time, "display_time": display_time,
-            "event_type": event_name(item), "title": text(item, "title", "contest", "competition", "source_group") or event_name(item),
-            "group_name": text(item, "group_name", "source_group", "group_id") or "-", "group_id": text(item, "group_id"),
-            "speed": speed, "keystroke": number(item, "keystroke", "key", "kpm"),
-            "code_length": number(item, "code_length", "codelength", "codeLength"),
-            "accuracy": accuracy, "acc": accuracy,
-        })
-    def sort_key(row):
-        try: return float(row["occurred_at"])
-        except (ValueError, TypeError): return 0
-    rows.sort(key=sort_key, reverse=True)
-    speeds = [x["speed"] for x in rows if x["speed"] is not None and x["speed"] > 0]
-    accuracies = [x["accuracy"] for x in rows if x["accuracy"] is not None and x["accuracy"] > 0]
-    categories = {}
-    for row in rows:
-        bucket = categories.setdefault(row["event_type"], [])
-        bucket.append(row)
-    category_rows = [{"name": name, "attempts": len(values), "best_speed": max((x["speed"] for x in values if x["speed"] is not None), default=0), "average_speed": round(sum(x["speed"] for x in values if x["speed"] is not None) / max(1, len([x for x in values if x["speed"] is not None])), 2)} for name, values in categories.items()]
-    trend = list(reversed(rows[:500]))
-    return {"ok": True, "data": {
-        "username": username, "attempts": len(rows), "best_speed": max(speeds, default=0),
-        "average_speed": round(sum(speeds) / len(speeds), 2) if speeds else 0,
-        "best_accuracy": max(accuracies, default=0), "average_accuracy": round(sum(accuracies) / len(accuracies), 2) if accuracies else 0,
-        "trend": [{"date": x["date"], "speed": x["speed"] or 0, "accuracy": x["accuracy"] or 0, "event_type": x["event_type"]} for x in trend],
-        "categories": category_rows, "history": rows, "total": len(rows), "best": sorted(rows, key=lambda x: x["speed"] or 0, reverse=True)[:5],
-    }}
-
-
-def score_user_sources(username: str) -> dict:
-    detail = score_user_detail(username)
-    payload = detail.get("data", {}) if isinstance(detail, dict) else {}
-    categories = payload.get("categories", []) if isinstance(payload, dict) else []
-    return {"ok": True, "data": {
-        "username": username,
-        "sources": [{"name": str(item.get("name")), "attempts": int(item.get("attempts", 0) or 0)} for item in categories if item.get("name")],
-    }}
-
-
-def score_user_fm_detail(username: str, days: int = 30) -> dict:
-    """Read daily leaderboard rows through FM's public APIs, without score tables."""
-    days = max(1, min(int(days or 30), 365))
-    today = datetime.now().date()
-    sources = [("champ", "锦标赛榜"), ("comp", "极速杯榜"), ("tiger", "虎杯榜")]
-    sources += [
-        ("极速联赛", "极速联赛群赛文榜"), ("五笔修炼基地", "五笔修炼基地群赛文榜"),
-        ("帝隆", "帝隆群赛文榜"), ("梦幻打字阁", "梦幻打字阁群赛文榜"),
-        ("092五笔正规闲聊群", "092五笔正规闲聊群群赛文榜"), ("倉頡之友", "倉頡之友群赛文榜"),
-        ("小鹤进修班", "小鹤进修班群赛文榜"),
-    ]
-    jobs = []
-    for offset in range(days):
-        date = (today - timedelta(days=offset)).isoformat()
-        for source, label in sources:
-            jobs.append((date, source, label))
-    def query_one(job):
-        date, source, label = job
-        try:
-            result = fetch_domain("/competition/live", urlencode({"source": source, "date": date, "soft": 1}))
-            payload = result.get("data") if result.get("ok") else {}
-            rows = payload.get("rows", []) if isinstance(payload, dict) else []
-            return date, label, rows
-        except Exception:
-            return date, label, []
-    matches = []
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        for date, label, rows in executor.map(query_one, jobs):
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                name = str(row.get("name") or row.get("user_name") or "").strip()
-                if username.strip().lower() not in name.lower():
-                    continue
-                matches.append({
-                    "display_time": date, "date": date, "occurred_at": date,
-                    "event_type": label, "title": label, "group_name": label,
-                    "speed": row.get("speed"), "keystroke": row.get("key"),
-                    "code_length": row.get("code"), "accuracy": row.get("acc"), "acc": row.get("acc"),
-                    "user_name": name,
-                })
-    # AI leaderboard is also consumed as an FM endpoint; it is not read from
-    # the admin/domain score tables.
-    for offset in range(days):
-        date = (today - timedelta(days=offset)).isoformat()
-        try:
-            result = fetch_domain("/ai-contest/leaderboard", urlencode({"date": date}))
-            payload = result.get("data") if result.get("ok") else {}
-            rows = payload.get("rows", []) if isinstance(payload, dict) else []
-            for row in rows:
-                name = str(row.get("name") or row.get("user_name") or "").strip() if isinstance(row, dict) else ""
-                if username.strip().lower() in name.lower():
-                    matches.append({"display_time": date, "date": date, "occurred_at": date, "event_type": "AI赛文榜", "title": "AI赛文榜", "group_name": "AI赛文榜", "speed": row.get("speed"), "keystroke": row.get("key"), "code_length": row.get("code"), "accuracy": row.get("acc"), "acc": row.get("acc"), "user_name": name})
-        except Exception:
-            pass
-    matches.sort(key=lambda row: (row["date"], row["event_type"]), reverse=True)
-    speeds = [float(x["speed"]) for x in matches if str(x.get("speed", "")).replace(".", "", 1).isdigit()]
-    accuracy = [float(x["accuracy"]) for x in matches if str(x.get("accuracy", "")).replace(".", "", 1).isdigit()]
-    grouped = {}
-    for row in matches: grouped.setdefault(row["event_type"], []).append(row)
-    categories = [{"name": name, "attempts": len(rows), "best_speed": max((float(x["speed"]) for x in rows if str(x.get("speed", "")).replace(".", "", 1).isdigit()), default=0), "average_speed": round(sum(float(x["speed"]) for x in rows if str(x.get("speed", "")).replace(".", "", 1).isdigit()) / max(1, len([x for x in rows if str(x.get("speed", "")).replace(".", "", 1).isdigit()])), 2)} for name, rows in grouped.items()]
-    return {"ok": True, "data": {"username": username, "attempts": len(matches), "best_speed": max(speeds, default=0), "average_speed": round(sum(speeds) / len(speeds), 2) if speeds else 0, "best_accuracy": max(accuracy, default=0), "average_accuracy": round(sum(accuracy) / len(accuracy), 2) if accuracy else 0, "total": len(matches), "trend": matches, "history": matches, "categories": categories}}
-
-
-def error_stats() -> dict:
-    errors = list(read_state().get("recent_errors", []))
-    by_component = {}
-    daily = {}
-    for item in errors:
-        component = str(item.get("component") or "system")
-        by_component[component] = by_component.get(component, 0) + 1
-        stamp = float(item.get("at", 0) or 0)
-        day = time.strftime("%Y-%m-%d", time.localtime(stamp)) if stamp else "未知"
-        daily[day] = daily.get(day, 0) + 1
-    now = time.time()
-    trend = [{"date": time.strftime("%Y-%m-%d", time.localtime(now - 86400 * i)), "count": daily.get(time.strftime("%Y-%m-%d", time.localtime(now - 86400 * i)), 0)} for i in range(6, -1, -1)]
-    return {"ok": True, "data": {"by_component": [{"name": k, "count": v} for k, v in sorted(by_component.items())], "trend": trend, "items": list(reversed(errors))[:100]}}
-
-
-def model_stats() -> dict:
-    result = fetch_rpc("audit.recent", {"limit": 500})
-    raw = result.get("data") if result.get("ok") else []
-    events = raw if isinstance(raw, list) else (raw.get("entries", raw.get("items", [])) if isinstance(raw, dict) else [])
-    totals = {}
-    for event in events:
-        value = event.get("event", event) if isinstance(event, dict) else {}
-        if not isinstance(value, dict):
-            continue
-        model = str(value.get("model") or value.get("model_name") or value.get("provider") or "未标注")
-        usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
-        tokens = int(usage.get("total_tokens") or value.get("total_tokens") or 0)
-        elapsed = float(value.get("elapsed_ms") or value.get("duration_ms") or value.get("latency_ms") or 0)
-        item = totals.setdefault(model, {"name": model, "calls": 0, "tokens": 0, "elapsed": 0})
-        item["calls"] += 1
-        item["tokens"] += tokens
-        item["elapsed"] += elapsed
-    models = [{**x, "average_ms": round(x["elapsed"] / x["calls"]) if x["calls"] else 0} for x in totals.values()]
-    return {"ok": True, "data": {"models": models, "distribution": [{"name": x["name"], "value": x["tokens"]} for x in models], "trend": []}}
-
-
-def log_stream() -> dict:
-    overview = observability_overview({})
-    errors = overview.get("recent_errors", [])
-    return {"ok": True, "data": {"items": [{**x, "level": "ERROR", "service": x.get("component", "admin")} for x in errors], "services": overview.get("domain", {})}}
 
 
 def fetch_rpc(method: str, params: dict | None = None) -> dict:
@@ -753,20 +401,6 @@ def observability_overview(query: dict) -> dict:
         "audit": filtered_audit(query),
         "state": {name: len(read_state()[name]) for name in COLLECTIONS},
     }
-
-
-def health_score() -> dict:
-    overview = observability_overview({})
-    errors = overview.get("recent_errors", [])
-    recent = [x for x in errors if time.time() - float(x.get("at", 0) or 0) <= 3600]
-    domain_ok = bool(overview.get("domain", {}).get("ok"))
-    rpc_ok = bool(overview.get("rpc", {}).get("ok"))
-    score = (30 if domain_ok else 0) + (25 if len(recent) <= 2 else 15 if len(recent) <= 10 else 0) + (20 if rpc_ok else 0) + (15 if overview.get("config_sync", {}).get("saved") else 8) + (10 if overview.get("tasks", {}).get("ok") else 0)
-    issues = []
-    if not domain_ok: issues.append({"issue":"FM Domain 离线","suggestion":"检查 Domain 容器和数据库连接。"})
-    if not rpc_ok: issues.append({"issue":"Cosmobot RPC 不可用","suggestion":"检查 RPC 服务和令牌配置。"})
-    if len(recent) > 2: issues.append({"issue":f"最近 1 小时有 {len(recent)} 条错误","suggestion":"查看运行状态和审计日志定位失败请求。"})
-    return {"ok": True, "score": score, "issues": issues, "dimensions":{"service":30 if domain_ok else 0,"errors":25 if len(recent)<=2 else 15 if len(recent)<=10 else 0,"rpc":20 if rpc_ok else 0,"config":15 if overview.get("config_sync",{}).get("saved") else 8,"processing":10 if overview.get("tasks",{}).get("ok") else 0}}
 
 
 def runtime_config_result(kind: str, payload: dict | None = None) -> dict:
@@ -1088,9 +722,6 @@ class Api(BaseHTTPRequestHandler):
             self.handle_token_list()
         elif not self.require_auth():
             return
-        elif request.path == "/api/search":
-            keyword = parse_qs(request.query).get("q", [""])[0]
-            self.send_json(HTTPStatus.OK, {"ok": True, "data": global_search(keyword)})
         elif request.path == "/api/overview":
             self.send_json(HTTPStatus.OK, {
                 "ok": True,
@@ -1102,34 +733,8 @@ class Api(BaseHTTPRequestHandler):
             })
         elif request.path == "/api/observability/overview":
             self.send_json(HTTPStatus.OK, observability_overview(parse_qs(request.query)))
-        elif request.path == "/api/health/score":
-            self.send_json(HTTPStatus.OK, health_score())
-        elif request.path == "/api/errors/stats":
-            self.send_json(HTTPStatus.OK, error_stats())
-        elif request.path == "/api/logs/stream":
-            self.send_json(HTTPStatus.OK, log_stream())
-        elif request.path == "/api/models/stats":
-            self.send_json(HTTPStatus.OK, model_stats())
-        elif request.path == "/api/dashboard/advanced":
-            domain_result = fetch_domain("/stats/advanced")
-            audit_result = fetch_rpc("audit.recent", {"limit": 500})
-            self.send_json(HTTPStatus.OK, {"ok": True, "domain": domain_result, "audit": audit_result})
-        elif request.path.startswith("/api/domain/scores/user/fm/"):
-            username = unquote(request.path.removeprefix("/api/domain/scores/user/fm/").strip("/"))
-            try:
-                days = min(max(int(parse_qs(request.query).get("days", ["30"])[0]), 1), 365)
-            except ValueError:
-                days = 30
-            self.send_json(HTTPStatus.OK, score_user_fm_detail(username, days))
-        elif request.path == "/api/domain/user/score-sources":
-            username = parse_qs(request.query).get("username", [""])[0].strip()
-            self.send_json(HTTPStatus.OK, score_user_sources(username))
-        elif request.path.startswith("/api/domain/scores/user/"):
-            username = unquote(request.path.removeprefix("/api/domain/scores/user/").strip("/"))
-            self.send_json(HTTPStatus.OK, score_user_detail(username))
         elif request.path == "/api/logs":
-            items = filtered_audit(parse_qs(request.query))
-            self.send_json(HTTPStatus.OK, {"ok": True, "items": items, "total": len(items)})
+            self.send_json(HTTPStatus.OK, {"ok": True, "items": filtered_audit(parse_qs(request.query))})
         elif request.path.startswith("/api/domain/"):
             name = request.path.removeprefix("/api/domain/")
             if name.startswith("reports/"):
@@ -1141,15 +746,9 @@ class Api(BaseHTTPRequestHandler):
             else:
                 path = DOMAIN_READS.get(name, "/" + name)
                 result = fetch_domain(path, request.query)
-                if isinstance(result.get("data"), list):
-                    result["items"] = result["data"]
-                    result["total"] = int(result.get("total", len(result["data"])))
                 self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.SERVICE_UNAVAILABLE, result)
         elif request.path == "/api/runtime/audit":
             result = fetch_rpc("audit.recent", {"limit": 50})
-            if isinstance(result.get("data"), list):
-                result["items"] = result["data"]
-                result["total"] = int(result.get("total", len(result["data"])))
             self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_GATEWAY, result)
         elif request.path == "/api/runtime/media":
             result = fetch_rpc("media.stats", {"limit": 20})
@@ -1238,55 +837,10 @@ class Api(BaseHTTPRequestHandler):
             return
         if not self.require_admin():
             return
-        if request.path == "/api/send-message":
-            payload = self.read_json()
-            if not isinstance(payload, dict):
-                self.send_error_json(HTTPStatus.BAD_REQUEST, "请求体必须是 JSON 对象。")
-                return
-            required = ["target_type", "target_id", "content"]
-            if any(not str(payload.get(key, "")).strip() for key in required):
-                self.send_error_json(HTTPStatus.BAD_REQUEST, "target_type、target_id 和 content 不能为空。")
-                return
-            rpc_payload = {
-                "platform": str(payload.get("platform", "qq")),
-                "target_type": str(payload["target_type"]),
-                "target_id": str(payload["target_id"]),
-                "content": str(payload["content"]),
-                "media": [str(x) for x in payload.get("media", []) if str(x).strip()],
-            }
-            result = fetch_rpc("send_direct_message", rpc_payload)
-            if result["ok"]:
-                record_audit("send", "message", f'{rpc_payload["target_type"]}:{rpc_payload["target_id"]}', "admin")
-                self.send_json(HTTPStatus.OK, result)
-            else:
-                self.send_json(HTTPStatus.BAD_GATEWAY, result)
-            return
         if request.path == "/api/models/test":
             payload = self.read_json()
             result = test_model_connection(payload if isinstance(payload, dict) else {})
             self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST, result)
-            return
-        if request.path == "/api/models/compare":
-            payload = self.read_json()
-            result = compare_models(payload if isinstance(payload, dict) else {})
-            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST, result)
-            return
-        if request.path == "/api/persona/test":
-            payload = self.read_json()
-            result = test_persona(payload if isinstance(payload, dict) else {})
-            self.send_json(HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST, result)
-            return
-        if request.path.startswith("/api/system/restart/"):
-            service = request.path.removeprefix("/api/system/restart/").strip("/")
-            allowed = {"admin": "fm-admin", "domain": "fm-domain", "cosmobot": "fm-cosmobot"}
-            if service not in allowed:
-                self.send_error_json(HTTPStatus.BAD_REQUEST, "不支持的服务名称。")
-                return
-            try:
-                subprocess.run(["docker", "restart", allowed[service]], check=True, timeout=30, capture_output=True)
-                self.send_json(HTTPStatus.OK, {"ok": True, "service": service})
-            except Exception as error:
-                self.send_error_json(HTTPStatus.BAD_GATEWAY, sanitize_error(error))
             return
         if request.path in {"/api/domain/group-state", "/api/domain/group-capability", "/api/domain/repeat-follow"}:
             payload = self.read_json()
@@ -1456,7 +1010,6 @@ class Api(BaseHTTPRequestHandler):
             content_type += "; charset=utf-8"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if not head_only:

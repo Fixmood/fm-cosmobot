@@ -23,6 +23,10 @@ data FileConfig = FileConfig
   , botId :: !(Maybe Integer)
   , allowedGroups :: ![Integer]
   , allowedUsers :: ![Integer]
+  , allowAllGroups :: !Bool
+  , allowAllPrivate :: !Bool
+  , blockedGroups :: ![Integer]
+  , blockedUsers :: ![Integer]
   , superusers :: ![Integer]
   }
   deriving (Show)
@@ -36,6 +40,10 @@ instance FromValue FileConfig where
     <*> optKey "bot_id"
     <*> fmap (fromMaybe []) (optKey "allowed_groups")
     <*> fmap (fromMaybe []) (optKey "allowed_users")
+    <*> fmap (fromMaybe True) (optKey "allow_all_groups")
+    <*> fmap (fromMaybe True) (optKey "allow_all_private")
+    <*> fmap (fromMaybe []) (optKey "blocked_groups")
+    <*> fmap (fromMaybe []) (optKey "blocked_users")
     <*> fmap (fromMaybe []) (optKey "superusers")
 
 toRuntimeConfig :: FileConfig -> QQ.Config
@@ -48,5 +56,9 @@ toRuntimeConfig cfg =
     , botQQ = cfg.botId
     , allowedGroups = cfg.allowedGroups
     , allowedUsers = cfg.allowedUsers
+    , allowAllGroups = cfg.allowAllGroups
+    , allowAllPrivate = cfg.allowAllPrivate
+    , blockedGroups = cfg.blockedGroups
+    , blockedUsers = cfg.blockedUsers
     , superusers = cfg.superusers
     }

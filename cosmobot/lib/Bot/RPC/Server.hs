@@ -52,6 +52,7 @@ data RpcServerCallbacks es = RpcServerCallbacks
   { auditMethod :: RPC.RpcRequest -> Eff es (Maybe (Either RPC.RpcError Aeson.Value))
   , managerMethod :: RPC.RpcRequest -> Eff es (Maybe RPC.RpcResponse)
   , configMethod :: RPC.RpcRequest -> Eff es (Maybe (Either RPC.RpcError Aeson.Value))
+  , directMessageMethod :: RPC.RpcRequest -> Eff es (Maybe RPC.RpcResponse)
   }
 
 data RpcAttachmentUpload = RpcAttachmentUpload
@@ -80,6 +81,7 @@ noRpcServerCallbacks = RpcServerCallbacks
   { auditMethod = \_ -> pure Nothing
   , managerMethod = \_ -> pure Nothing
   , configMethod = \_ -> pure Nothing
+  , directMessageMethod = \_ -> pure Nothing
   }
 
 withManagerRpcCallbacks
@@ -276,6 +278,9 @@ dispatchRpcRequestUnsafe rpcState _cfg callbacks request =
       dispatchUploadAttachment request
     "chat.send" ->
       dispatchChatSend rpcState request
+    "send_direct_message" ->
+      fromMaybe (methodNotFound (RPC.requestId request) "send_direct_message")
+        <$> callbacks.directMessageMethod request
     "media.resolve_source" ->
       dispatchMediaResolveSource request
     "media.get" ->

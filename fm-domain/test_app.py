@@ -57,6 +57,48 @@ from app import (
 )
 
 
+class SQLiteConcurrencyTest(unittest.TestCase):
+    def test_connection_uses_wal_normal_sync_and_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            db = connect(str(Path(root) / "fm.sqlite3"))
+            try:
+                self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 1)
+                self.assertEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+            finally:
+                db.close()
+
+    def test_locked_write_retries_until_writer_commits(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / "fm.sqlite3")
+            writer = connect(path)
+            writer.execute("CREATE TABLE lock_test (value TEXT)")
+            writer.commit()
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("INSERT INTO lock_test VALUES ('first')")
+            result = []
+
+            def delayed_write():
+                contender = connect(path)
+                try:
+                    contender.execute("PRAGMA busy_timeout=1")
+                    contender.execute("INSERT INTO lock_test VALUES ('second')")
+                    contender.commit()
+                    result.append("ok")
+                finally:
+                    contender.close()
+
+            thread = threading.Thread(target=delayed_write)
+            thread.start()
+            time.sleep(0.15)
+            writer.commit()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, ["ok"])
+            self.assertEqual(writer.execute("SELECT COUNT(*) FROM lock_test").fetchone()[0], 2)
+            writer.close()
+
+
 def report_font():
     if not importlib.util.find_spec("PIL"):
         return None

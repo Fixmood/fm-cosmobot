@@ -13,6 +13,10 @@ where
 import Bot.Agent.Tools.Common
 import Bot.Agent.Tool
 import Bot.Agent.Types
+import qualified Bot.Chat.Bridge.FM as FMBridge
+import Bot.Core.Message
+import qualified Bot.Core.ReplyBody as ReplyBody
+import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.HTTP as HTTP
 import qualified Bot.Util.Html as Html
 import Bot.Prelude
@@ -27,11 +31,11 @@ import Network.HTTP.Req
 import System.IO.Error (userError)
 import qualified Text.URI as URI
 
-webSearchTool :: HTTP.HTTP :> es => Tool (Eff es)
+webSearchTool :: (HTTP.HTTP :> es, Chat.Chat :> es) => Tool (Eff es)
 webSearchTool =
   noisy
   . allowWhen (.toolConfig.webSearchEnable)
-  . withDescription "Search the web for current information. Returns title, url, and snippet results plus image_urls when the provider finds usable image URLs. If the user asks for a photo or image, set include_images=true, then pass returned image_urls to send_reply; do not claim an image was sent unless send_reply succeeds."
+  . withDescription "Search the web for current information. Returns title, url, and snippet results plus image_urls when the provider finds usable image URLs. For an explicit image-search request, set include_images=true; this tool will immediately send the first returned image as an actual chat image."
   $ tool "search_web"
       ( requiredText "query" "Search query."
       , optionalInteger "max_results" "Maximum number of results to return. Defaults to 5 and is capped at 20."
@@ -47,12 +51,51 @@ webSearchTool =
           Right (query, maxResults) -> do
             let searchConfig = context.toolConfig
             (results, imageUrls) <- webSearch searchConfig query maxResults (fromMaybe True requestedImages)
-            pure (toolText (jsonText (Aeson.object
-              [ "query" Aeson..= query
-              , "source" Aeson..= webSearchSource searchConfig.webSearchApi
-              , "results" Aeson..= results
-              , "image_urls" Aeson..= imageUrls
-              ])))
+            if explicitImageSearchRequest context.input.text
+              then case imageUrls of
+                imageRef : _ -> do
+                  let body = FMBridge.fmReplyRelayBodyForRequest context.input.text (ReplyBody.imageDirective imageRef)
+                  sent <- Chat.replyTo context.message body
+                  case rights sent of
+                    _ : _ ->
+                      pure (toolText (jsonText (Aeson.object
+                        [ "query" Aeson..= query
+                        , "source" Aeson..= webSearchSource searchConfig.webSearchApi
+                        , "result_count" Aeson..= length results
+                        , "image_sent" Aeson..= True
+                        , "instruction" Aeson..= ("The image was sent as an actual chat image. Do not repeat its URL." :: Text)
+                        ])))
+                    [] ->
+                      let err = Text.intercalate "\n" (lefts sent)
+                      in pure (toolFailure Failure
+                        { category = ExternalServiceUnavailable
+                        , userMessage = "搜索到了图片，但作为图片消息发送失败。"
+                        , detail = err
+                        })
+                [] ->
+                  pure (toolText (jsonText (Aeson.object
+                    [ "query" Aeson..= query
+                    , "source" Aeson..= webSearchSource searchConfig.webSearchApi
+                    , "result_count" Aeson..= length results
+                    , "image_sent" Aeson..= False
+                    , "instruction" Aeson..= ("No usable image URL was returned. Tell the user the image could not be sent; do not paste ordinary page links." :: Text)
+                    ])))
+              else
+                pure (toolText (jsonText (Aeson.object
+                  [ "query" Aeson..= query
+                  , "source" Aeson..= webSearchSource searchConfig.webSearchApi
+                  , "results" Aeson..= results
+                  , "image_urls" Aeson..= imageUrls
+                  ])))
+
+explicitImageSearchRequest :: Text -> Bool
+explicitImageSearchRequest raw =
+  let normalized = Text.toCaseFold raw
+      action = any (`Text.isInfixOf` normalized)
+        [ "搜", "搜索", "找", "查找", "想看", "给我", "来张", "来一张", "发张", "发一张" ]
+      subject = any (`Text.isInfixOf` normalized)
+        [ "图", "图片", "照片", "海报", "壁纸", "剧照" ]
+  in action && subject
 
 webFetchTool :: (HTTP.HTTP :> es, IOE :> es) => Tool (Eff es)
 webFetchTool =

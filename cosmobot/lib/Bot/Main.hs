@@ -18,7 +18,7 @@ import qualified Bot.ACP.Server as ACPServer
 import qualified Bot.ACP.State as ACP
 import Bot.Config
 import qualified Bot.Concurrency.Manager as ConcurrencyManager
-import Bot.Core.Message (incomingMessageLogLine)
+import Bot.Core.Message (ChatKind (..), ChatPlatform (..), IncomingMessage (..), IncomingMessageEventKind (..), emptyMessageDigest, incomingMessageLogLine)
 import Bot.Core.Route
 import qualified Bot.Lifecycle as Lifecycle
 import qualified Bot.Chat.Driver as ChatDriver
@@ -50,7 +50,10 @@ import qualified Bot.RPC.RuntimeConfig as RPCConfigControl
 import qualified Bot.RPC.Config as RPCConfig
 import qualified Bot.RPC.Server as RPCServer
 import qualified Bot.RPC.State as RPC
+import qualified Bot.JSONRPC as JSONRPC
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as AesonTypes
+import qualified Data.Text as Text
 import Bot.Handler.Admin
 import Bot.Handler.Ask
 import Bot.Handler.Audit
@@ -205,15 +208,67 @@ runConfiguredServers cfg threads rpcState acpState messageConsumer =
   runWithTaskGroup "servers" (serverTasks cfg threads rpcState acpState) "message.consumer" messageConsumer
 
 serverTasks
-  :: ( AgentAudit.AgentAudit :> es, Concurrency.Concurrency :> es, ResourceEffect.Resource :> es, Storage.Storage :> es, MediaEffect.Media :> es, Memory.Memory :> es, LLM.LLM :> es, KatipE :> es, Prim :> es, Concurrent :> es, FileSystem :> es, IOE :> es)
+  :: ( Chat.Chat :> es, AgentAudit.AgentAudit :> es, Concurrency.Concurrency :> es, ResourceEffect.Resource :> es, Storage.Storage :> es, MediaEffect.Media :> es, Memory.Memory :> es, LLM.LLM :> es, KatipE :> es, Prim :> es, Concurrent :> es, FileSystem :> es, IOE :> es)
   => BotConfig
   -> ThreadStore
   -> RPC.RpcState
   -> ACP.AcpState
   -> [(Text, Eff es ())]
 serverTasks cfg threads rpcState acpState =
-  enabledTask cfg.rpc.enabled "rpc.server" (RPCServer.runRpcServer cfg.rpc rpcState (RPCServer.withManagerRpcCallbacks (RPCAudit.auditRpcCallbacks {RPCServer.configMethod = RPCConfigControl.configMethod})))
+  enabledTask cfg.rpc.enabled "rpc.server" (RPCServer.runRpcServer cfg.rpc rpcState rpcCallbacks)
     <> enabledTask cfg.acp.enabled "acp.server" (ACPServer.runAcpServer cfg.acp threads acpState)
+  where
+    rpcCallbacks =
+      (RPCServer.withManagerRpcCallbacks (RPCAudit.auditRpcCallbacks {RPCServer.configMethod = RPCConfigControl.configMethod}))
+        { RPCServer.directMessageMethod = dispatchDirectMessage }
+
+    dispatchDirectMessage request =
+      case AesonTypes.parseEither parseParams (JSONRPC.requestParams request) of
+        Left err ->
+          pure (Just (JSONRPC.errorResponse (JSONRPC.requestId request) "invalid_params" (Text.pack err)))
+        Right (platform, targetType, targetId, content, media)
+          | platform /= "qq" ->
+              pure (Just (JSONRPC.errorResponse (JSONRPC.requestId request) "unsupported_platform" "Direct sending currently supports QQ only."))
+          | targetType `notElem` ["group", "private"] ->
+              pure (Just (JSONRPC.errorResponse (JSONRPC.requestId request) "invalid_params" "target_type must be group or private"))
+          | otherwise ->
+              case readMaybe (toString targetId) of
+                Nothing ->
+                  pure (Just (JSONRPC.errorResponse (JSONRPC.requestId request) "invalid_params" "QQ target_id must be numeric"))
+                Just numericTarget -> do
+                  let target = IncomingMessage
+                        { eventKind = IncomingMessageCreated
+                        , platform = PlatformQQ
+                        , kind = if targetType == "group" then ChatGroup else ChatPrivate
+                        , chatId = Just numericTarget
+                        , chatAliases = []
+                        , digest = emptyMessageDigest
+                        , senderId = if targetType == "private" then Just targetId else Nothing
+                        , senderUsername = Nothing
+                        , messageId = Nothing
+                        , replyToMessageId = Nothing
+                        , mentions = []
+                        , mentionUsernames = []
+                        , imageUrls = []
+                        , files = []
+                        , text = ""
+                        , raw = Aeson.Null
+                        }
+                      body = Chat.replyContentToBody (Chat.ReplyContent content media)
+                  logInfo [i|direct message requested: platform=qq target_type=#{targetType} target_id=#{targetId} content_length=#{Text.length content}|]
+                  results <- Chat.replyTo target body
+                  if any isRight results
+                    then pure (Just (JSONRPC.successResponse (JSONRPC.requestId request) (Aeson.object ["sent" Aeson..= True, "results" Aeson..= results])))
+                    else pure (Just (JSONRPC.errorResponse (JSONRPC.requestId request) "send_failed" (fromMaybe "QQ driver rejected the message" (listToMaybe [err | Left err <- results]))))
+      where
+        parseParams :: Aeson.Value -> AesonTypes.Parser (Text, Text, Text, Text, [Text])
+        parseParams = Aeson.withObject "send_direct_message params" $ \o -> do
+          platform <- o Aeson..:? "platform" Aeson..!= "qq"
+          targetType <- o Aeson..: "target_type"
+          targetId <- o Aeson..: "target_id"
+          content <- o Aeson..:? "content" Aeson..!= ""
+          media <- o Aeson..:? "media" Aeson..!= []
+          pure (platform, targetType, targetId, content, media)
 
 enabledTask :: Bool -> Text -> Eff es () -> [(Text, Eff es ())]
 enabledTask enabled label action =

@@ -1,6 +1,9 @@
 services:
   fm-domain:
     image: ${FM_DOMAIN_IMAGE:-fm-domain:local}
+    build:
+      context: ../fm-domain
+      dockerfile: Dockerfile
     container_name: fm-domain
     restart: unless-stopped
     command: ["serve", "--host", "0.0.0.0", "--port", "8077"]

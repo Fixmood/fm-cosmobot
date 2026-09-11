@@ -70,19 +70,21 @@ parseAuditId =
 
 parseMessageKey :: Aeson.Value -> AesonTypes.Parser ThreadMessageKey
 parseMessageKey =
-  Aeson.withObject "audit.thread params" \o ->
-    ThreadMessageKey
-      <$> (o Aeson..: "platform" >>= parsePlatform)
-      <*> o Aeson..:? "chat_id"
-      <*> (textMessageId <$> o Aeson..: "message_id")
+  Aeson.withObject "audit.thread params" \o -> do
+    platform <- o Aeson..: "platform" >>= parsePlatform
+    chatId <- o Aeson..:? "chat_id"
+    senderId <- o Aeson..:? "sender_id"
+    messageId <- textMessageId <$> o Aeson..: "message_id"
+    pure ThreadMessageKey{platform, chatId, senderId, messageId}
 
 parseMessageKeys :: Aeson.Value -> AesonTypes.Parser [ThreadMessageKey]
 parseMessageKeys =
   Aeson.withObject "audit.thread_messages params" \o -> do
     platform <- o Aeson..: "platform" >>= parsePlatform
     chatId <- o Aeson..:? "chat_id"
+    senderId <- o Aeson..:? "sender_id"
     messageIds <- o Aeson..: "message_ids"
-    pure [ThreadMessageKey{platform, chatId, messageId = textMessageId messageId} | messageId <- messageIds]
+    pure [ThreadMessageKey{platform, chatId, senderId, messageId = textMessageId messageId} | messageId <- messageIds]
 
 parsePlatform :: Text -> AesonTypes.Parser ChatPlatform
 parsePlatform = \case

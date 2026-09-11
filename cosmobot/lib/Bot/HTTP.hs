@@ -29,6 +29,7 @@ import qualified Text.URI as URI
 runHTTP :: IOE :> es => Eff (HTTP.HTTP : es) a -> Eff es a
 runHTTP inner = do
   sharedManager <- liftIO newTlsManager
+  directManager <- liftIO newDirectTlsManager
   interpret
     ( \_ -> \case
         HTTP.Manager ->
@@ -38,7 +39,8 @@ runHTTP inner = do
         HTTP.RunReqWithConfig config action ->
           liftIO $ runReqWithConfigIO (withSharedManager sharedManager config) action
         HTTP.OpenResponse request ->
-          liftIO $ Client.responseOpen request sharedManager
+          liftIO $ Client.responseOpen request
+            (if isDirectLLMRequest request then directManager else sharedManager)
     )
     inner
 
@@ -60,10 +62,28 @@ httpsEndpointUrl endpoint path = do
 newTlsManager :: IO Client.Manager
 newTlsManager =
   ClientTLS.newTlsManagerWith
-    (Client.managerSetProxy (Client.useProxy (Client.Proxy (ByteString.pack "172.20.0.1") 40123))
-      (ClientTLS.mkManagerSettings tlsSettings Nothing))
+    (Client.managerSetProxy (Client.useProxy (Client.Proxy (ByteString.pack "172.20.0.1") 7890))
+      (ClientTLS.tlsManagerSettings))
       { Client.managerConnCount = sharedManagerConnectionCount
       }
+
+-- DeepSeek is reachable directly from the server, while the configured
+-- proxy is currently unreliable for its streaming endpoint. Keep Matrix and
+-- other shared HTTP traffic on the existing proxy manager.
+newDirectTlsManager :: IO Client.Manager
+newDirectTlsManager =
+  ClientTLS.newTlsManagerWith ClientTLS.tlsManagerSettings
+    { Client.managerConnCount = sharedManagerConnectionCount
+    }
+
+isDirectLLMRequest :: Client.Request -> Bool
+isDirectLLMRequest request =
+  Client.host request `elem`
+    map ByteString.pack
+      [ "api.deepseek.com"
+      , "weilai.uk"
+      , "botcf.com"
+      ]
 
 sharedManagerConnectionCount :: Int
 sharedManagerConnectionCount =

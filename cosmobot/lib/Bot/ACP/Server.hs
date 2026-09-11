@@ -467,7 +467,7 @@ dispatchPrompt acpState queue request =
               (Content.messageContentBlocks prompt.text prompt.imageUrls [])
 
 cancelAcpThread
-  :: (Concurrency.Concurrency :> es, Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es)
+  :: (Concurrency.Concurrency :> es, Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es, IOE :> es)
   => ThreadStore
   -> MessageId
   -> Eff es ()
@@ -479,6 +479,7 @@ acpThreadMessageKey messageId =
   ThreadMessageKey
     { platform = PlatformACP
     , chatId = Nothing
+    , senderId = Nothing
     , messageId
     }
 

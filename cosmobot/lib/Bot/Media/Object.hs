@@ -21,13 +21,13 @@ import qualified Data.List as List
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
 import Control.Monad.Trans.Resource (ResourceT)
-import qualified Control.Exception as Exception
 import Effectful.FileSystem (FileSystem)
-import qualified Data.ByteString.Streaming.HTTP as StreamingHTTP
 import qualified Network.HTTP.Client as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPTLS
 import qualified Network.HTTP.Types.Header as HTTPHeader
 import qualified Network.HTTP.Types.Status as HTTPStatus
+import Network.Connection (TLSSettings (..))
+import qualified Network.TLS as TLS
 import qualified Streaming.ByteString as Q
 import qualified Streaming.Prelude as S
 import System.FilePath (takeFileName)
@@ -88,25 +88,98 @@ isBase64TextWhitespace char =
 
 downloadObject :: IOE :> es => HTTP.Manager -> Text -> Eff es MediaObject
 downloadObject manager ref = do
-  request <- mediaDownloadRequest <$> liftIO (HTTP.parseRequest (Text.unpack ref))
-  if isQQMediaRequest request
-    then downloadQQMediaObject manager ref request
-    else do
-      let sourceName = requestSourceName request
-          nameMime = Mime.mimeFromName sourceName
-      mime <- probeRemoteMime manager request nameMime
-      pure MediaObject
-        { bytes = downloadByteStream manager ref request mime
-        , mimeType = mime
-        , sourceName = Just sourceName
+  let normalizedRef = normalizeQQMediaRef ref
+  request <- mediaDownloadRequest <$> liftIO (HTTP.parseRequest (Text.unpack normalizedRef))
+  if isQQLogoRequest request
+    then downloadQQLogoObject normalizedRef request
+    else if isQQMediaRequest request
+    then downloadQQMediaObject manager normalizedRef request
+    else downloadRemoteMediaObject manager normalizedRef request
+
+-- Some OneBot/QQ payloads omit the question mark before query parameters in
+-- multimedia URLs, which makes http-client treat the whole query as the host.
+-- Normalize only that known QQ form; all other URLs remain untouched.
+normalizeQQMediaRef :: Text -> Text
+normalizeQQMediaRef ref =
+  let stripped = Text.strip ref
+      replacePrefix prefix base =
+        Text.stripPrefix prefix stripped <&> (base <>)
+  in fromMaybe stripped
+       (replacePrefix "https://multimedia.nt.qq.com.cn&" "https://multimedia.nt.qq.com.cn?"
+        <|> replacePrefix "http://multimedia.nt.qq.com.cn&" "http://multimedia.nt.qq.com.cn?")
+
+downloadQQLogoObject :: IOE :> es => Text -> HTTP.Request -> Eff es MediaObject
+downloadQQLogoObject ref request =
+  bracket
+    (liftIO (HTTPTLS.newTlsManagerWith (HTTPTLS.mkManagerSettings qlogoTlsSettings Nothing)))
+    (liftIO . HTTP.closeManager)
+    (\directManager -> downloadRemoteMediaObject directManager ref request)
+
+qlogoTlsSettings :: TLSSettings
+qlogoTlsSettings =
+  TLSSettingsSimple
+    { settingDisableCertificateValidation = False
+    , settingDisableSession = True
+    , settingUseServerName = True
+    , settingClientSupported =
+        TLS.defaultSupported
+          { TLS.supportedExtendedMainSecret = TLS.NoEMS
+          }
+    }
+
+downloadRemoteMediaObject :: IOE :> es => HTTP.Manager -> Text -> HTTP.Request -> Eff es MediaObject
+downloadRemoteMediaObject manager ref request =
+  tryDownload remoteMediaDownloadAttempts
+  where
+    sourceName = requestSourceName request
+    nameMime = Mime.mimeFromName sourceName
+
+    -- Read the generated image completely before exposing it to the cache. A
+    -- streaming response can fail after the HTTP request has succeeded, which
+    -- used to turn an otherwise valid image into an empty media reference.
+    tryDownload attempts = do
+      result <- trySync (liftIO (HTTP.httpLbs remoteRequest manager))
+      case result of
+        Left err
+          | attempts > 1 -> tryDownload (attempts - 1)
+          | otherwise -> throwIO err
+        Right response -> do
+          let status = HTTP.responseStatus response
+              body = LazyByteString.toStrict (HTTP.responseBody response)
+              bodySize = StrictByteString.length body
+              headerMime = responseMime response
+              mime = resolvedRemoteMime headerMime nameMime (StrictByteString.take 512 body)
+          unless (HTTPStatus.statusIsSuccessful status) $
+            liftIO (ioError (userError [i|Remote media download failed: #{ref} returned HTTP #{HTTPStatus.statusCode status}|]))
+          when (bodySize > remoteMediaMaxBytes) $
+            liftIO (ioError (userError [i|Remote media download exceeded #{remoteMediaMaxBytes} bytes: #{ref}|]))
+          when (StrictByteString.null body) $
+            liftIO (ioError (userError [i|Remote media download returned an empty body: #{ref}|]))
+          unless (Mime.isProbablyMediaMime mime) $
+            liftIO (ioError (userError [i|Remote media download returned non-media content-type #{headerMime}: #{ref}|]))
+          pure MediaObject
+            { bytes = Q.fromStrict body
+            , mimeType = mime
+            , sourceName = Just sourceName
+            }
+
+    remoteRequest =
+      request
+        { HTTP.responseTimeout = HTTP.responseTimeoutMicro 15_000_000
         }
 
+remoteMediaDownloadAttempts :: Int
+remoteMediaDownloadAttempts = 3
+
+remoteMediaMaxBytes :: Int
+remoteMediaMaxBytes = 25 * 1024 * 1024
+
 downloadQQMediaObject :: IOE :> es => HTTP.Manager -> Text -> HTTP.Request -> Eff es MediaObject
-downloadQQMediaObject _manager ref request =
+downloadQQMediaObject manager ref request =
   tryDownload qqMediaDownloadAttempts
   where
     tryDownload attempts = do
-      result <- trySync (liftIO freshQQMediaRequest)
+      result <- trySync (liftIO (HTTP.httpLbs (qqMediaDownloadRequest request) manager))
       case result of
         Right response -> do
           let status = HTTP.responseStatus response
@@ -133,22 +206,18 @@ downloadQQMediaObject _manager ref request =
           | otherwise ->
               throwIO err
 
-    -- QQ's CDN occasionally returns an entirely unreachable address set. A
-    -- fresh manager forces DNS resolution on every retry instead of retaining
-    -- the failed address in the process-wide connection pool.
-    freshQQMediaRequest =
-      Exception.bracket
-        (HTTP.newManager HTTPTLS.tlsManagerSettings)
-        HTTP.closeManager
-        (HTTP.httpLbs (qqMediaDownloadRequest request))
-
 requestSourceName :: HTTP.Request -> Text
 requestSourceName =
   TextEncoding.decodeUtf8 . StrictByteString.takeWhile (/= 63) . HTTP.path
 
 isQQMediaRequest :: HTTP.Request -> Bool
 isQQMediaRequest request =
-  Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request)) == "multimedia.nt.qq.com.cn"
+  Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request))
+    == "multimedia.nt.qq.com.cn"
+
+isQQLogoRequest :: HTTP.Request -> Bool
+isQQLogoRequest request =
+  Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request)) == "q.qlogo.cn"
 
 qqMediaDownloadRequest :: HTTP.Request -> HTTP.Request
 qqMediaDownloadRequest request =
@@ -188,17 +257,6 @@ probeRemoteMimeWithRangeGet manager request nameMime =
         liftIO (ioError (userError [i|Remote media probe failed with HTTP #{HTTPStatus.statusCode status}|]))
       chunk <- liftIO (HTTP.brRead (HTTP.responseBody response))
       pure (resolvedRemoteMime (responseMime response) nameMime chunk)
-
-downloadByteStream :: HTTP.Manager -> Text -> HTTP.Request -> Text -> Q.ByteStream (ResourceT IO) ()
-downloadByteStream manager ref request expectedMime = do
-  response <- lift (StreamingHTTP.http request manager)
-  let status = HTTP.responseStatus response
-      headerMime = responseMime response
-  unless (HTTPStatus.statusIsSuccessful status) $
-    liftIO (ioError (userError [i|Remote media download failed: #{ref} returned HTTP #{HTTPStatus.statusCode status}|]))
-  unless (Mime.isProbablyMediaMime headerMime || Mime.isProbablyMediaMime expectedMime) $
-    liftIO (ioError (userError [i|Remote media download returned non-media content-type #{headerMime}: #{ref}|]))
-  HTTP.responseBody response
 
 mediaDownloadRequest :: HTTP.Request -> HTTP.Request
 mediaDownloadRequest request =

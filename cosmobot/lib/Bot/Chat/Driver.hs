@@ -233,7 +233,7 @@ instance ChatDriver ChatDrivers where
           Left{} -> pure result
           Right matrixMessageId -> do
             qqResult <- withQQBridgeDriver drivers message \driver target ->
-              replyAudio driver target audioRef (FMBridge.fmReplyRelayBody <$> caption)
+              replyAudio driver target audioRef (FMBridge.fmReplyRelayBodyForRequest message.text <$> caption)
             let qqMessageIds = rights [qqResult :: Either Text MessageId]
                 deliveryId = FMBridge.bridgeDeliveryMessageId matrixMessageId qqMessageIds
             recordRecentQQDeliveries drivers message (fromMaybe "" caption) [deliveryId]
@@ -413,7 +413,7 @@ sendQQBridgeReplies
   -> Eff es [Either Text MessageId]
 sendQQBridgeReplies drivers message body =
   withQQBridgeDriver drivers message \driver target ->
-    sendReplyMessages driver target (FMBridge.fmReplyRelayBody body)
+        sendReplyMessages driver target (FMBridge.fmReplyRelayBodyForRequest message.text body)
 
 takeBridgeReplyBody
   :: IORef.IORef (Map MessageId Text)

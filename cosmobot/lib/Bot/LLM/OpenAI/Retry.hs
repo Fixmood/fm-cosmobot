@@ -23,7 +23,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 
 maxLLMRetries :: Int
 maxLLMRetries =
-  3
+  2
 
 retryLLMStreamRequest
   :: (Concurrent :> es, IOE :> es, KatipE :> es)
@@ -100,12 +100,22 @@ retryableHTTPContent = \case
     True
   HTTP.ResponseBodyTooShort{} ->
     True
+  HTTP.InternalException inner ->
+    retryableInternalException inner
   _ ->
     False
 
+retryableInternalException :: SomeException -> Bool
+retryableInternalException err =
+  let rendered = show err :: String
+  in any (`List.isInfixOf` rendered)
+      [ "HandshakeFailed", "Error_EOF", "Connection reset"
+      , "Connection refused", "broken pipe", "resource vanished"
+      ]
+
 retryDelaySeconds :: Int -> SomeException -> Int
 retryDelaySeconds retryNumber err =
-  max (2 ^ retryNumber) (fromMaybe 0 (retryAfterSeconds err))
+  max 1 (min 2 (fromMaybe retryNumber (retryAfterSeconds err)))
 
 retryAfterSeconds :: SomeException -> Maybe Int
 retryAfterSeconds err =
