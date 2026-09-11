@@ -37,3 +37,6 @@ backups/
 *.orig
 *.rej
 *.pre-*
+
+# backup copies with a suffix after the marker (FM.hs.bak.proxy.20260826131048)
+*.bak.*
