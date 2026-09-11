@@ -759,23 +759,23 @@ streamImageGenerationVolcengineBytes provider@ImageProviderConfig{baseUrl, model
               [ ("Authorization", ByteString.pack [i|Bearer #{apiKey}|])
               , ("Content-Type", "application/json") ]
           , Client.responseTimeout = Client.responseTimeoutMicro (secondsToMicros requestTimeout) }
-    response <- HTTP.openResponse postRequest
+    response <- lift (HTTP.openResponse postRequest)
     body <- liftIO (Client.brConsume (Client.responseBody response))
     liftIO (Client.responseClose response)
     unless (HTTPStatus.statusIsSuccessful (Client.responseStatus response)) $
-      throwIO (LLMException "火山引擎 Seedream 图片接口返回错误，请检查 API Key、模型 ID 和 endpoint 配置。")
-    imageUrl <- maybe (throwIO (LLMException "火山引擎 Seedream 返回中没有图片 URL。")) pure (parseImageUrl (LazyByteString.fromChunks body))
+      lift (throwIO (LLMException "火山引擎 Seedream 图片接口返回错误，请检查 API Key、模型 ID 和 endpoint 配置。"))
+    imageUrl <- maybe (lift (throwIO (LLMException "火山引擎 Seedream 返回中没有图片 URL。"))) pure (parseImageUrl (LazyByteString.fromChunks body))
     imageRequest <- liftIO (Client.parseRequest (Text.unpack imageUrl))
-    imageResponse <- HTTP.openResponse imageRequest
+    imageResponse <- lift (HTTP.openResponse imageRequest)
     imageBytes <- liftIO (Client.brConsume (Client.responseBody imageResponse))
     liftIO (Client.responseClose imageResponse)
-    pure imageBytes
+    S.each imageBytes
   where
     parseImageUrl body = do
       value <- Aeson.decode body
       AesonTypes.parseMaybe (Aeson.withObject "Seedream response" $ \object -> do
         items <- (object Aeson..: "data" :: AesonTypes.Parser [Aeson.Value])
-        firstItem <- listToMaybe items
+        firstItem <- maybe (fail "火山引擎 Seedream 返回的 data 为空。") pure (listToMaybe items)
         Aeson.withObject "Seedream image" (Aeson..: "url") firstItem) value
 
 streamImageEditOpenAIBytes

@@ -219,7 +219,7 @@ runLLM cfg action = do
               (_, fallback) <- MVar.readMVar imageSelection
               liftIO (persistImageModelSelection imageSelectionFile (Just name))
               MVar.modifyMVar_ imageSelection (const (pure (Just name, fallback)))
-              pure (maybe (Left "The selected image model is unavailable.") Right (find ((== name) . LLM.imageProfile) (imageModelInfos cfg (Just name, fallback))))
+              pure (maybe (Left "The selected image model is unavailable.") Right (find (\info -> info.imageProfile == name) (imageModelInfos cfg (Just name, fallback))))
         LLM.SelectImageFallbackModel target -> do
           case target of
             Nothing -> do
@@ -232,13 +232,13 @@ runLLM cfg action = do
                 (primary, _) <- MVar.readMVar imageSelection
                 liftIO (persistImageModelSelection imageFallbackSelectionFile (Just name))
                 MVar.modifyMVar_ imageSelection (\(primary, _) -> pure (primary, Just name))
-                pure (maybe (Left "The selected fallback image model is unavailable.") (Right . Just) (find ((== name) . LLM.imageProfile) (imageModelInfos cfg (primary, Just name))))
+                pure (maybe (Left "The selected fallback image model is unavailable.") (Right . Just) (find (\info -> info.imageProfile == name) (imageModelInfos cfg (primary, Just name))))
         LLM.ResetImageModels -> do
           liftIO (persistImageModelSelection imageSelectionFile cfg.imageProviderName)
           liftIO (persistImageModelSelection imageFallbackSelectionFile cfg.imageFallbackProviderName)
           MVar.modifyMVar_ imageSelection (const (pure (cfg.imageProviderName, cfg.imageFallbackProviderName)))
           let infos = imageModelInfos cfg (cfg.imageProviderName, cfg.imageFallbackProviderName)
-          pure (find LLM.isImageCurrent infos, find LLM.isImageFallback infos)
+          pure (find (\info -> info.isImageCurrent) infos, find (\info -> info.isImageFallback) infos)
         LLM.AddImageModel candidate -> do
           case validateNewImageModel candidate of
             Left err -> pure (Left err)
