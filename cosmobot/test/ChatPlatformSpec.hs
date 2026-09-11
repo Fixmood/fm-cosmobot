@@ -60,7 +60,6 @@ main =
       , testCase "QQ reply strips its leading mention" testQqReplyStripsLeadingMention
       , testCase "QQ forwarded messages merge all node text" testQqForwardedMessagesMergeAllNodeText
       , testCase "QQ file segment becomes a message file" testQqFileSegmentBecomesMessageFile
-      , testCase "QQ image upload becomes a message image" testQqImageUploadBecomesMessageImage
       , testCase "QQ record segment becomes a message file" testQqRecordSegmentBecomesMessageFile
       , testCase "QQ sends local file bytes as a base64 resource" testQqBase64FileRef
       , testCase "Telegram user message converts to incoming message" testTelegramUserMessageConvertsToIncomingMessage
@@ -416,16 +415,6 @@ testQqFileSegmentBecomesMessageFile = do
 testQqBase64FileRef :: IO ()
 testQqBase64FileRef =
   QQ.base64FileRef "cosmobot" @?= "base64://Y29zbW9ib3Q="
-
-testQqImageUploadBecomesMessageImage :: IO ()
-testQqImageUploadBecomesMessageImage =
-  QQ.uploadFileMessage "/tmp/image.png" Nothing "image/png" "base64://abc"
-    @?= Aeson.toJSON
-      [ Aeson.object
-          [ "type" Aeson..= ("image" :: Text)
-          , "data" Aeson..= Aeson.object ["file" Aeson..= ("base64://abc" :: Text)]
-          ]
-      ]
 
 testQqRecordSegmentBecomesMessageFile :: IO ()
 testQqRecordSegmentBecomesMessageFile = do

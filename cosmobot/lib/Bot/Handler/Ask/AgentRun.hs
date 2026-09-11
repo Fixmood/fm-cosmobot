@@ -537,7 +537,7 @@ sanitizeUserFacingReply reply
       ]
 
 commitAgentReply
-  :: (ChatLog.ChatLog :> es, Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es)
+  :: (ChatLog.ChatLog :> es, Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es, IOE :> es)
   => Agent.Observer AgentObservation.ObservationContext (Eff es)
   -> ActiveReplyState
   -> IncomingMessage
@@ -576,7 +576,7 @@ rememberToolEmittedMessage activeReply messageId = do
   active <- ensureActiveReply activeReply messageId activeReply.baseTranscript
   traverse_ (\activeHandle -> traverse_ (addActiveThreadMessage activeReply.threads activeHandle . threadMessageKey activeReply.message) messageId) active
 
-discardActiveReply :: (Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es) => ActiveReplyState -> Eff es ()
+discardActiveReply :: (Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es, IOE :> es) => ActiveReplyState -> Eff es ()
 discardActiveReply activeReply =
   IORef.readIORef activeReply.activeRef
     >>= traverse_ (finishActiveThreadCurrent activeReply.threads)
