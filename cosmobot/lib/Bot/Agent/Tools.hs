@@ -9,6 +9,7 @@ module Bot.Agent.Tools
   , defaultToolsWith
   , acpTools
   , selectToolsForMessage
+  , toolSelectionSummary
   )
 where
 
@@ -217,15 +218,20 @@ defaultToolsWith extraTools = tools
 -- remain unchanged.
 selectToolsForMessage :: Context -> [Tool m] -> [Tool m]
 selectToolsForMessage context tools =
-  case requestDomain compact of
-    Nothing -> tools
-    Just domain -> filter (keepTool domain . toolName) tools
+  case selection compact of
+    SimpleChat -> []
+    FullTools -> tools
+    ToolSubset domain -> filter (keepTool domain . toolName) tools
   where
     keepTool domain name =
-      name `elem` alwaysVisible
+      name `elem` alwaysVisible domain
         || name `elem` domainTools domain
 
-    alwaysVisible =
+    alwaysVisible Image =
+      [ "datetime"
+      , "current_message_info"
+      ]
+    alwaysVisible _ =
       [ toolEnableName
       , "datetime"
       , "current_message_info"
@@ -253,41 +259,109 @@ selectToolsForMessage context tools =
         ]
       Admin ->
         [ "fm_admin_status", "fm_domain_stats", "fm_group_status"
+        , "chat_model_status", "account_balance"
+        ]
+      Image ->
+        [ "user_avatar", "image_generate", "image_edit", "send_reply"
+        , "send_media", "read_media_text", "media_to_file", "view_image"
+        , "search_web"
         ]
 
     normalized = Text.toCaseFold context.input.text
     compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) normalized
 
-    requestDomain value
-      | explicitAdmin value = Just Admin
-      | explicitScores value = Just Scores
-      | explicitContest value = Just Contest
-      | explicitLibrary value = Just Library
-      | otherwise = Nothing
+    selection value
+      | explicitAdmin value = ToolSubset Admin
+      | explicitImage value = ToolSubset Image
+      | explicitScores value = ToolSubset Scores
+      | explicitContest value = ToolSubset Contest
+      | explicitLibrary value = ToolSubset Library
+      | simpleChat value = SimpleChat
+      | otherwise = FullTools
+
+    simpleChat value =
+      Text.length value <= 48
+        && any (`Text.isInfixOf` value)
+          [ "你好", "您好", "嗨", "嘿", "谢谢", "感谢", "辛苦了", "早安", "晚安"
+          , "哈哈", "笑死", "在吗", "好的", "好啊", "嗯嗯", "收到", "明白了"
+          ]
+
+    explicitAdmin value =
+      any (`Text.isInfixOf` value)
+        [ "后台地址", "后台在哪", "控制中心", "管理后台", "fm后台"
+        , "什么模型", "哪个模型", "当前模型", "模型状态", "模型余额"
+        , "多少余额", "剩余余额", "还剩多少", "账户余额", "账号余额"
+        ]
+
+    explicitImage value =
+      any (`Text.isInfixOf` value)
+        [ "参考头像", "用头像", "根据头像", "头像生成", "头像做"
+        , "九宫格表情包", "表情包", "生图", "生成图片", "生成一张图"
+        , "画一张", "画个图", "做张图", "做一张图", "修改图片"
+        , "编辑图片", "图片编辑", "改图", "参考这张图"
+        , "搜图", "搜索图片", "查找图片", "找张图", "找一张图"
+        , "找个图", "找一个图", "搜张图", "搜一张图"
+        ]
 
     explicitLibrary value =
       any (`Text.isInfixOf` value)
-        [ "文来", "发文", "来一篇", "来篇", "练一篇", "练文"
-        , "继续打", "上一篇", "这篇文"
+        [ "文来", "发文", "发文章", "来一篇", "来篇", "练一篇", "练文"
+        , "开始跟打", "继续打", "上一篇", "下一篇", "这篇文", "继续"
         ]
 
     explicitContest value =
       any (`Text.isInfixOf` value)
-        [ "赛文", "比赛文章", "赛事文本", "虎杯", "极速杯", "锦标赛"
-        , "555赛文", "ai赛文", "排行榜"
+        [ "赛文", "比赛", "比赛文章", "赛事文本", "虎杯", "极速杯", "锦标赛"
+        , "555赛文", "ai赛文", "排行榜", "榜单"
         ]
 
     explicitScores value =
-      any (`Text.isInfixOf` value)
-        [ "查成绩", "成绩如何", "成绩怎么样", "分析成绩", "成绩分析"
-        , "成绩曲线", "成绩图", "平均成绩", "最好成绩", "成绩排行"
-        ]
+      "成绩" `Text.isInfixOf` value
+        && any (`Text.isInfixOf` value) [ "查", "看", "我的", "怎么样", "如何", "分析", "曲线", "排行" ]
 
-    explicitAdmin value =
-      any (`Text.isInfixOf` value)
-        [ "后台地址", "后台在哪", "控制中心", "管理后台", "fm后台" ]
+data ToolSelection
+  = SimpleChat
+  | ToolSubset RequestDomain
+  | FullTools
 
-data RequestDomain = Library | Contest | Scores | Admin
+toolSelectionSummary :: Context -> [Tool m] -> (Text, Text)
+toolSelectionSummary context _tools =
+  case selectionFor compact of
+    SimpleChat -> ("none", "simple")
+    ToolSubset domain -> ("subset", domainName domain)
+    FullTools -> ("full", "fallback")
+  where
+    compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000']))
+      (Text.toCaseFold context.input.text)
+    selectionFor value
+      | any (`Text.isInfixOf` value)
+          [ "后台地址", "后台在哪", "控制中心", "管理后台", "fm后台"
+          , "群设置", "暂停群", "群能力", "切换模型", "模型管理"
+          , "什么模型", "哪个模型", "当前模型", "模型状态", "模型余额"
+          , "多少余额", "剩余余额", "还剩多少", "账户余额", "账号余额"
+          ] = ToolSubset Admin
+      | any (`Text.isInfixOf` value)
+          [ "参考头像", "用头像", "根据头像", "头像生成", "头像做"
+          , "九宫格表情包", "表情包", "生图", "生成图片", "生成一张图"
+          , "画一张", "画个图", "做张图", "做一张图", "修改图片"
+          , "编辑图片", "图片编辑", "改图", "参考这张图"
+          , "搜图", "搜索图片", "查找图片", "找张图", "找一张图"
+          , "找个图", "找一个图", "搜张图", "搜一张图"
+          ] = ToolSubset Image
+      | "成绩" `Text.isInfixOf` value && any (`Text.isInfixOf` value) ["查", "看", "我的", "怎么样", "如何", "分析", "曲线", "排行"] = ToolSubset Scores
+      | any (`Text.isInfixOf` value) ["赛文", "比赛", "比赛文章", "赛事文本", "虎杯", "极速杯", "锦标赛", "555赛文", "ai赛文", "排行榜", "榜单"] = ToolSubset Contest
+      | any (`Text.isInfixOf` value) ["文来", "发文", "发文章", "来一篇", "来篇", "练一篇", "练文", "开始跟打", "继续打", "上一篇", "下一篇", "这篇文", "继续"] = ToolSubset Library
+      | Text.length value <= 48 && any (`Text.isInfixOf` value)
+          ["你好", "您好", "嗨", "嘿", "谢谢", "感谢", "辛苦了", "早安", "晚安", "哈哈", "笑死", "在吗", "好的", "好啊", "嗯嗯", "收到", "明白了"] = SimpleChat
+      | otherwise = FullTools
+    domainName = \case
+      Library -> "library"
+      Contest -> "contest"
+      Scores -> "scores"
+      Admin -> "admin"
+      Image -> "image"
+
+data RequestDomain = Library | Contest | Scores | Admin | Image
 
 acpTools :: ACP.ACP :> es => [Tool (Eff es)]
 acpTools =

@@ -869,7 +869,6 @@ threadKeyMatches :: forall (backend :: Type). ThreadMessageKey -> Row backend Th
 threadKeyMatches key row =
   row ! #platform_key .== literal (chatPlatformKey key.platform)
     .&& nullableIntegerMatches key.chatId (row ! #chat_id)
-    .&& nullableTextMatches key.senderId (row ! #sender_id)
     .&& row ! #message_id .== literal (messageIdText key.messageId)
 
 nullableIntegerMatches :: forall (backend :: Type). Maybe Integer -> Col backend (Maybe Int.Int64) -> Col backend Bool

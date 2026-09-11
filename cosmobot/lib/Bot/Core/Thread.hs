@@ -33,7 +33,23 @@ data ThreadMessageKey = ThreadMessageKey
   , senderId :: !(Maybe Text)
   , messageId :: !MessageId
   }
-  deriving (Eq, Ord, Show, Generic)
+  deriving (Show, Generic)
+
+-- | Key equality deliberately ignores 'senderId'.
+--
+-- A thread is anchored to a platform message: anyone who replies to that
+-- message, and any superuser issuing a halt, must resolve the same thread no
+-- matter who they are.  'senderId' stays as descriptive metadata (RPC audit,
+-- the sender_id column) but takes no part in identity.
+instance Eq ThreadMessageKey where
+  a == b =
+    a.platform == b.platform
+      && a.chatId == b.chatId
+      && a.messageId == b.messageId
+
+instance Ord ThreadMessageKey where
+  compare a b =
+    compare (a.platform, a.chatId, a.messageId) (b.platform, b.chatId, b.messageId)
 
 instance Aeson.ToJSON ThreadMessageKey where
   toJSON key =
