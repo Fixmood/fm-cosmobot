@@ -23,7 +23,7 @@ import GHC.Clock (getMonotonicTimeNSec)
 
 maxLLMRetries :: Int
 maxLLMRetries =
-  2
+  3
 
 retryLLMStreamRequest
   :: (Concurrent :> es, IOE :> es, KatipE :> es)
@@ -115,7 +115,7 @@ retryableInternalException err =
 
 retryDelaySeconds :: Int -> SomeException -> Int
 retryDelaySeconds retryNumber err =
-  max 1 (min 2 (fromMaybe retryNumber (retryAfterSeconds err)))
+  max (2 ^ retryNumber) (fromMaybe 0 (retryAfterSeconds err))
 
 retryAfterSeconds :: SomeException -> Maybe Int
 retryAfterSeconds err =
