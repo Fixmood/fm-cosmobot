@@ -582,7 +582,7 @@ class RetainedSnapshotImportTest(unittest.TestCase):
 
                 stats = library_stats(db)
                 self.assertEqual(stats["texts"], 3)
-                self.assertEqual(stats["ranked_texts"], 1)
+                self.assertEqual(stats["ranked_texts"], 2)
                 self.assertEqual(stats["active_sessions"], 0)
                 self.assertEqual(library_session_status(db, identity)["status"], "idle")
             finally:

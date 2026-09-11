@@ -14,23 +14,36 @@ class AdminApiTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.old_state = app.STATE_PATH
-        self.old_token = app.ADMIN_TOKEN
+        self.old_auth = app.AUTH_PATH
         app.STATE_PATH = Path(self.tmp.name) / "state.json"
-        app.ADMIN_TOKEN = "test-token"
+        app.AUTH_PATH = Path(self.tmp.name) / "auth.json"
+        salt = "testsalt"
+        app.AUTH_PATH.write_text(json.dumps({
+            "admin_username": "admin",
+            "admin_password_hash": app.password_hash(salt, "test-token"),
+            "salt": salt,
+            "tokens": [],
+        }, ensure_ascii=False), encoding="utf-8")
         self.server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Api)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
+        login = Request(self.base + "/api/login", data=json.dumps(
+            {"type": "admin", "username": "admin", "password": "test-token"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urlopen(login) as response:
+            self.cookie = response.headers.get("Set-Cookie", "").split(";")[0]
 
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
         app.STATE_PATH = self.old_state
-        app.ADMIN_TOKEN = self.old_token
+        app.AUTH_PATH = self.old_auth
         self.tmp.cleanup()
 
     def request(self, method, path, payload=None, token="test-token"):
         body = None if payload is None else json.dumps(payload).encode()
-        headers = {"X-FM-Admin-Token": token}
+        cookie = self.cookie if token == "test-token" else "fm_session=bogus"
+        headers = {"Cookie": cookie}
         if body:
             headers["Content-Type"] = "application/json"
         request = Request(self.base + path, data=body, headers=headers, method=method)
@@ -55,7 +68,7 @@ class AdminApiTest(unittest.TestCase):
         self.request("POST", "/api/collections/models", {"id": "two"}, token="test-token")
         # Actor is deliberately supplied as a separate header, like the production UI/API client.
         request = Request(self.base + "/api/collections/personas", data=json.dumps({"id": "three"}).encode(),
-                          headers={"X-FM-Admin-Token": "test-token", "X-FM-Admin-Actor": "operator"}, method="POST")
+                          headers={"Cookie": self.cookie, "X-FM-Admin-Actor": "operator"}, method="POST")
         with urlopen(request):
             pass
         _, filtered = self.request("GET", "/api/logs?actor=operator&action=create&collection=personas&limit=1")
@@ -106,7 +119,7 @@ class AdminApiTest(unittest.TestCase):
             status, payload = self.request("GET", "/api/domain/contests")
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
-        fetch.assert_called_once_with("/contest/search?limit=50")
+        fetch.assert_called_once_with("/contest/search?limit=50", "")
 
     def test_runtime_rpc_is_gracefully_disabled_by_default(self):
         old_enabled = app.RPC_ENABLED
