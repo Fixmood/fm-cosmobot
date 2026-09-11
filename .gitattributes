@@ -4,3 +4,9 @@
 *.md text eol=lf
 *.toml text eol=lf
 *.py text eol=lf
+
+# Haskell and JavaScript have carried CRLF in committed blobs.
+# Pin them to LF so diffs show real changes only.
+*.hs text eol=lf
+*.js text eol=lf
+*.cabal text eol=lf
