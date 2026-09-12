@@ -4,6 +4,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.Aeson.KeyMap as AesonKeyMap
 import qualified Bot.Chat.Driver.Discord as Discord
+import qualified Bot.Agent.Middleware.Tools as MiddlewareTools
 import qualified Bot.Chat.Bridge.FM as FMBridge
 import qualified Bot.Chat.Driver as ChatDriver
 import qualified Bot.Chat.Driver.Matrix as Matrix
@@ -264,6 +265,18 @@ testFmMatrixOwnerUsesQqContext = do
   -- for another bot: the prefix would break its trigger, whatever the wording.
   let krkrRoster = "- 机器人 krkr（QQ 1094950020）：触发=@ 或首字「krkr」；叫法=发一条以 krkr 开头的正文"
   FMBridge.registeredTriggerWords krkrRoster @?= ["krkr"]
+  -- Progress lines must never bury a fast tool. A four hour window on the live
+  -- bot had 17 of 60 messages (28%) spent on "正在调用 mention_user 工具…" for
+  -- tools that finish in milliseconds, so those are silent however they are tagged.
+  MiddlewareTools.shouldAnnounceProgress True "mention_user" @?= False
+  MiddlewareTools.shouldAnnounceProgress True "fm_member_style" @?= False
+  MiddlewareTools.shouldAnnounceProgress True "chat_log" @?= False
+  MiddlewareTools.shouldAnnounceProgress True "send_reply" @?= False
+  -- ...while tools that genuinely take a while still announce themselves.
+  MiddlewareTools.shouldAnnounceProgress True "image_generate" @?= True
+  MiddlewareTools.shouldAnnounceProgress True "search_web" @?= True
+  -- An untagged tool never announces, whatever its name.
+  MiddlewareTools.shouldAnnounceProgress False "image_generate" @?= False
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"

@@ -10,6 +10,8 @@ module Bot.Agent.Middleware.Tools
   , withToolLimit
   , withToolMessage
   , toolProgressText
+  , progressSilentTools
+  , shouldAnnounceProgress
   )
 where
 
@@ -55,7 +57,7 @@ announceNoisyTool :: (Chat.Chat :> es, Concurrent :> es, HList.Has ObservationCo
 announceNoisyTool program call context =
   case find ((== call.name) . toolName) program.tools of
     Just definition
-      | toolIsNoisy definition || importantDynamicTool call -> do
+      | shouldAnnounceProgress (toolIsNoisy definition) call.name || importantDynamicTool call -> do
           shouldAnnounce <-
             maybe (pure True) ToolRegistry.claimToolAnnouncement
               (find ((== call.name) . (.name)) program.runningTools)
@@ -63,6 +65,27 @@ announceNoisyTool program call context =
             void $ Chat.replyTo program.context.message (toolMessageText call context)
     _ ->
       pure ()
+
+-- | Tools that finish in milliseconds. "Noisy" is meant to say "this tool can
+-- take a while, so it is worth telling the chat we are working on it"; a fast
+-- chat action announced that way only floods the chat with progress lines that
+-- arrive after the action itself. Measured on the live bot: 17 of the 60
+-- messages FM sent in one four hour window (28%) were progress lines, and the
+-- noisiest turns were all fast tools - mention_user, fm_member_style,
+-- recall_recent_self_messages. The typing notification already shows activity.
+progressSilentTools :: [Text]
+progressSilentTools =
+  [ "chat_log", "sender_log", "chat_memory", "fm_group_persona", "fm_member_style"
+  , "mention_user", "send_reply", "send_file", "recall_recent_self_messages"
+  , "group_members", "member_info", "sender_info", "message_info", "user_avatar"
+  ]
+
+-- | Whether one tool call should announce itself in the chat. Kept separate
+-- from the tool definition so the fast/slow split is testable and can be tuned
+-- in one place.
+shouldAnnounceProgress :: Bool -> Text -> Bool
+shouldAnnounceProgress noisyFlag toolName =
+  noisyFlag && toolName `notElem` progressSilentTools
 
 importantDynamicTool :: LLM.ToolCall -> Bool
 importantDynamicTool call =
