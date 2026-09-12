@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-relayroster-20260912` (built from commit `5fb19af`)
+- image `fm-cosmobot:runtime-rosterfirst-20260912` (built from commit `bc65f98`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -318,6 +318,15 @@ Two traps found the hard way on 2026-09-12:
   then went out unprefixed to Matrix and prefixed to QQ, and the summoned bot's leading
   trigger word landed behind "😻 FM：" so its trigger could not fire. Pass the inputs,
   do not re-derive them.
+- A necessary input is not a sufficient rule. Handing the relay the chat's roster was
+  the missing input, but the prefix rule still consulted the roster only as a conjunct
+  of two conditions that cannot hold for a mirrored reply - so the same symptom came
+  back on the very next live test. When a live check still fails after the fix, re-read
+  the whole predicate instead of assuming the input did not arrive.
+- Do not key a later stage on data an earlier stage consumes. The `[[bare]]` marker is
+  stripped by the streaming layer, so a relay rule of the form `markedBare && ...` is
+  dead for every mirrored reply no matter what else is fixed. Either carry the signal
+  forward or key the downstream rule on something that still exists.
 - Corollary, paid for once: the previous release's live check looked green because the
   request itself said "直接发" (requestsDirectOpening). A check that passes for the
   wrong reason is not evidence - read which branch produced the result before calling a
