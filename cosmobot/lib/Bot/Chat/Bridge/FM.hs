@@ -431,9 +431,14 @@ fmReplyRelayBodyForRequestWith triggers request body =
       cleanText = stripReplyPrefix unmarkedText
       rosterCommand = startsWithRosterTrigger triggers cleanText
       suppressPrefix =
-        requestsDirectOpening request
-          || (markedBare && (requestsBareDelivery request || rosterCommand))
-          || (requestsSummon request && rosterCommand)
+        -- A reply that opens with a registered trigger word is addressed to that bot.
+        -- FM's "😻 FM：" prefix would sit in front of the trigger and the summoned bot
+        -- could never fire, so this stands on its own: the mirrored body keeps no
+        -- [[bare]] marker (the streaming layer consumes it) and the request need not
+        -- say "叫一下" for FM to end up talking to a bot.
+        rosterCommand
+          || requestsDirectOpening request
+          || (markedBare && requestsBareDelivery request)
       constrainedText = enforceRequestedReplyOpening request cleanText
       prefixedText =
         if Text.null (Text.strip text)

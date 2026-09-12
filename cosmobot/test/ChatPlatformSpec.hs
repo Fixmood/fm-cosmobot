@@ -326,6 +326,15 @@ testFmMatrixOwnerUsesQqContext = do
   -- "😻 FM： krkr …", so krkr's leading-word trigger could not fire.
   Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你叫一下 krkr 出来冒个泡" "krkr 出来冒个泡呗！") @?= False
   Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith [] "fm 你叫一下 krkr 出来冒个泡" "krkr 出来冒个泡呗！") @?= True
+
+  -- A reply that opens with a registered trigger word stands on its own. Reported live
+  -- on 2026-09-12: these two went to QQ as "😻 FM： krkr ..." while the Matrix room
+  -- showed them bare, because neither request says "叫一下" and the relay's body had
+  -- no marker left.
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你出个问题考考krkr" "krkr 出个题考考你～ 有一家人要过河") @?= False
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你再问一次" "krkr 再问你一次哈～ 有一家人要过河") @?= False
+  -- ...but a reply that is not addressed to a bot keeps FM's mark.
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你和krkr对话的时候不能带前缀" "记进小本本了 Fix哥！！") @?= True
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"
