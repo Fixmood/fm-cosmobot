@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-mention-body-20260912` (built from commit `0b836c6`)
+- image `fm-cosmobot:runtime-opening-guard-20260912` (built from commit `eb2219c`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -237,6 +237,13 @@ Two traps found the hard way on 2026-09-12:
   prefix or marker and adds nothing, so the mentioned bot receives the command
   verbatim.
 
+- "以 X 开头" is ambiguous in Chinese: it can ask for OUR reply's opening, or
+  merely describe how another bot is triggered. `openingBeforeMarker` used to
+  read both the same way, so "你记一下以fw开头就可以把他叫出来" dropped the prefix
+  and forced our acknowledgement to start with "fw". It now ignores a clause
+  that continues into an outcome (就可以/就能/触发/叫出来/召唤/...). When a
+  feature parses user text mechanically, always pin the mis-readable case with
+  a test - the existing suite had encoded the buggy reading as intended.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
