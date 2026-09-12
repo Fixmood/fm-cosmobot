@@ -285,6 +285,39 @@ dead history are referenced by tracked files.
 Find tracked references with `git grep -nE 'fm-cosmobot:[a-zA-Z0-9._-]+'`, and
 also check `/opt/fm-cosmobot/*.sh`, which are outside git.
 
+### Verifying A Built Binary
+
+- Only **string literals** survive into the executable as greppable markers.
+  GHC inlines small functions and constants, so `grep -c isTransportFailure`,
+  `grep -c qqMediaTlsSettings` and `grep -c remoteMediaResponseTimeoutMicro`
+  all return 0 even when that code is present and correct. A release gate must
+  use literals such as `ftn.qq.com`, `volcengine_seedream`, `image_model_manage`
+  or a prompt string, never a function or binding name. Identifiers that look
+  like they should survive (top-level CAFs) do not: this was measured, not
+  assumed, by grepping a binary built from the same tree.
+- Because identifiers are unusable, the link between reviewed source and the
+  deployed binary has to come from the source tree: assert that
+  `git rev-parse HEAD` equals the commit CI verified and that
+  `git status --porcelain` is empty before staging the image, and leave the
+  tree untouched until the deploy finishes.
+- Compare the new `docker run` against the live container before trusting it.
+  `docker inspect` on the running container is the authority for mounts
+  (including `:ro`), `CapAdd`, `SecurityOpt`, `RestartPolicy`, `NetworkMode`,
+  entrypoint and command. `WorkingDir` and the container log limits came from
+  the image and `/etc/docker/daemon.json`, so they are inherited rather than
+  restated in the run command.
+- The config lives in a bind mount shared by the old and the new container, so
+  a rollback restarts the old binary against the new config. Check that every
+  key in the new config maps to a field in the old binary's schema (the old
+  commit's `AgentRun.hs`, or `git log -S <field>`) before relying on rollback.
+- Never edit a running shell script in place: write a new one and restart it.
+  `bash` reads a script incrementally, so editing it mid-run can corrupt
+  execution. Stop the old waiter first.
+- Anonymous GitHub API calls are capped at 60/hour per IP and fail *quietly*:
+  a rate-limited 403 body is valid JSON without a `workflow_runs` key, so a
+  naive parser reports "no run yet" instead of "refused". Poll no faster than
+  every 3 minutes and treat a missing `workflow_runs` key as a refusal.
+
 ### CI And Pushes
 
 - `.github/workflows/ci.yml` triggers on every `push` (no branch filter), so any
