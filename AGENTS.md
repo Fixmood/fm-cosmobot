@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-flushfix-20260912` (built from commit `16ac220`)
+- image `fm-cosmobot:runtime-prefixfix-20260912` (built from commit `c4d9057`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -286,6 +286,12 @@ Two traps found the hard way on 2026-09-12:
   and the run's own log kept only its last thirty lines, so a failing suite could
   hide behind another suite's noise. Read the whole log, or the count of failing
   suites is a guess.
+- The speaker prefix belongs to the first part of a delivered message. QQ
+  delivers reply chunks as one streaming message and appends later chunks into
+  that same body, so a part continuing an early flush must go out unprefixed:
+  prefixing each part put a second "😻 FM：" in the middle of the answer. Long
+  replies already prefix only their first chunk; the flush now matches that, and
+  chat-platform-spec pins both directions.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
