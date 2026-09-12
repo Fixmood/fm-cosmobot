@@ -15,6 +15,7 @@ module Bot.Handler.Ask.AgentRun
   )
 where
 
+import Control.Monad.Trans.Class (lift)
 import qualified Bot.Agent as Agent
 import qualified Bot.Agent.Tool as AgentTool
 import qualified Bot.Agent.Tools as AgentTools
@@ -578,6 +579,7 @@ agentReplyTextEvents request stream = do
           -- which also keeps it to one early flush per turn.
           if Text.null (renderReplyText answer) && earlyFlushDue request pendingText
             then do
+              lift (logInfo [i|FM early flush: sending #{Text.length pendingText} chars before the turn ended|])
               yieldFinalReply pendingText
               go retryUsed openingHandled (appendReplyText pendingText answer) mempty rest
             else go retryUsed openingHandled answer (appendReplyText chunk pending) rest
@@ -737,7 +739,7 @@ earlyFlushDue :: Text -> Text -> Bool
 earlyFlushDue request pending =
   noOpeningRequested
     && Text.length pending >= earlyFlushMinChars
-    && endsAtSentenceBoundary pending
+    && Text.any isSentenceEnd pending
   where
     noOpeningRequested =
       case FMBridge.requestedReplyOpening request of
@@ -747,11 +749,12 @@ earlyFlushDue request pending =
 earlyFlushMinChars :: Int
 earlyFlushMinChars = 140
 
-endsAtSentenceBoundary :: Text -> Bool
-endsAtSentenceBoundary text =
-  case Text.unsnoc (Text.stripEnd text) of
-    Just (_, lastChar) -> lastChar `elem` ("。！？!?…；;：" :: String)
-    Nothing -> False
+-- | A finished sentence anywhere in the buffer is enough: a token boundary can
+-- fall inside the punctuation run, so requiring the buffer to *end* with one made
+-- the flush depend on how the provider happened to chunk the text - and it never
+-- fired at all for answers written in English.
+isSentenceEnd :: Char -> Bool
+isSentenceEnd c = c `elem` ("。！？!?…；;：.\n" :: String)
 
 longReplyStreamingThreshold :: Int
 longReplyStreamingThreshold = 256

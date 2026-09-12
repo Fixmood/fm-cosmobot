@@ -286,6 +286,8 @@ testFmMatrixOwnerUsesQqContext = do
   AgentRun.earlyFlushDue "fm 讲讲吧" longAnswer @?= True
   AgentRun.earlyFlushDue "fm 你好" "好的。" @?= False
   AgentRun.earlyFlushDue "fm 你好" (Text.replicate 30 "还在想") @?= False
+  -- English answers end sentences with a period; the first live test missed this.
+  AgentRun.earlyFlushDue "fm tell me a story" (Text.replicate 20 "This is the answer. ") @?= True
   -- ...and never when the user demanded an exact opening: that is enforced on
   -- the completed reply, so it must not be split.
   AgentRun.earlyFlushDue "fm 以 krkr 开头，叫一下他" longAnswer @?= False
