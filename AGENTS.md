@@ -218,6 +218,20 @@ Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 Runtime state (config, sqlite, memory git repo, media cache) lives in
 `/opt/fm-cosmobot/runtime`, outside the image and outside git.
 
+### Reply-Text Markers Must Survive Every Reply Path
+
+The `😻 FM：` prefix is decided from a marker the model may write at the head of
+its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
+reaching the prefixing step still starts with the marker, so every path that
+slices or rewrites a reply before prefixing has to keep it whole. The long-reply
+streaming split used to take a two-character first chunk, which would have cut
+`[[bare]]` in half, hidden it from the prefixing step and printed it to the
+user. When you add or move a marker like this, grep every caller of
+`fmReplyRelayBodyForRequest` and `fmReplyBody` (`Bot/Agent/Tools/Chat.hs`,
+`Bot/Agent/Tools/Web.hs`, `Bot/Chat/Driver.hs`,
+`Bot/Handler/Ask/AgentRun.hs`) and check the chunk boundaries, not just the
+happy path.
+
 ### Never Drive Production From The Compose Pipeline
 
 `/opt/fm-cosmobot/compose.yaml`, `deploy/cosmobot.compose.yaml`, and the
