@@ -10,6 +10,8 @@ module Bot.Handler.Ask.AgentRun
   ( runAskAgentThread
   , askSystemPrompt
   , streamingReplyChunks
+  , earlyFlushDue
+  , earlyFlushMinChars
   )
 where
 
@@ -566,8 +568,19 @@ agentReplyTextEvents request stream = do
               finalAnswer = appendReplyText finalChunk answer
           yieldFinalReply finalChunk
           pure (renderReplyText finalAnswer, result)
-        Right (Agent.ContentDelta chunk, rest) ->
-          go retryUsed openingHandled answer (appendReplyText chunk pending) rest
+        Right (Agent.ContentDelta chunk, rest) -> do
+          let pendingText = renderReplyText (appendReplyText chunk pending)
+          -- A long answer does not have to wait for its own ending. Process
+          -- narration is short and rarely reaches a finished sentence, so once a
+          -- body is this long its beginning is the answer itself; sending it now
+          -- turns "wait for the whole reply" into "wait for the first sentence".
+          -- `answer` being empty is exactly "nothing flushed yet in this turn",
+          -- which also keeps it to one early flush per turn.
+          if Text.null (renderReplyText answer) && earlyFlushDue request pendingText
+            then do
+              yieldFinalReply pendingText
+              go retryUsed openingHandled (appendReplyText pendingText answer) mempty rest
+            else go retryUsed openingHandled answer (appendReplyText chunk pending) rest
         Right (Agent.ToolCallNotification{}, rest) -> do
           S.yield Nothing
           go retryUsed openingHandled answer mempty rest
@@ -716,6 +729,29 @@ streamingReplyChunksForRequest request reply
             | otherwise = initialReplyChars
           (initial, rest) = Text.splitAt (max requiredHeadChars requiredOpeningChars) reply
       in FMBridge.fmReplyRelayBodyForRequest request initial : textChunksOf matrixLikeEditChunkChars rest
+
+-- | Whether the beginning of a reply may go out before the turn ends.
+-- Skipped when the user demanded an exact opening: that constraint is enforced
+-- on the completed reply, so splitting it would fight the correction step.
+earlyFlushDue :: Text -> Text -> Bool
+earlyFlushDue request pending =
+  noOpeningRequested
+    && Text.length pending >= earlyFlushMinChars
+    && endsAtSentenceBoundary pending
+  where
+    noOpeningRequested =
+      case FMBridge.requestedReplyOpening request of
+        Nothing -> True
+        Just _ -> False
+
+earlyFlushMinChars :: Int
+earlyFlushMinChars = 140
+
+endsAtSentenceBoundary :: Text -> Bool
+endsAtSentenceBoundary text =
+  case Text.unsnoc (Text.stripEnd text) of
+    Just (_, lastChar) -> lastChar `elem` ("。！？!?…；;：" :: String)
+    Nothing -> False
 
 longReplyStreamingThreshold :: Int
 longReplyStreamingThreshold = 256

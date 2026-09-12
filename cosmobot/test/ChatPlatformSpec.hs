@@ -4,6 +4,8 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.Aeson.KeyMap as AesonKeyMap
 import qualified Bot.Chat.Driver.Discord as Discord
+import qualified Bot.Agent.Tools.Shell as ShellTools
+import qualified Bot.Handler.Ask.AgentRun as AgentRun
 import qualified Bot.Agent.Middleware.Tools as MiddlewareTools
 import qualified Bot.Chat.Bridge.FM as FMBridge
 import qualified Bot.Chat.Driver as ChatDriver
@@ -277,6 +279,21 @@ testFmMatrixOwnerUsesQqContext = do
   MiddlewareTools.shouldAnnounceProgress True "search_web" @?= True
   -- An untagged tool never announces, whatever its name.
   MiddlewareTools.shouldAnnounceProgress False "image_generate" @?= False
+
+  -- A long answer may go out in two parts, but only when it really is an answer:
+  -- short narration before a tool call must keep being discarded.
+  let longAnswer = Text.replicate 30 "这是答案。" <> "很久很久以前。"
+  AgentRun.earlyFlushDue "fm 讲讲吧" longAnswer @?= True
+  AgentRun.earlyFlushDue "fm 你好" "好的。" @?= False
+  AgentRun.earlyFlushDue "fm 你好" (Text.replicate 30 "还在想") @?= False
+  -- ...and never when the user demanded an exact opening: that is enforced on
+  -- the completed reply, so it must not be split.
+  AgentRun.earlyFlushDue "fm 以 krkr 开头，叫一下他" longAnswer @?= False
+  -- A command wait is capped, so the agent can never hold the chat for minutes.
+  ShellTools.commandWaitCeilingSeconds @?= 20
+  ShellTools.clampCommandWait 300 @?= 20
+  ShellTools.clampCommandWait 10 @?= 10
+  ShellTools.clampCommandWait 0 @?= 0
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"

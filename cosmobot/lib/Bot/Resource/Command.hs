@@ -7,6 +7,7 @@ module Bot.Resource.Command
   , createAndStart
   , queryCommand
   , waitCommand
+  , claimCompletionReport
   , appendStdout
   , appendStderr
   )
@@ -22,6 +23,7 @@ import Effectful.Timeout (Timeout, timeout)
 data Command = Command
   { state :: !(MVar.MVar CommandStatus)
   , worker :: !(MVar.MVar (Maybe Concurrency.Handle))
+  , completionReportClaimed :: !(MVar.MVar Bool)
   }
 
 data CommandStatus = Running !Text !Text | Finished !(Either Text Text) !Text !Text
@@ -34,7 +36,7 @@ instance (Resource.Resource :> es, Concurrency.Concurrency :> es, Concurrent :> 
   resourceIdPrefix _ = "cmd"
   resourceListed _ = False
   resourceTTLSeconds _ = Right (Just (5 * 60))
-  createResourceObject _ = Right <$> (Command <$> MVar.newMVar (Running "" "") <*> MVar.newMVar Nothing)
+  createResourceObject _ = Right <$> (Command <$> MVar.newMVar (Running "" "") <*> MVar.newMVar Nothing <*> MVar.newMVar False)
   destroyResourceObject command = do
     active <- MVar.readMVar command.worker
     for_ active \workerHandle -> do
@@ -73,6 +75,13 @@ createAndStart access parent initValue action = do
       pure ()
     pure ()
   pure created
+
+-- | Claim the right to report this command's completion into the chat, so an
+-- agent polling the same handle several times still produces exactly one report.
+claimCompletionReport :: Concurrent :> es => Command -> Eff es Bool
+claimCompletionReport command =
+  MVar.modifyMVar command.completionReportClaimed \alreadyClaimed ->
+    pure (True, not alreadyClaimed)
 
 queryCommand :: Concurrent :> es => Command -> Eff es CommandStatus
 queryCommand = MVar.readMVar . (.state)

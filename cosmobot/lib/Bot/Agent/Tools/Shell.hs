@@ -11,6 +11,8 @@ module Bot.Agent.Tools.Shell
   , runSandboxBashSafe
   , runSandboxBashStreaming
   , observeCommand
+  , clampCommandWait
+  , commandWaitCeilingSeconds
   )
 where
 
@@ -18,8 +20,11 @@ import Bot.Agent.Tools.Common
 import Bot.Agent.Tool
 import Bot.Agent.Types
 import Bot.Prelude
+import Bot.Core.Message (IncomingMessage)
 import qualified Bot.Resource.Sandbox as Sandbox
 import qualified Bot.Resource.Command as Command
+import qualified Bot.Chat.Bridge.FM as FMBridge
+import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.Resource as Resource
 import qualified Bot.Effect.Concurrency as Concurrency
 import qualified Bot.Util.Process as ProcessUtil
@@ -35,7 +40,7 @@ import Effectful.FileSystem (FileSystem)
 import qualified Effectful.Process.Typed as TypedProcess
 import Effectful.Timeout
 
-runBashTool :: (Resource.Resource :> es, FileSystem :> es, IOE :> es, Fail :> es, Timeout :> es, Concurrency.Concurrency :> es, Concurrent :> es, TypedProcess.TypedProcess :> es) => Tool (Eff es)
+runBashTool :: (Resource.Resource :> es, FileSystem :> es, IOE :> es, Fail :> es, Timeout :> es, Concurrency.Concurrency :> es, Concurrent :> es, TypedProcess.TypedProcess :> es, Chat.Chat :> es) => Tool (Eff es)
 runBashTool =
   tagged [workTag]
   . allowWhen (\context -> superuserOnly context && hasResourceIdentity context)
@@ -57,13 +62,13 @@ runBashTool =
               (\_ command -> Right <$> runBashStreaming timeoutSeconds (Text.unpack script) command)
             case command of
               Left err -> pure (resourceToolFailure err)
-              Right commandId -> observeCommand True access metadata.resourceOwner commandId 10 0 0
+              Right commandId -> observeCommand True access metadata.resourceOwner context.message commandId 10 0 0
 
-commandTool :: (Resource.Resource :> es, Concurrency.Concurrency :> es, Timeout :> es, Concurrent :> es) => Tool (Eff es)
+commandTool :: (Resource.Resource :> es, Concurrency.Concurrency :> es, Timeout :> es, Concurrent :> es, Chat.Chat :> es) => Tool (Eff es)
 commandTool =
   tagged [workTag]
   . allowWhen hasResourceIdentity
-  . withDescription "Query, wait for, or cancel an asynchronous command handle."
+  . withDescription "Query, wait for, or cancel an asynchronous command handle. Waiting is capped at 20 seconds; if the command is still running, a completion report is posted to this chat automatically, so never wait or poll in a loop."
   $ tool "command"
       (parsedArguments (objectSchema
         [ fieldText "op" "One of: query, wait, cancel."
@@ -78,8 +83,8 @@ commandTool =
         case Resource.accessFromMessage context.message of
           Left err -> pure (resourceToolFailure err)
           Right access -> case call of
-            Query commandId stdoutOffset stderrOffset -> observeCommand False access metadata.resourceOwner commandId 0 stdoutOffset stderrOffset
-            Wait commandId seconds stdoutOffset stderrOffset -> observeCommand False access metadata.resourceOwner commandId seconds stdoutOffset stderrOffset
+            Query commandId stdoutOffset stderrOffset -> observeCommand False access metadata.resourceOwner context.message commandId 0 stdoutOffset stderrOffset
+            Wait commandId seconds stdoutOffset stderrOffset -> observeCommand False access metadata.resourceOwner context.message commandId (clampCommandWait seconds) stdoutOffset stderrOffset
             Cancel commandId -> Resource.destroy access commandId <&> either resourceToolFailure (const (toolText "Command cancelled."))
 
 data CommandCall = Query Text Int Int | Wait Text Int Int Int | Cancel Text
@@ -95,24 +100,103 @@ parseCommandCall = Aeson.withObject "command arguments" \o -> do
   case op :: Text of
     "query" -> pure (Query commandId stdoutOffset stderrOffset)
     "wait" -> do
-      seconds <- fromMaybe 10 <$> o Aeson..:? Key.fromText "timeout_seconds"
+      seconds <- clampCommandWait . fromMaybe 10 <$> o Aeson..:? Key.fromText "timeout_seconds"
       when (seconds <= 0) $ fail "timeout_seconds must be positive."
       pure (Wait commandId seconds stdoutOffset stderrOffset)
     "cancel" -> pure (Cancel commandId)
     _ -> fail "op must be one of: query, wait, cancel."
 
 observeCommand
-  :: (Resource.Resource :> es, Concurrency.Concurrency :> es, Timeout :> es, Concurrent :> es)
-  => Bool -> Resource.ResourceAccess -> Maybe Concurrency.Handle -> Text -> Int -> Int -> Int -> Eff es ToolResult
-observeCommand initial access owner commandId seconds stdoutOffset stderrOffset = do
+  :: (Resource.Resource :> es, Concurrency.Concurrency :> es, Timeout :> es, Concurrent :> es, Chat.Chat :> es)
+  => Bool -> Resource.ResourceAccess -> Maybe Concurrency.Handle -> IncomingMessage -> Text -> Int -> Int -> Int -> Eff es ToolResult
+observeCommand initial access owner message commandId seconds stdoutOffset stderrOffset = do
   result <- Resource.withResource @Command.Command access commandId owner \command ->
     if seconds == 0 then Command.queryCommand command else Command.waitCommand seconds command
   case result of
     Left err -> pure (resourceToolFailure err)
-    Right (Command.Running stdoutText stderrText) -> pure (toolText (commandSnapshot initial commandId "running" stdoutOffset stderrOffset stdoutText stderrText))
+    Right (Command.Running stdoutText stderrText) -> do
+      forkCompletionReport access owner message commandId
+      pure (toolText (commandSnapshot initial commandId "running" stdoutOffset stderrOffset stdoutText stderrText <> runningCommandNote))
     Right (Command.Finished outcome stdoutText stderrText) -> do
       when (seconds /= 0) $ void (Resource.destroy access commandId)
       pure $ either clientFailure (\output -> if seconds == 0 then toolText (commandSnapshot False commandId "completed" stdoutOffset stderrOffset stdoutText stderrText) else toolText output) outcome
+
+-- | Waiting inline for a long command is what makes an answer feel stuck: the
+-- agent holds the chat while a script runs, and polling it costs a model round
+-- trip each time. The wait is capped instead, and this watcher posts the real
+-- output when the command finishes. The claim inside the command resource means
+-- a polling loop still produces exactly one report.
+runningCommandNote :: Text
+runningCommandNote =
+  "\n\nStill running. A completion report with the output will be posted to this chat automatically when it finishes; do not wait or poll again - answer the user now with one short line saying it is still running."
+
+commandWaitCeilingSeconds :: Int
+commandWaitCeilingSeconds = 20
+
+clampCommandWait :: Int -> Int
+clampCommandWait seconds = max 0 (min seconds commandWaitCeilingSeconds)
+
+completionReportStepSeconds :: Int
+completionReportStepSeconds = 15
+
+completionReportMaxSeconds :: Int
+completionReportMaxSeconds = 260
+
+completionReportOutputChars :: Int
+completionReportOutputChars = 1200
+
+forkCompletionReport
+  :: (Resource.Resource :> es, Concurrency.Concurrency :> es, Timeout :> es, Concurrent :> es, Chat.Chat :> es)
+  => Resource.ResourceAccess -> Maybe Concurrency.Handle -> IncomingMessage -> Text -> Eff es ()
+forkCompletionReport access owner message commandId =
+  void $ Concurrency.fork "command-completion-report" do
+    outcome <- Resource.withResource @Command.Command access commandId owner \command -> do
+      claimed <- Command.claimCompletionReport command
+      if not claimed
+        then pure Nothing
+        else Just <$> waitForCompletion command 0
+    -- Left: the handle is gone (expired or cancelled), so there is nothing to
+    -- report. Right Nothing: another watcher already claimed this command.
+    case outcome of
+      Right (Just status) -> do
+        void $ Chat.replyTo message (FMBridge.fmReplyBody (completionReportText commandId status))
+        void $ Resource.destroy access commandId
+      _ -> pure ()
+
+waitForCompletion
+  :: (Concurrency.Concurrency :> es, Concurrent :> es, Timeout :> es)
+  => Command.Command -> Int -> Eff es Command.CommandStatus
+waitForCompletion command waited
+  | waited >= completionReportMaxSeconds = Command.queryCommand command
+  | otherwise = do
+      status <- Command.waitCommand completionReportStepSeconds command
+      case status of
+        Command.Finished{} -> pure status
+        Command.Running{} -> waitForCompletion command (waited + completionReportStepSeconds)
+
+completionReportText :: Text -> Command.CommandStatus -> Text
+completionReportText commandId status =
+  case status of
+    Command.Finished outcome stdoutText stderrText ->
+      Text.unlines
+        ( [[i|刚才那条后台命令（#{commandId}）跑完啦：|]]
+            <> outcomeLines outcome
+            <> outputLines (stdoutText <> stderrText) )
+    Command.Running _ _ ->
+      Text.unlines
+        [ [i|刚才那条后台命令（#{commandId}）还在跑，已经超过 #{completionReportMaxSeconds} 秒了，我先不等它了。|] ]
+  where
+    outcomeLines result = case result of
+      Left err -> [ [i|结果是失败：#{Text.take 300 err}|] ]
+      Right _ -> []
+    outputLines raw =
+      let trimmed = Text.strip raw
+      in if Text.null trimmed
+           then [ "（没有输出）" ]
+           else
+             let kept = Text.takeEnd completionReportOutputChars trimmed
+                 prefix = if Text.length kept < Text.length trimmed then "…" else ""
+             in [prefix <> kept]
 
 commandSnapshot :: Bool -> Text -> Text -> Int -> Int -> Text -> Text -> Text
 commandSnapshot initial commandId status stdoutOffset stderrOffset stdoutText stderrText =

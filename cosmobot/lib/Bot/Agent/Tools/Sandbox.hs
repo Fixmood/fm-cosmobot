@@ -16,6 +16,7 @@ import Bot.Agent.Tool
 import Bot.Agent.Types
 import qualified Bot.Effect.Media as Media
 import qualified Bot.Effect.Resource as Resource
+import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.Concurrency as Concurrency
 import qualified Bot.Media.Object as MediaObject
 import Bot.Prelude
@@ -33,7 +34,7 @@ import System.FilePath ((</>))
 import qualified System.FilePath.Posix as Posix
 
 sandboxTool
-  :: (Media.Media :> es, Resource.Resource :> es, Concurrency.Concurrency :> es, FileSystem :> es, Timeout :> es, Concurrent :> es, TypedProcess.TypedProcess :> es, IOE :> es)
+  :: (Chat.Chat :> es, Media.Media :> es, Resource.Resource :> es, Concurrency.Concurrency :> es, FileSystem :> es, Timeout :> es, Concurrent :> es, TypedProcess.TypedProcess :> es, IOE :> es)
   => Tool (Eff es)
 sandboxTool =
   tagged [workTag]
@@ -78,7 +79,7 @@ sandboxTool =
                   pure (join (first renderResourceError result))
               case command of
                 Left err -> pure (resourceToolFailure err)
-                Right commandId -> Shell.observeCommand True access metadata.resourceOwner commandId 10 0 0
+                Right commandId -> Shell.observeCommand True access metadata.resourceOwner context.message commandId 10 0 0
             SandboxFileToMedia sandboxId path -> do
               result <- Resource.withResource @Sandbox.Sandbox access sandboxId metadata.resourceOwner \sandbox ->
                 copyFileToMedia sandbox path
