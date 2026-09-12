@@ -99,6 +99,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       outputMessage = FMBridge.fmStandaloneMessage message
   systemPrompt <- askSystemPrompt cfg message
   rosterTriggers <- loadRosterTriggers message
+  Chat.rememberRosterTriggers message rosterTriggers
   (recentContextMessages, recentChatContext) <- loadRecentChatContext cfg message startedAt
   crossPrompt <- loadCrossPlatformOwnerContext message
   let openingConstraint = requestedOpeningSystemPrompt input.text

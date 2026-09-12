@@ -29,6 +29,7 @@ module Bot.Effect.ChatDriver
   , mentionUser
   , setMemberTitle
   , setTyping
+  , rememberRosterTriggers
   , incomingMessages
   , runChatDriverWithHandler
   , chatDriverEffectHandler
@@ -124,6 +125,10 @@ data ChatDriver :: Effect where
   SetTyping
     :: IncomingMessage
     -> Int
+    -> ChatDriver m ()
+  RememberRosterTriggers
+    :: IncomingMessage
+    -> [Text]
     -> ChatDriver m ()
   IncomingMessages
     :: ChatDriver m (Stream (Of IncomingMessage) m ())
@@ -223,6 +228,12 @@ setTyping :: ChatDriver :> es => IncomingMessage -> Int -> Eff es ()
 setTyping message timeout =
   send (SetTyping message timeout)
 
+-- | Remember this chat's roster trigger words, so a relay step that runs later (the
+-- QQ mirror of a bridged reply) can make the same prefix decision the reply made.
+rememberRosterTriggers :: ChatDriver :> es => IncomingMessage -> [Text] -> Eff es ()
+rememberRosterTriggers message triggers =
+  send (RememberRosterTriggers message triggers)
+
 incomingMessages :: ChatDriver :> es => Stream (Of IncomingMessage) (Eff es) ()
 incomingMessages = do
   stream <- lift (send IncomingMessages)
@@ -279,6 +290,8 @@ chatDriverEffectHandler driver _ = \case
     Driver.setMemberTitle driver message userId title
   SetTyping message timeout ->
     Driver.setTyping driver message timeout
+  RememberRosterTriggers message triggers ->
+    Driver.rememberRosterTriggers driver message triggers
   IncomingMessages ->
     pure (pure ())
 

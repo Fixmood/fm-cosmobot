@@ -112,6 +112,14 @@ class ChatDriver driver where
   setTyping _ _ _ =
     pure ()
 
+  -- | Remember this chat's roster trigger words. A bridged reply is delivered twice
+  -- (the Matrix room, then the QQ mirror), so the relay needs the same words to make
+  -- the same prefix decision the reply already made. Drivers that cannot relay keep
+  -- the no-op default.
+  rememberRosterTriggers :: ChatDriverEffects driver es => driver -> IncomingMessage -> [Text] -> Eff es ()
+  rememberRosterTriggers _ _ _ =
+    pure ()
+
 uploadFileName :: FilePath -> Maybe Text -> Text
 uploadFileName path requested =
   fromMaybe fallback (requested >>= nonEmptyBaseName)

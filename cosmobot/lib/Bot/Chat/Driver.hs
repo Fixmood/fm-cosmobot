@@ -11,6 +11,7 @@ module Bot.Chat.Driver
   ( runChatDrivers
   , takeBridgeReplyBody
   , mentionDeliveryFailureText
+  , rosterTriggerKey
   )
 where
 
@@ -62,6 +63,7 @@ data ChatDrivers = ChatDrivers
   , acpState :: !ACP.AcpState
   , bridgeReplyBodies :: !(IORef.IORef (Map MessageId Text))
   , recentQQDeliveries :: !(IORef.IORef (Map Text [RecentQQDelivery]))
+  , rosterTriggers :: !(IORef.IORef (Map Text [Text]))
   }
 
 data RecentQQDelivery = RecentQQDelivery
@@ -233,8 +235,9 @@ instance ChatDriver ChatDrivers where
         case result of
           Left{} -> pure result
           Right matrixMessageId -> do
+            triggers <- relayRosterTriggers drivers message
             qqResult <- withQQBridgeDriver drivers message \driver target ->
-              replyAudio driver target audioRef (FMBridge.fmReplyRelayBodyForRequest message.text <$> caption)
+              replyAudio driver target audioRef (FMBridge.fmReplyRelayBodyForRequestWith triggers message.text <$> caption)
             for_ (leftToMaybe (qqResult :: Either Text MessageId)) \err ->
               logWarning [i|QQ copy of the audio reply was not delivered: #{err}|]
             let qqMessageIds = rights [qqResult :: Either Text MessageId]
@@ -389,6 +392,11 @@ instance ChatDriver ChatDrivers where
     withMessageDriver drivers message \driver ->
       setMemberTitle driver message userId title
 
+  rememberRosterTriggers drivers message triggers =
+    unless (null triggers) $
+      liftIO $ IORef.atomicModifyIORef' drivers.rosterTriggers \stored ->
+        (Map.insert (rosterTriggerKey message) triggers stored, ())
+
   setTyping drivers message timeoutMillis
     | FMBridge.usesMatrixReplyPipeline message =
         withMatrixBridgeDriver drivers message \driver target ->
@@ -423,9 +431,10 @@ sendQQBridgeReplies
   -> IncomingMessage
   -> Text
   -> Eff es [Either Text MessageId]
-sendQQBridgeReplies drivers message body =
+sendQQBridgeReplies drivers message body = do
+  triggers <- relayRosterTriggers drivers message
   withQQBridgeDriver drivers message \driver target ->
-        sendReplyMessages driver target (FMBridge.fmReplyRelayBodyForRequest message.text body)
+        sendReplyMessages driver target (FMBridge.fmReplyRelayBodyForRequestWith triggers message.text body)
 
 takeBridgeReplyBody
   :: IORef.IORef (Map MessageId Text)
@@ -617,6 +626,7 @@ runChatDrivers qqConfig telegramConfig matrixConfig discordConfig rpcConfig rpcS
   discord <- traverse Discord.newDiscordDriver discordConfig
   bridgeReplyBodies <- liftIO (IORef.newIORef Map.empty)
   recentQQDeliveries <- liftIO (IORef.newIORef Map.empty)
+  rosterTriggers <- liftIO (IORef.newIORef Map.empty)
   let drivers = ChatDrivers
         { qq
         , telegram
@@ -628,6 +638,7 @@ runChatDrivers qqConfig telegramConfig matrixConfig discordConfig rpcConfig rpcS
         , acpState
         , bridgeReplyBodies
         , recentQQDeliveries
+        , rosterTriggers
         }
   if hasConfiguredChatDriver drivers
     then runChatDriversWith drivers action
@@ -822,3 +833,14 @@ normalizeJsonMediaUrls normalizePlatformMediaRef = \case
 mentionDeliveryFailureText :: Text -> Text
 mentionDeliveryFailureText err =
   [i|The mention did not reach QQ (#{err}). Only the Matrix copy was sent, so a bot that reacts to a mention or to a leading trigger word will not answer. Send a normal plain-text reply instead.|]
+
+-- | Cache key for a chat's roster triggers. Platform plus chat id is exactly what
+-- the memory scope is derived from, and the relay sees the same incoming message.
+rosterTriggerKey :: IncomingMessage -> Text
+rosterTriggerKey message =
+  Text.pack (show (message.platform, message.chatId))
+
+-- | The roster triggers remembered for this chat, if an agent run has stored them.
+relayRosterTriggers :: IOE :> es => ChatDrivers -> IncomingMessage -> Eff es [Text]
+relayRosterTriggers drivers message =
+  Map.findWithDefault [] (rosterTriggerKey message) <$> liftIO (IORef.readIORef drivers.rosterTriggers)

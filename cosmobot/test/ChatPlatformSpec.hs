@@ -317,6 +317,15 @@ testFmMatrixOwnerUsesQqContext = do
   Text.isInfixOf "plain-text" (ChatDriver.mentionDeliveryFailureText "no message id") @?= True
   Text.isInfixOf "retcode" (QQ.qqResponseSummary (Just (Aeson.object ["retcode" Aeson..= (100 :: Int)]))) @?= True
   QQ.qqResponseSummary Nothing @?= "no response data"
+
+  -- The QQ mirror of a bridged reply must use the roster triggers the reply itself
+  -- used. The relay only ever sees the marker-less body: the [[bare]] marker is
+  -- consumed by the streaming chunk builder upstream, which is why the roster has
+  -- to reach the relay too. Reported live: "fm 你叫一下 krkr 出来冒个泡" was
+  -- answered "krkr 出来冒个泡…", Matrix showed it unprefixed and QQ showed
+  -- "😻 FM： krkr …", so krkr's leading-word trigger could not fire.
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你叫一下 krkr 出来冒个泡" "krkr 出来冒个泡呗！") @?= False
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith [] "fm 你叫一下 krkr 出来冒个泡" "krkr 出来冒个泡呗！") @?= True
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"
