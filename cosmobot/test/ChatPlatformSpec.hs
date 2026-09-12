@@ -234,6 +234,16 @@ testFmMatrixOwnerUsesQqContext = do
   FMBridge.fmReplyRelayBodyForRequest "fm 直接说：大家好" "先打个招呼：大家好" @?= "大家好"
   FMBridge.fmReplyRelayBodyForRequest "fm 只输出结果" "😻 FM：结果" @?= "结果"
   FMBridge.fmReplyRelayBodyForRequest "fm 不要加前缀" "😻 FM：结果" @?= "结果"
+  -- The model can decide for itself not to carry the prefix by leading with the
+  -- internal marker. The marker must never reach the user, and only a marker at
+  -- the head of the body suppresses the prefix.
+  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]\n结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]😻 FM：结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 直接说：大家好" "[[bare]]先打个招呼：大家好" @?= "大家好"
+  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "结果里提到 [[bare]] 这个词" @?= "😻 FM：结果里提到  这个词"
+  FMBridge.fmReplyBody "[[bare]]结果" @?= "结果"
+  FMBridge.fmReplyBody "普通结果" @?= "😻 FM：普通结果"
   for_ ["fm 你好", "fm 查一下我的成绩", "这个开头怎么样"] $ \request ->
     FMBridge.fmReplyRelayBodyForRequest request "结果" @?= "😻 FM：结果"
   FMBridge.fmReplyRelayBody "😻 FM：[FM/赛文·极速联赛] [日期2026-08-26] 《标题》 [字数2]\n正文\n-----第650107段-FM发文"

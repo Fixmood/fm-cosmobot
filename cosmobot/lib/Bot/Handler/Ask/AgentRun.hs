@@ -709,7 +709,12 @@ streamingReplyChunksForRequest request reply
   | Text.length reply < longReplyStreamingThreshold = [FMBridge.fmReplyRelayBodyForRequest request reply]
   | otherwise =
       let requiredOpeningChars = maybe 0 Text.length (FMBridge.requestedReplyOpening request)
-          (initial, rest) = Text.splitAt (max initialReplyChars requiredOpeningChars) reply
+          -- Keep a leading bare marker inside the first chunk; otherwise the split
+          -- would hide it from the prefixing step and leak it to the user.
+          requiredHeadChars
+            | FMBridge.bareReplyMarker `Text.isPrefixOf` reply = Text.length FMBridge.bareReplyMarker + initialReplyChars
+            | otherwise = initialReplyChars
+          (initial, rest) = Text.splitAt (max requiredHeadChars requiredOpeningChars) reply
       in FMBridge.fmReplyRelayBodyForRequest request initial : textChunksOf matrixLikeEditChunkChars rest
 
 longReplyStreamingThreshold :: Int

@@ -19,6 +19,8 @@ module Bot.Chat.Bridge.FM
   , requestedReplyOpening
   , enforceRequestedReplyOpening
   , fmReplyBody
+  , bareReplyMarker
+  , stripBareReplyMarker
   , fmStandaloneMessage
   , FMTakeoverAddress (..)
   , FMTakeoverState (..)
@@ -413,8 +415,9 @@ fmReplyRelayBody = fmReplyRelayBodyForRequest ""
 fmReplyRelayBodyForRequest :: Text -> Text -> Text
 fmReplyRelayBodyForRequest request body =
   let ReplyBody.ReplyContent{text, images} = ReplyBody.replyContentFromBody body
-      cleanText = stripReplyPrefix text
-      suppressPrefix = requestsDirectOpening request
+      (markedBare, unmarkedText) = stripBareReplyMarker text
+      cleanText = stripReplyPrefix unmarkedText
+      suppressPrefix = requestsDirectOpening request || markedBare
       constrainedText = enforceRequestedReplyOpening request cleanText
       prefixedText =
         if Text.null (Text.strip text)
@@ -522,8 +525,9 @@ openingJoiner opening reply
 
 fmReplyBody :: Text -> Text
 fmReplyBody body =
-  let cleanBody = stripReplyPrefix body
-  in if isTypingPracticeBody cleanBody then cleanBody else "😻 FM：" <> cleanBody
+  let (markedBare, unmarkedBody) = stripBareReplyMarker body
+      cleanBody = stripReplyPrefix unmarkedBody
+  in if isTypingPracticeBody cleanBody || markedBare then cleanBody else "😻 FM：" <> cleanBody
 
 isTypingPracticeBody :: Text -> Bool
 isTypingPracticeBody body =
@@ -582,6 +586,19 @@ markFMAgentReply message =
 isFMAgentReply :: IncomingMessage -> Bool
 isFMAgentReply message =
   agentReplyMarker `elem` message.chatAliases
+
+-- | The model may lead its reply with this internal marker to say "do not add
+-- the 😻 FM： prefix this time". It is removed before delivery and never
+-- reaches a user. Only a marker at the head of the body suppresses the prefix;
+-- a marker mentioned inside the text is still removed so it cannot leak.
+bareReplyMarker :: Text
+bareReplyMarker = "[[bare]]"
+
+stripBareReplyMarker :: Text -> (Bool, Text)
+stripBareReplyMarker value =
+  let atHead = bareReplyMarker `Text.isPrefixOf` Text.stripStart value
+      without = Text.replace bareReplyMarker "" value
+  in (atHead, if atHead then Text.stripStart without else without)
 
 stripReplyPrefix :: Text -> Text
 stripReplyPrefix value =
