@@ -105,7 +105,129 @@ jobs:
       # on purpose: they are aligned for GHC 9.10, and building from upstream pins
       # instead is what kept this job red while production built fine.
       - name: Build
-        run: cabal build --project-file=cabal.project.production cosmobot cosmocode -j all
+        id: build
+        run: cabal build --project-file=cabal.project.production cosmobot cosmocode --enable-tests -j all
 
-      - name: Test
-        run: cabal test --project-file=cabal.project.production cosmobot -j all --test-options=--hide-successes
+      # The suite list below must match cosmobot/cosmobot.cabal. Regenerating it by
+      # hand is what let this job drift away from what production builds, so the
+      # mismatch is a failure, not a warning.
+      - name: Suite list matches cosmobot.cabal
+        run: |
+          grep -E '^test-suite ' cosmobot/cosmobot.cabal | awk '{print $2}' | sort > /tmp/actual.txt
+          sort .github/test-suites.txt > /tmp/expected.txt
+          if ! diff -u /tmp/expected.txt /tmp/actual.txt; then
+            echo "cosmobot.cabal and .github/test-suites.txt disagree."
+            echo "Add the suite to both, and add a step for it below,"
+            echo "otherwise CI silently stops covering it."
+            exit 1
+          fi
+      - name: 'test: filter-spec'
+        id: s01
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot filter-spec --test-options=--hide-successes
+      - name: 'test: scratchpad-spec'
+        id: s02
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot scratchpad-spec --test-options=--hide-successes
+      - name: 'test: media-handler-spec'
+        id: s03
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot media-handler-spec --test-options=--hide-successes
+      - name: 'test: chat-platform-spec'
+        id: s04
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot chat-platform-spec --test-options=--hide-successes
+      - name: 'test: config-spec'
+        id: s05
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot config-spec --test-options=--hide-successes
+      - name: 'test: scheduler-spec'
+        id: s06
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot scheduler-spec --test-options=--hide-successes
+      - name: 'test: stream-spec'
+        id: s07
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot stream-spec --test-options=--hide-successes
+      - name: 'test: concurrency-spec'
+        id: s08
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot concurrency-spec --test-options=--hide-successes
+      - name: 'test: resource-spec'
+        id: s09
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot resource-spec --test-options=--hide-successes
+      - name: 'test: agent-spec'
+        id: s10
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot agent-spec --test-options=--hide-successes
+      - name: 'test: program-spec'
+        id: s11
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot program-spec --test-options=--hide-successes
+      - name: 'test: failure-spec'
+        id: s12
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot failure-spec --test-options=--hide-successes
+      - name: 'test: llm-retry-spec'
+        id: s13
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot llm-retry-spec --test-options=--hide-successes
+      - name: 'test: rpc-spec'
+        id: s14
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot rpc-spec --test-options=--hide-successes
+      - name: 'test: acp-spec'
+        id: s15
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot acp-spec --test-options=--hide-successes
+      - name: 'test: llm-openai-config-spec'
+        id: s16
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot llm-openai-config-spec --test-options=--hide-successes
+      - name: 'test: chat-log-spec'
+        id: s17
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot chat-log-spec --test-options=--hide-successes
+      - name: 'test: typing-spec'
+        id: s18
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot typing-spec --test-options=--hide-successes
+      - name: 'test: admin-spec'
+        id: s19
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot admin-spec --test-options=--hide-successes
+      - name: 'test: shutup-spec'
+        id: s20
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot shutup-spec --test-options=--hide-successes
+      - name: 'test: safebooru-spec'
+        id: s21
+        if: steps.build.outcome == 'success'
+        run: cabal test --project-file=cabal.project.production cosmobot safebooru-spec --test-options=--hide-successes
+      - name: Which suites failed
+        if: failure()
+        run: |
+          echo "step outcomes:"
+          echo '  filter-spec              ${{ steps.s01.outcome }}'
+          echo '  scratchpad-spec          ${{ steps.s02.outcome }}'
+          echo '  media-handler-spec       ${{ steps.s03.outcome }}'
+          echo '  chat-platform-spec       ${{ steps.s04.outcome }}'
+          echo '  config-spec              ${{ steps.s05.outcome }}'
+          echo '  scheduler-spec           ${{ steps.s06.outcome }}'
+          echo '  stream-spec              ${{ steps.s07.outcome }}'
+          echo '  concurrency-spec         ${{ steps.s08.outcome }}'
+          echo '  resource-spec            ${{ steps.s09.outcome }}'
+          echo '  agent-spec               ${{ steps.s10.outcome }}'
+          echo '  program-spec             ${{ steps.s11.outcome }}'
+          echo '  failure-spec             ${{ steps.s12.outcome }}'
+          echo '  llm-retry-spec           ${{ steps.s13.outcome }}'
+          echo '  rpc-spec                 ${{ steps.s14.outcome }}'
+          echo '  acp-spec                 ${{ steps.s15.outcome }}'
+          echo '  llm-openai-config-spec   ${{ steps.s16.outcome }}'
+          echo '  chat-log-spec            ${{ steps.s17.outcome }}'
+          echo '  typing-spec              ${{ steps.s18.outcome }}'
+          echo '  admin-spec               ${{ steps.s19.outcome }}'
+          echo '  shutup-spec              ${{ steps.s20.outcome }}'
+          echo '  safebooru-spec           ${{ steps.s21.outcome }}'
+          echo "See the step list above for the failing suite."
