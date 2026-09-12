@@ -430,13 +430,16 @@ fmReplyRelayBodyForRequestWith triggers request body =
       (markedBare, unmarkedText) = stripBareReplyMarker text
       cleanText = stripReplyPrefix unmarkedText
       rosterCommand = startsWithRosterTrigger triggers cleanText
+      rosterMentioned = mentionsRosterTrigger triggers request
       suppressPrefix =
-        -- A reply that opens with a registered trigger word is addressed to that bot.
-        -- FM's "😻 FM：" prefix would sit in front of the trigger and the summoned bot
-        -- could never fire, so this stands on its own: the mirrored body keeps no
-        -- [[bare]] marker (the streaming layer consumes it) and the request need not
-        -- say "叫一下" for FM to end up talking to a bot.
+        -- While FM is dealing with a bot, the QQ copy carries no prefix. Two ways a
+        -- turn counts: the reply opens with that bot's trigger word (a prefix there
+        -- would hide the trigger and the bot could never fire), or the request names
+        -- the bot (the rest of the exchange belongs to that conversation). The mirrored
+        -- body keeps no [[bare]] marker - the streaming layer consumes it - so the
+        -- request is the only surviving signal for the follow-up messages.
         rosterCommand
+          || rosterMentioned
           || requestsDirectOpening request
           || (markedBare && requestsBareDelivery request)
       constrainedText = enforceRequestedReplyOpening request cleanText
@@ -455,6 +458,14 @@ registeredTriggerWords memory =
   , let word = Text.strip (Text.takeWhile (/= '」') chunk)
   , not (Text.null word)
   ]
+
+-- | Does the request name one of this chat's registered bots? The owner's rule:
+-- while the turn is about a bot, the QQ copy must not carry FM's prefix, wherever in
+-- the reply the bot's name happens to fall.
+mentionsRosterTrigger :: [Text] -> Text -> Bool
+mentionsRosterTrigger triggers request =
+  let clean = Text.toCaseFold (Text.strip request)
+  in any (\trigger -> not (Text.null trigger) && Text.toCaseFold trigger `Text.isInfixOf` clean) triggers
 
 startsWithRosterTrigger :: [Text] -> Text -> Bool
 startsWithRosterTrigger triggers body =

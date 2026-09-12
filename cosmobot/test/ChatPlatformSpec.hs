@@ -333,8 +333,15 @@ testFmMatrixOwnerUsesQqContext = do
   -- no marker left.
   Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你出个问题考考krkr" "krkr 出个题考考你～ 有一家人要过河") @?= False
   Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你再问一次" "krkr 再问你一次哈～ 有一家人要过河") @?= False
-  -- ...but a reply that is not addressed to a bot keeps FM's mark.
-  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你和krkr对话的时候不能带前缀" "记进小本本了 Fix哥！！") @?= True
+  -- A turn ABOUT a bot counts even when the reply does not open with its trigger: the
+  -- follow-up chatter of a bot exchange carries no prefix either. Reported live in group
+  -- 776227233 (the 小二 group, whose roster holds 小二): "fm 问小二一个很难的问题" produced
+  -- "😻 FM： 题已经甩过去了！..." and "fm 你和krkr对话的时候不能带前缀" produced
+  -- "😻 FM： 记进小本本了 Fix哥！！".
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["小二"] "fm 问小二一个很难的问题" "题已经甩过去了！用了真 @ 精准命中小二") @?= False
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 你和krkr对话的时候不能带前缀" "记进小本本了 Fix哥！！") @?= False
+  -- ...but chatter that has nothing to do with a bot keeps FM's mark.
+  Text.isInfixOf "😻 FM：" (FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 用一句话说说今天的天气" "今天晴，风不大") @?= True
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"

@@ -433,7 +433,7 @@ sendQQBridgeReplies
   -> Eff es [Either Text MessageId]
 sendQQBridgeReplies drivers message body = do
   triggers <- relayRosterTriggers drivers message
-  logInfo [i|QQ bridge relay: #{length triggers} roster trigger(s) remembered for this chat|]
+  logInfo [i|QQ bridge relay for #{rosterTriggerKey message}: #{length triggers} roster trigger(s) remembered|]
   withQQBridgeDriver drivers message \driver target ->
         sendReplyMessages driver target (FMBridge.fmReplyRelayBodyForRequestWith triggers message.text body)
 
