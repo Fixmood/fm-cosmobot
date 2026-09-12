@@ -418,13 +418,31 @@ fmReplyRelayBodyForRequest request body =
   let ReplyBody.ReplyContent{text, images} = ReplyBody.replyContentFromBody body
       (markedBare, unmarkedText) = stripBareReplyMarker text
       cleanText = stripReplyPrefix unmarkedText
-      suppressPrefix = requestsDirectOpening request || markedBare
+      suppressPrefix = requestsDirectOpening request || (markedBare && requestsBareDelivery request)
       constrainedText = enforceRequestedReplyOpening request cleanText
       prefixedText =
         if Text.null (Text.strip text)
           then ""
           else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else "😻 FM：" <> constrainedText
   in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
+
+-- | Whether the user actually asked for a bare/direct delivery in this request
+-- (no prefix), or asked us to summon a bot that triggers on a plain first-word
+-- command. The [[bare]] marker is honoured only when one of these holds:
+-- the model sometimes volunteers the marker on an ordinary question, and that
+-- silently drops the "😻 FM：" prefix from a normal answer.
+requestsBareDelivery :: Text -> Bool
+requestsBareDelivery request =
+  let clean = Text.toCaseFold (Text.strip request)
+  in any (`Text.isInfixOf` clean)
+       [ "别带", "别加", "别写", "别说"
+       , "不要", "不用", "无需", "不必"
+       , "裸", "直接", "原样", "照原"
+       , "只要", "只需", "只回", "只发", "只给", "只说", "只输出"
+       , "前缀", "旁白"
+       , "触发", "召唤"
+       , "叫出来", "叫出", "叫一下", "叫下", "喊出来", "喊出", "拉出来", "弄出来"
+       ]
 
 requestsDirectOpening :: Text -> Bool
 requestsDirectOpening request =

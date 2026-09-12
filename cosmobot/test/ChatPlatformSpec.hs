@@ -243,13 +243,23 @@ testFmMatrixOwnerUsesQqContext = do
   -- The model can decide for itself not to carry the prefix by leading with the
   -- internal marker. The marker must never reach the user, and only a marker at
   -- the head of the body suppresses the prefix.
-  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]结果" @?= "结果"
-  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]\n结果" @?= "结果"
-  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]😻 FM：结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 别带前缀" "[[bare]]结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 不要前缀，只要结果" "[[bare]]\n结果" @?= "结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm 只要结果" "[[bare]]😻 FM：结果" @?= "结果"
   FMBridge.fmReplyRelayBodyForRequest "fm 直接说：大家好" "[[bare]]先打个招呼：大家好" @?= "大家好"
   FMBridge.fmReplyRelayBodyForRequest "fm 你好" "结果里提到 [[bare]] 这个词" @?= "😻 FM：结果里提到  这个词"
   FMBridge.fmReplyBody "[[bare]]结果" @?= "结果"
   FMBridge.fmReplyBody "普通结果" @?= "😻 FM：普通结果"
+  -- A marker the model volunteered on an ordinary question must be ignored.
+  FMBridge.fmReplyRelayBodyForRequest "fm 你好" "[[bare]]结果" @?= "😻 FM：结果"
+  FMBridge.fmReplyRelayBodyForRequest "fm Hindi 是什么语？" "[[bare]]子寻你这问题一抛" @?= "😻 FM：子寻你这问题一抛"
+  FMBridge.fmReplyRelayBodyForRequest "fm 查一下今天的天气" "[[bare]]今天晴" @?= "😻 FM：今天晴"
+  -- Real requests still suppress the prefix.
+  FMBridge.fmReplyRelayBodyForRequest "fm 别带前缀，回一句：群测通过" "[[bare]]群测通过" @?= "群测通过"
+  FMBridge.fmReplyRelayBodyForRequest "fm 不要加其它旁白，只告诉我今天是几号" "[[bare]]今天是几号" @?= "今天是几号"
+  FMBridge.fmReplyRelayBodyForRequest "fm 不要加前缀，说一句测试" "[[bare]]测试" @?= "测试"
+  -- Summoning a bot that triggers on a plain first word still works.
+  FMBridge.fmReplyRelayBodyForRequest "fm 把fw叫出来" "[[bare]]fw 快出来" @?= "fw 快出来"
   FMBridge.fmMentionBody "hi" @?= "hi"
   FMBridge.fmMentionBody "菜单" @?= "菜单"
   FMBridge.fmMentionBody "😻 FM：hi" @?= "hi"
