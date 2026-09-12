@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-latency-20260912` (built from commit `3d1d986`)
+- image `fm-cosmobot:runtime-flushfix-20260912` (built from commit `16ac220`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -273,6 +273,19 @@ Two traps found the hard way on 2026-09-12:
   140+ characters, and cap command waits at 20s while a watcher thread posts the
   output when the command ends. Keep the requested-opening exception: that
   constraint is enforced on the completed reply.
+- Two traps cost real time on the latency work, both about *observing* rather
+  than coding. First, the early flush looked broken in every RPC probe because
+  RPC (like Matrix and Telegram) uses an editable output policy: the second part
+  is an edit of the first message, so history shows one message either way. Only
+  QQ chunks into separate messages. Log the event instead of inferring it from a
+  channel that hides it. Second, the predicate demanded a sentence end in Chinese
+  punctuation only, which meant an English answer never flushed at all.
+- When a release changes behaviour on purpose, the tests that pinned the old
+  behaviour move with it. The quiet-notice release silenced `send_reply` and
+  `user_avatar`, and six agent-spec expectations kept demanding their notices -
+  and the run's own log kept only its last thirty lines, so a failing suite could
+  hide behind another suite's noise. Read the whole log, or the count of failing
+  suites is a guess.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
