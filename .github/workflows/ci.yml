@@ -126,127 +126,127 @@ jobs:
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot filter-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-filter-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:filter-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-filter-spec.txt
       - name: 'test: scratchpad-spec'
         id: s02
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot scratchpad-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-scratchpad-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:scratchpad-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-scratchpad-spec.txt
       - name: 'test: media-handler-spec'
         id: s03
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot media-handler-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-media-handler-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:media-handler-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-media-handler-spec.txt
       - name: 'test: chat-platform-spec'
         id: s04
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot chat-platform-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-chat-platform-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:chat-platform-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-chat-platform-spec.txt
       - name: 'test: config-spec'
         id: s05
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot config-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-config-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:config-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-config-spec.txt
       - name: 'test: scheduler-spec'
         id: s06
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot scheduler-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-scheduler-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:scheduler-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-scheduler-spec.txt
       - name: 'test: stream-spec'
         id: s07
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot stream-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-stream-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:stream-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-stream-spec.txt
       - name: 'test: concurrency-spec'
         id: s08
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot concurrency-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-concurrency-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:concurrency-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-concurrency-spec.txt
       - name: 'test: resource-spec'
         id: s09
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot resource-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-resource-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:resource-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-resource-spec.txt
       - name: 'test: agent-spec'
         id: s10
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot agent-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-agent-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:agent-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-agent-spec.txt
       - name: 'test: program-spec'
         id: s11
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot program-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-program-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:program-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-program-spec.txt
       - name: 'test: failure-spec'
         id: s12
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot failure-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-failure-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:failure-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-failure-spec.txt
       - name: 'test: llm-retry-spec'
         id: s13
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot llm-retry-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-llm-retry-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:llm-retry-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-llm-retry-spec.txt
       - name: 'test: rpc-spec'
         id: s14
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot rpc-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-rpc-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:rpc-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-rpc-spec.txt
       - name: 'test: acp-spec'
         id: s15
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot acp-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-acp-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:acp-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-acp-spec.txt
       - name: 'test: llm-openai-config-spec'
         id: s16
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot llm-openai-config-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-llm-openai-config-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:llm-openai-config-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-llm-openai-config-spec.txt
       - name: 'test: chat-log-spec'
         id: s17
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot chat-log-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-chat-log-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:chat-log-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-chat-log-spec.txt
       - name: 'test: typing-spec'
         id: s18
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot typing-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-typing-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:typing-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-typing-spec.txt
       - name: 'test: admin-spec'
         id: s19
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot admin-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-admin-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:admin-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-admin-spec.txt
       - name: 'test: shutup-spec'
         id: s20
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot shutup-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-shutup-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:shutup-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-shutup-spec.txt
       - name: 'test: safebooru-spec'
         id: s21
         # !cancelled() stops GitHub applying its implicit success() to this
         # condition: without it, one failing suite skipped all the later ones.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cabal test --project-file=cabal.project.production cosmobot safebooru-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-safebooru-spec.txt
+        run: cabal test --project-file=cabal.project.production cosmobot:safebooru-spec --test-options=--hide-successes --test-show-details=direct 2>&1 | tee /tmp/out-safebooru-spec.txt
       # Annotations are readable without a token, unlike this job's log.
       - name: Report failing tests as annotations
         if: ${{ !cancelled() && failure() }}

@@ -5,6 +5,7 @@ import qualified Bot.Chat.Driver.Types as Driver
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Storage.SQLite as StorageSQLite
 import qualified Data.Aeson as Aeson
+import Data.Unique (hashUnique, newUnique)
 import Bot.Core.Route
 import Bot.Handler.Scratchpad
 import Bot.Core.Message
@@ -120,9 +121,33 @@ withScratchpadStore label action =
 withScratchpadPath :: (Concurrent :> es, FileSystem :> es, IOE :> es) => String -> (FilePath -> Eff es ()) -> Eff es ()
 withScratchpadPath label action = do
   tmp <- getTemporaryDirectory
-  let path = tmp </> ("cosmobot-scratchpad-spec-" <> label <> ".sqlite")
-  removeFile path `catch` \(_ :: IOException) -> pure ()
-  action path
+  root <- createScratchpadRoot tmp label
+  bracket
+    (pure root)
+    removePathForcibly
+    \dir -> action (dir </> "scratchpad.sqlite")
+
+-- | Reserve a directory that no other run of this suite can be holding.
+--
+-- This spec used to write @\/tmp\/cosmobot-scratchpad-spec-<label>.sqlite@ and
+-- delete only that one file, so every run on the machine shared a path. When
+-- two runs overlapped, one unlinked the database out from under the other and
+-- SQLite answered the loser with @ErrorBusy: database is locked@, or with
+-- @ErrorIO: disk I/O error@ once the file it held had been replaced. Removing
+-- the whole directory also takes the @-wal@ and @-shm@ sidecars with it, which
+-- the single @removeFile@ left behind.
+createScratchpadRoot :: (FileSystem :> es, IOE :> es) => FilePath -> String -> Eff es FilePath
+createScratchpadRoot tmp label = go (0 :: Int)
+  where
+    go attempt = do
+      unique <- liftIO (hashUnique <$> newUnique)
+      let root = tmp </> ("cosmobot-scratchpad-spec-" <> label <> "-" <> show unique <> "-" <> show attempt)
+      created <- trySync (createDirectory root)
+      case created of
+        Right () -> pure root
+        Left (_ :: SomeException)
+          | attempt < 64 -> go (attempt + 1)
+        Left err -> throwIO err
 
 runScratchpad :: (Concurrent :> es, IOE :> es, Prim :> es) => FilePath -> IORef.IORef [Text] -> IncomingMessage -> Eff es ()
 runScratchpad path replies incoming =
