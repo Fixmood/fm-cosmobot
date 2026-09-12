@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-rosterfirst-20260912` (built from commit `bc65f98`)
+- image `fm-cosmobot:runtime-botthread-20260912` (built from commit `345b76e`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -327,6 +327,15 @@ Two traps found the hard way on 2026-09-12:
   stripped by the streaming layer, so a relay rule of the form `markedBare && ...` is
   dead for every mirrored reply no matter what else is fixed. Either carry the signal
   forward or key the downstream rule on something that still exists.
+- Key a rule on the input that survives, not on the text the pipeline rewrites. A
+  bot-directed exchange is more than its first message: the follow-up chatter of a turn
+  that summons a bot is not addressed to that bot, yet it belongs to the conversation and
+  the owner reads a prefix on it as the same defect. The reply's own opening is rewritten
+  as it travels (markers consumed, prefixes stripped), so the request - which no stage
+  touches - is the reliable key.
+- A diagnostic must name the entity it is about. "1 roster trigger(s) remembered" without
+  the chat id cannot be traced back to a group, and the group is the whole question when
+  someone asks whether only one chat was fixed.
 - Corollary, paid for once: the previous release's live check looked green because the
   request itself said "直接发" (requestsDirectOpening). A check that passes for the
   wrong reason is not evidence - read which branch produced the result before calling a
