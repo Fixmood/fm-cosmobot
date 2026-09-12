@@ -1207,9 +1207,9 @@ testSendReplyToolUsesChatEffect = do
   (answer, _) <- runAgentWith answers (ChatMock (Just replies) (Just "42") Nothing) do
     runAgentWithToolMessageCapture 4 (agentContext{Agent.input = inputWithImages "再发一条消息" []}) AgentTools.defaultTools (startWithEnabledTools ["chat"] "再发一条消息") recorded remembered
   answer @?= "sent"
-  IORef.readIORef replies >>= (@?= ["😻 FM：正在调用 send_reply 工具…", "😻 FM：hello\n[image] https://example.test/image.png"])
-  IORef.readIORef recorded >>= (@?= ["😻 FM：正在调用 send_reply 工具…", "😻 FM：hello\n[image] https://example.test/image.png"])
-  IORef.readIORef remembered >>= (@?= [Just "42", Just "42"])
+  IORef.readIORef replies >>= (@?= ["😻 FM：hello\n[image] https://example.test/image.png"])
+  IORef.readIORef recorded >>= (@?= ["😻 FM：hello\n[image] https://example.test/image.png"])
+  IORef.readIORef remembered >>= (@?= [Just "42"])
 
 testToolReplyMiddlewareNormalizesReplyImages :: IO ()
 testToolReplyMiddlewareNormalizesReplyImages = do
@@ -1444,9 +1444,9 @@ testUserAvatarToolQueriesChatEffect = do
   Text.unlines (toolOutputs transcript) @?= jsonText avatar <> "\n"
   imageContextUrls transcript @?= ["https://example.test/avatar.jpg"]
   -- The avatar tool should emit the avatar as a chat image, not only return JSON to the model.
-  IORef.readIORef replies >>= (@?= ["😻 FM：正在调用 user_avatar 工具…", "[image] https://example.test/avatar.jpg"])
-  IORef.readIORef recorded >>= (@?= ["😻 FM：正在调用 user_avatar 工具…", "[image] https://example.test/avatar.jpg"])
-  IORef.readIORef remembered >>= (@?= [Just "44", Just "44"])
+  IORef.readIORef replies >>= (@?= ["[image] https://example.test/avatar.jpg"])
+  IORef.readIORef recorded >>= (@?= ["[image] https://example.test/avatar.jpg"])
+  IORef.readIORef remembered >>= (@?= [Just "44"])
 
 testUserAvatarToolRequiresUserId :: IO ()
 testUserAvatarToolRequiresUserId = do
@@ -1459,7 +1459,7 @@ testUserAvatarToolRequiresUserId = do
     runTestAgent 4 (agentContext{Agent.input = inputWithImages "看头像" []}) AgentTools.defaultTools (startWithEnabledTools ["chat"] "avatar?")
   answer @?= "rejected"
   Text.unlines (toolOutputs transcript) @?= "Error in $: key \"user_id\" not found\n"
-  IORef.readIORef replies >>= (@?= ["😻 FM：正在调用 user_avatar 工具…"])
+  IORef.readIORef replies >>= (@?= [])
 
 testUserAvatarToolRejectsZeroUserId :: IO ()
 testUserAvatarToolRejectsZeroUserId = do
@@ -1472,7 +1472,7 @@ testUserAvatarToolRejectsZeroUserId = do
     runTestAgent 4 (agentContext{Agent.input = inputWithImages "看头像" []}) AgentTools.defaultTools (startWithEnabledTools ["chat"] "avatar?")
   answer @?= "rejected"
   Text.unlines (toolOutputs transcript) @?= "Error in $: user_id must not be 0.\n"
-  IORef.readIORef replies >>= (@?= ["😻 FM：正在调用 user_avatar 工具…"])
+  IORef.readIORef replies >>= (@?= [])
 
 testTypstToImageToolRendersAndSendsImage :: IO ()
 testTypstToImageToolRendersAndSendsImage = do
