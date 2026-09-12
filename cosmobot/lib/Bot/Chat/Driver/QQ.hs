@@ -21,6 +21,7 @@ module Bot.Chat.Driver.QQ
   , readActionResponse
   , getUserAvatar
   , base64FileRef
+  , qqResponseSummary
   )
 where
 
@@ -627,24 +628,36 @@ mentionUserQQ driver message userId body =
     (ChatGroup, Just groupId, _)
       | Just numericUserId <- parseIntegerUserId userId -> do
         qqMessage <- mentionMessage message numericUserId body
-        maybe (Left "QQ group mention did not produce a message id.") (Right . integerMessageId) . responseMessageId <$> sendAction driver (Aeson.object
+        response <- sendAction driver (Aeson.object
           [ "action" Aeson..= Aeson.String "send_group_msg"
           , "params" Aeson..= Aeson.object
               [ "group_id" Aeson..= groupId
               , "message" Aeson..= qqMessage
               ]
           ])
+        case responseMessageId response of
+          Just messageId -> pure (Right (integerMessageId messageId))
+          Nothing -> do
+            logWarning [i|QQ group mention returned no message_id: #{qqResponseSummary response.data_}|]
+            pure (Left (qqMalformedMessageResponseText "send_group_msg"))
     (ChatPrivate, _, Just rawUserId)
       | Just userId_ <- parseIntegerUserId rawUserId -> do
       qqMessage <- replyMessage message body
-      maybe (Left "QQ private mention reply did not produce a message id.") (Right . integerMessageId) . responseMessageId <$> sendAction driver (Aeson.object
+      response <- sendAction driver (Aeson.object
         [ "action" Aeson..= Aeson.String "send_private_msg"
         , "params" Aeson..= Aeson.object
             [ "user_id" Aeson..= userId_
             , "message" Aeson..= qqMessage
             ]
         ])
-    _ -> pure (Left "QQ mention reply requires a QQ group id or private sender id.")
+      case responseMessageId response of
+        Just messageId -> pure (Right (integerMessageId messageId))
+        Nothing -> do
+          logWarning [i|QQ private mention returned no message_id: #{qqResponseSummary response.data_}|]
+          pure (Left (qqMalformedMessageResponseText "send_private_msg"))
+    _ -> do
+      logWarning "QQ mention was requested but the target chat has neither a group id nor a private sender id; nothing was sent."
+      pure (Left "QQ mention reply requires a QQ group id or private sender id.")
 
 -- | Send a file segment through OneBot without requiring a shared filesystem.
 uploadFileQQ
@@ -1913,3 +1926,9 @@ parseReplyId value =
     case value of
       Aeson.String text -> readMaybe (toString text)
       _ -> Nothing
+
+-- | Render an OneBot response payload for a log line, trimmed to a sane length.
+qqResponseSummary :: Maybe Aeson.Value -> Text
+qqResponseSummary = \case
+  Nothing -> "no response data"
+  Just value -> Text.take 300 (Text.pack (show value))

@@ -311,6 +311,12 @@ testFmMatrixOwnerUsesQqContext = do
   map (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunksForRequest ["krkr"] "fm 叫一次krkr" "krkr 冒个泡") @?= [False]
   map (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunksForRequest [] "fm 叫一次krkr" "krkr 冒个泡") @?= [True]
   map (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunksForRequest (FMBridge.registeredTriggerWords krkrRoster) "fm 叫一次krkr" "krkr 冒个泡") @?= [False]
+
+  -- A mention that only reached Matrix must never be reported as delivered.
+  Text.isInfixOf "did not reach QQ" (ChatDriver.mentionDeliveryFailureText "no message id") @?= True
+  Text.isInfixOf "plain-text" (ChatDriver.mentionDeliveryFailureText "no message id") @?= True
+  Text.isInfixOf "retcode" (QQ.qqResponseSummary (Just (Aeson.object ["retcode" Aeson..= (100 :: Int)]))) @?= True
+  QQ.qqResponseSummary Nothing @?= "no response data"
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"

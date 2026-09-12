@@ -10,6 +10,7 @@ Stability   : experimental
 module Bot.Chat.Driver
   ( runChatDrivers
   , takeBridgeReplyBody
+  , mentionDeliveryFailureText
   )
 where
 
@@ -234,6 +235,8 @@ instance ChatDriver ChatDrivers where
           Right matrixMessageId -> do
             qqResult <- withQQBridgeDriver drivers message \driver target ->
               replyAudio driver target audioRef (FMBridge.fmReplyRelayBodyForRequest message.text <$> caption)
+            for_ (leftToMaybe (qqResult :: Either Text MessageId)) \err ->
+              logWarning [i|QQ copy of the audio reply was not delivered: #{err}|]
             let qqMessageIds = rights [qqResult :: Either Text MessageId]
                 deliveryId = FMBridge.bridgeDeliveryMessageId matrixMessageId qqMessageIds
             recordRecentQQDeliveries drivers message (fromMaybe "" caption) [deliveryId]
@@ -253,6 +256,8 @@ instance ChatDriver ChatDrivers where
           Right matrixMessageId -> do
             qqResult <- withQQBridgeDriver drivers message \driver target ->
               uploadFile driver target path fileName
+            for_ (leftToMaybe (qqResult :: Either Text MessageId)) \err ->
+              logWarning [i|QQ copy of the file upload was not delivered: #{err}|]
             let qqMessageIds = rights [qqResult :: Either Text MessageId]
                 deliveryId = FMBridge.bridgeDeliveryMessageId matrixMessageId qqMessageIds
             recordRecentQQDeliveries drivers message "" [deliveryId]
@@ -363,10 +368,17 @@ instance ChatDriver ChatDrivers where
           Right matrixMessageId -> do
             qqResult <- withQQBridgeDriver drivers message \driver target ->
               mentionUser driver target userId (FMBridge.fmMentionBody body)
-            let qqMessageIds = rights [qqResult :: Either Text MessageId]
-                deliveryId = FMBridge.bridgeDeliveryMessageId matrixMessageId qqMessageIds
-            recordRecentQQDeliveries drivers message body [deliveryId]
-            pure (Right deliveryId)
+            case qqResult of
+              Right qqMessageId -> do
+                let deliveryId = FMBridge.bridgeDeliveryMessageId matrixMessageId [qqMessageId]
+                recordRecentQQDeliveries drivers message body [deliveryId]
+                pure (Right deliveryId)
+              Left err -> do
+                -- The Matrix copy is not the point of a mention: the QQ side is
+                -- where the mentioned bot lives, so report the failure instead of
+                -- telling the model the summon went out.
+                logWarning [i|QQ mention delivery failed: #{err}|]
+                pure (Left (mentionDeliveryFailureText err))
     | otherwise = do
         result <- withMessageDriver drivers message \driver ->
           mentionUser driver message userId (FMBridge.fmMentionBody body)
@@ -802,3 +814,11 @@ normalizeJsonMediaUrls normalizePlatformMediaRef = \case
 
     mediaUrlKeys =
       ["avatar_url", "image_url", "url"]
+
+-- | What the model is told when the QQ copy of a mention did not go out. A
+-- Matrix-only copy is worthless to a summon: the mentioned bot lives on QQ and
+-- never sees the Matrix room, so the tool must fail and let the model fall back
+-- to a plain-text reply that starts with that bot's trigger word.
+mentionDeliveryFailureText :: Text -> Text
+mentionDeliveryFailureText err =
+  [i|The mention did not reach QQ (#{err}). Only the Matrix copy was sent, so a bot that reacts to a mention or to a leading trigger word will not answer. Send a normal plain-text reply instead.|]
