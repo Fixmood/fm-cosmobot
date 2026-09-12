@@ -304,6 +304,13 @@ testFmMatrixOwnerUsesQqContext = do
   any (Text.isInfixOf "😻 FM：") (AgentRun.continuationReplyChunks tail200) @?= False
   -- ...while the first part of a reply still carries it.
   any (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunks tail200) @?= True
+  -- The roster the chat has in memory now reaches the relay directly: a summon
+  -- reply that opens with a registered first word is delivered without the prefix
+  -- even when the model volunteered no marker (the krkr regression), while the
+  -- same reply on an empty roster still gets it.
+  map (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunksForRequest ["krkr"] "fm 叫一次krkr" "krkr 冒个泡") @?= [False]
+  map (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunksForRequest [] "fm 叫一次krkr" "krkr 冒个泡") @?= [True]
+  map (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunksForRequest (FMBridge.registeredTriggerWords krkrRoster) "fm 叫一次krkr" "krkr 冒个泡") @?= [False]
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"

@@ -945,7 +945,7 @@ matrixUnauthenticatedCall
   -> (forall scheme. Url scheme -> Option scheme -> Req response)
   -> Eff es response
 matrixUnauthenticatedCall cfg method logMessage addOptions buildRequest = do
-  logInfo [i|Matrix API request: #{logMessage}|]
+  logDebug [i|Matrix API request: #{logMessage}|]
   withMatrixBaseUrl cfg.homeserver \baseUrl baseOptions ->
     matrixReq method $
       HTTP.runReqWithConfig matrixHttpConfig $
@@ -1196,7 +1196,7 @@ incomingMessages driver =
           let effectiveDirectRoomIds = refreshedDirectRoomIds <> probedDirectRoomIds
               events = syncEvents effectiveDirectRoomIds response
               directCount = Set.size effectiveDirectRoomIds
-          S.lift $ logInfo [i|Matrix sync batch: #{length events}; direct_rooms=#{directCount}|]
+          S.lift $ logDebug [i|Matrix sync batch: #{length events}; direct_rooms=#{directCount}|]
           for_ events \event -> do
             accessHandled <- S.lift (handleMatrixAccessCommand driver cfg event)
             unless accessHandled $

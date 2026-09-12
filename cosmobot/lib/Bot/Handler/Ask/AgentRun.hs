@@ -10,6 +10,7 @@ module Bot.Handler.Ask.AgentRun
   ( runAskAgentThread
   , askSystemPrompt
   , streamingReplyChunks
+  , streamingReplyChunksForRequest
   , earlyFlushDue
   , earlyFlushMinChars
   , continuationReplyChunks
@@ -97,6 +98,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
   systemPrompt <- askSystemPrompt cfg message
+  rosterTriggers <- loadRosterTriggers message
   (recentContextMessages, recentChatContext) <- loadRecentChatContext cfg message startedAt
   crossPrompt <- loadCrossPlatformOwnerContext message
   let openingConstraint = requestedOpeningSystemPrompt input.text
@@ -127,7 +129,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       selectedTools
       \runtime ->
         withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text requestTranscript \activeReply -> do
-          reply <- streamAgentReply runtime activeReply outputMessage requestTranscript
+          reply <- streamAgentReply runtime activeReply outputMessage requestTranscript rosterTriggers
           finishedAt <- liftIO getCurrentTime
           let replyResult = reply.result
               replyStatus = replyResult.status
@@ -354,6 +356,14 @@ privateAddressRule message
           "Final identity rule for this QQ private chat: the current user is not Fixmood's owner; never address this user as Fix哥, even if that name appears in prior messages, memory, or persona text. Use the user's own known name or a neutral natural address."
   | otherwise = ""
 
+-- | First-word summon triggers this chat has on its bot roster. Written there
+-- by the bot-roster skill; reading it here is what makes "answer without the
+-- speaker prefix so the other bot's trigger still fires" a property of the code
+-- instead of something the model has to remember to mark up.
+loadRosterTriggers :: Memory.Memory :> es => IncomingMessage -> Eff es [Text]
+loadRosterTriggers message =
+  maybe [] FMBridge.registeredTriggerWords <$> loadScopedMemory (MemoryStore.chatMemoryScope message)
+
 loadScopedMemory :: Memory.Memory :> es => Either Text MemoryStore.MemoryScope -> Eff es (Maybe Text)
 loadScopedMemory =
   either (const (pure Nothing)) Memory.loadMemory
@@ -410,8 +420,9 @@ streamAgentReply
   -> ActiveReplyState
   -> IncomingMessage
   -> Transcript
+  -> [Text]
   -> Eff es AgentReply
-streamAgentReply runtime activeReply message transcript =
+streamAgentReply runtime activeReply message transcript triggers =
   do
     let sink = Agent.ToolEmittedMessageSink (rememberToolEmittedMessage activeReply)
         program =
@@ -424,7 +435,7 @@ streamAgentReply runtime activeReply message transcript =
     (lastReply, replyResult) <-
       S.mapM_
         (recordReplyUpdate activeReply)
-        (Chat.streamMultipleRepliesTo message (agentReplyTextSegments message.text (autoContinuingAgentStream program message transcript)))
+        (Chat.streamMultipleRepliesTo message (agentReplyTextSegments message.text triggers (autoContinuingAgentStream program message transcript)))
     let responseId = lastReply.responseId
         (answer, result) = replyResult
         correctedResult = result
@@ -546,17 +557,19 @@ isExplicitImageSearchRequest raw =
 agentReplyTextSegments
   :: (Prim :> es, LLM.LLM :> es, KatipE :> es)
   => Text
+  -> [Text]
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Stream (Of Text) (Eff es)) (Eff es) (Text, Agent.Result)
-agentReplyTextSegments request =
-  S.maps (S.mapMaybe id) . S.breaks isNothing . agentReplyTextEvents request
+agentReplyTextSegments request triggers =
+  S.maps (S.mapMaybe id) . S.breaks isNothing . agentReplyTextEvents request triggers
 
 agentReplyTextEvents
   :: (Prim :> es, LLM.LLM :> es, KatipE :> es)
   => Text
+  -> [Text]
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Of (Maybe Text)) (Eff es) (Text, Agent.Result)
-agentReplyTextEvents request stream = do
+agentReplyTextEvents request triggers stream = do
   retryUsed <- lift (IORef.newIORef False)
   openingHandled <- lift (IORef.newIORef False)
   earlyFlushed <- lift (IORef.newIORef False)
@@ -604,7 +617,7 @@ agentReplyTextEvents request stream = do
     -- prefix here would put a second "😻 FM：" in the middle of the answer.
     yieldFinalReply prefixed =
       traverse_ (S.yield . Just)
-        . if prefixed then streamingReplyChunksForRequest request else continuationReplyChunks
+        . if prefixed then streamingReplyChunksForRequest triggers request else continuationReplyChunks
 
 requestedOpeningSystemPrompt :: Text -> Text
 requestedOpeningSystemPrompt request =
@@ -725,12 +738,12 @@ replaceLastAssistantReply answer (Transcript history) =
 -- in Matrix-sized deltas so editable clients receive genuine incremental
 -- edits instead of a complete body followed only by a completion marker.
 streamingReplyChunks :: Text -> [Text]
-streamingReplyChunks = streamingReplyChunksForRequest ""
+streamingReplyChunks = streamingReplyChunksForRequest [] ""
 
-streamingReplyChunksForRequest :: Text -> Text -> [Text]
-streamingReplyChunksForRequest request reply
+streamingReplyChunksForRequest :: [Text] -> Text -> Text -> [Text]
+streamingReplyChunksForRequest triggers request reply
   | Text.null reply = []
-  | Text.length reply < longReplyStreamingThreshold = [FMBridge.fmReplyRelayBodyForRequest request reply]
+  | Text.length reply < longReplyStreamingThreshold = [FMBridge.fmReplyRelayBodyForRequestWith triggers request reply]
   | otherwise =
       let requiredOpeningChars = maybe 0 Text.length (FMBridge.requestedReplyOpening request)
           -- Keep a leading bare marker inside the first chunk; otherwise the split
@@ -739,7 +752,7 @@ streamingReplyChunksForRequest request reply
             | FMBridge.bareReplyMarker `Text.isPrefixOf` reply = Text.length FMBridge.bareReplyMarker + initialReplyChars
             | otherwise = initialReplyChars
           (initial, rest) = Text.splitAt (max requiredHeadChars requiredOpeningChars) reply
-      in FMBridge.fmReplyRelayBodyForRequest request initial : textChunksOf matrixLikeEditChunkChars rest
+      in FMBridge.fmReplyRelayBodyForRequestWith triggers request initial : textChunksOf matrixLikeEditChunkChars rest
 
 -- | Chunks for a segment that continues text already delivered in this turn:
 -- the speaker prefix is not repeated, exactly as for the tail chunks of a long

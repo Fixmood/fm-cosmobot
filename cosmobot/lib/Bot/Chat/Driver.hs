@@ -741,7 +741,7 @@ bridgeIncomingMessage drivers message
         Nothing
           | FMBridge.isMirroredQQMatrixMessage message -> do
               let sender = fromMaybe "-" message.senderId
-              logInfo [i|Ignoring mirrored QQ Matrix event: sender=#{sender}|]
+              logDebug [i|Ignoring mirrored QQ Matrix event: sender=#{sender}|]
               pure Nothing
           | Just bridged <- FMBridge.matrixOwnerAsQQ message -> do
               case drivers.qq of
