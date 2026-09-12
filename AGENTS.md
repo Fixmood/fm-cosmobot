@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-bare-prefix-20260912` (built from commit `84e04f9`)
+- image `fm-cosmobot:runtime-mention-body-20260912` (built from commit `0b836c6`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -219,6 +219,23 @@ Runtime state (config, sqlite, memory git repo, media cache) lives in
 `/opt/fm-cosmobot/runtime`, outside the image and outside git.
 
 ### Reply-Text Markers Must Survive Every Reply Path
+
+### The Bare Marker Is Opt-In, And chat_log Is Not The Delivered Text
+
+Two traps found the hard way on 2026-09-12:
+
+- The `[[bare]]` marker removes the "😻 FM：" prefix, so it must only appear when
+  the user asked for that in the same message. A prompt that explained the
+  default prefix but never forbade the marker made the model volunteer it on a
+  plain `fm hi`, so several groups saw replies with no prefix at all. Always
+  spell out the negative case ("never write it otherwise") and re-probe the
+  behaviour after any prompt change - a config-only edit can regress production.
+- `chat_log` stores the *pre-relay* text, so it is the wrong table for judging
+  what a user saw; missing/extra markers there are not delivery bugs. The
+  delivered text is whatever the send path produces. A real @-mention must not
+  carry the prefix at all: `mention_user` sends `fmMentionBody`, which strips a
+  prefix or marker and adds nothing, so the mentioned bot receives the command
+  verbatim.
 
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
