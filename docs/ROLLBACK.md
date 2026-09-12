@@ -24,6 +24,7 @@ docker inspect fm-cosmobot --format '{{index .Config.Labels "com.docker.compose.
 
 | 容器名 | 镜像 | 状态 |
 | --- | --- | --- |
+| `fm-cosmobot-prev-baregate-20260912-155422` | `fm-cosmobot:runtime-opening-guard-20260912` | Exited (0) |
 | `fm-cosmobot-prev-opening-20260912-152244` | `fm-cosmobot:runtime-mention-body-20260912` | Exited (0) |
 | `fm-cosmobot-prev-mention-20260912-145822` | `fm-cosmobot:runtime-bare-prefix-20260912` | Exited (0) |
 | `fm-cosmobot-prev-bare-20260912-140226` | `fm-cosmobot:runtime-context-20260912` | Exited (0) |

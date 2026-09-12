@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-opening-guard-20260912` (built from commit `eb2219c`)
+- image `fm-cosmobot:runtime-baregate-20260912` (built from commit `17609ff`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -244,6 +244,14 @@ Two traps found the hard way on 2026-09-12:
   that continues into an outcome (就可以/就能/触发/叫出来/召唤/...). When a
   feature parses user text mechanically, always pin the mis-readable case with
   a test - the existing suite had encoded the buggy reading as intended.
+- Prompt wording is not an enforcement mechanism. Telling the model "never write
+  [[bare]] unless the user asks" reduced the volunteering but did not stop it
+  ("fm Hindi 是什么语？" still came back without the prefix), so
+  fmReplyRelayBodyForRequest now requires a real bare-delivery request in the
+  user's own message before honouring the marker. When a model-controlled token
+  changes user-visible formatting, gate it on something deterministic - and pin
+  the phrasings that must keep working, because the suite previously encoded the
+  over-permissive reading as intended (it asserted a bare reply for "fm 你好").
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
