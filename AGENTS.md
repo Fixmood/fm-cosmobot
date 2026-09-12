@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-mentionfix-20260912` (built from commit `f33a6c3`)
+- image `fm-cosmobot:runtime-relayroster-20260912` (built from commit `5fb19af`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -311,6 +311,17 @@ Two traps found the hard way on 2026-09-12:
   message id: ... qq: []" - so the model announced a summon no QQ user ever saw
   ("真·@ 事件直奔 krkr 的脑门"), and the OneBot reason was thrown away with the Left.
   Report per destination and let the failure reach the caller.
+- A decision that two delivery paths share must be made where both can see the same
+  inputs. A bridged answer is delivered to Matrix and relayed to QQ; the FM prefix is
+  a QQ-side decision, and the relay re-made it with an empty roster (the trigger-less
+  variant of the body function) while the reply itself had the roster. The same text
+  then went out unprefixed to Matrix and prefixed to QQ, and the summoned bot's leading
+  trigger word landed behind "😻 FM：" so its trigger could not fire. Pass the inputs,
+  do not re-derive them.
+- Corollary, paid for once: the previous release's live check looked green because the
+  request itself said "直接发" (requestsDirectOpening). A check that passes for the
+  wrong reason is not evidence - read which branch produced the result before calling a
+  wiring verified.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
