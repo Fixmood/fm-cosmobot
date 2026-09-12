@@ -296,6 +296,14 @@ testFmMatrixOwnerUsesQqContext = do
   ShellTools.clampCommandWait 300 @?= 20
   ShellTools.clampCommandWait 10 @?= 10
   ShellTools.clampCommandWait 0 @?= 0
+  -- A segment continuing an early flush must not repeat the speaker prefix: the
+  -- client appends parts into one body, which is how a second "😻 FM：" ended up
+  -- in the middle of a delivered message.
+  let tail200 = Text.replicate 200 "续"
+  Text.concat (AgentRun.continuationReplyChunks tail200) @?= tail200
+  any (Text.isInfixOf "😻 FM：") (AgentRun.continuationReplyChunks tail200) @?= False
+  -- ...while the first part of a reply still carries it.
+  any (Text.isInfixOf "😻 FM：") (AgentRun.streamingReplyChunks tail200) @?= True
   FMBridge.fmReplyRelayBodyForRequestWith
     (FMBridge.registeredTriggerWords krkrRoster)
     "fm 你试着叫一次krkr看看"

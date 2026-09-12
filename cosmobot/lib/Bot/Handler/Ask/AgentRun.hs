@@ -12,6 +12,7 @@ module Bot.Handler.Ask.AgentRun
   , streamingReplyChunks
   , earlyFlushDue
   , earlyFlushMinChars
+  , continuationReplyChunks
   )
 where
 
@@ -558,44 +559,52 @@ agentReplyTextEvents
 agentReplyTextEvents request stream = do
   retryUsed <- lift (IORef.newIORef False)
   openingHandled <- lift (IORef.newIORef False)
-  go retryUsed openingHandled mempty mempty stream
+  earlyFlushed <- lift (IORef.newIORef False)
+  go retryUsed openingHandled earlyFlushed mempty mempty stream
   where
-    go retryUsed openingHandled answer pending currentStream = do
+    go retryUsed openingHandled earlyFlushed answer pending currentStream = do
       next <- lift (S.next currentStream)
       case next of
         Left result -> do
+          flushed <- lift (IORef.readIORef earlyFlushed)
           finalChunk <- lift (correctVisibleReply retryUsed openingHandled request (renderReplyText pending))
           let
               finalAnswer = appendReplyText finalChunk answer
-          yieldFinalReply finalChunk
+          yieldFinalReply (not flushed) finalChunk
           pure (renderReplyText finalAnswer, result)
         Right (Agent.ContentDelta chunk, rest) -> do
           let pendingText = renderReplyText (appendReplyText chunk pending)
+          alreadyFlushed <- lift (IORef.readIORef earlyFlushed)
           -- A long answer does not have to wait for its own ending. Process
           -- narration is short and rarely reaches a finished sentence, so once a
           -- body is this long its beginning is the answer itself; sending it now
           -- turns "wait for the whole reply" into "wait for the first sentence".
-          -- `answer` being empty is exactly "nothing flushed yet in this turn",
-          -- which also keeps it to one early flush per turn.
-          if Text.null (renderReplyText answer) && earlyFlushDue request pendingText
+          if not alreadyFlushed && Text.null (renderReplyText answer) && earlyFlushDue request pendingText
             then do
               lift (logInfo [i|FM early flush: sending #{Text.length pendingText} chars before the turn ended|])
-              yieldFinalReply pendingText
-              go retryUsed openingHandled (appendReplyText pendingText answer) mempty rest
-            else go retryUsed openingHandled answer (appendReplyText chunk pending) rest
+              yieldFinalReply True pendingText
+              lift (IORef.writeIORef earlyFlushed True)
+              go retryUsed openingHandled earlyFlushed (appendReplyText pendingText answer) mempty rest
+            else go retryUsed openingHandled earlyFlushed answer (appendReplyText chunk pending) rest
         Right (Agent.ToolCallNotification{}, rest) -> do
           S.yield Nothing
-          go retryUsed openingHandled answer mempty rest
+          lift (IORef.writeIORef earlyFlushed False)
+          go retryUsed openingHandled earlyFlushed answer mempty rest
         Right (Agent.ReplyBoundary, rest) -> do
           completedChunk <- lift (correctVisibleReply retryUsed openingHandled request (renderReplyText pending))
           let
               completedAnswer = appendReplyText completedChunk answer
-          yieldFinalReply completedChunk
+          yieldFinalReply True completedChunk
           S.yield Nothing
-          go retryUsed openingHandled completedAnswer mempty rest
+          lift (IORef.writeIORef earlyFlushed False)
+          go retryUsed openingHandled earlyFlushed completedAnswer mempty rest
 
-    yieldFinalReply =
-      traverse_ (S.yield . Just) . streamingReplyChunksForRequest request
+    -- The prefix belongs to the first part of a delivered message. Later parts
+    -- are appended (streaming) or edited into that same body, so repeating the
+    -- prefix here would put a second "😻 FM：" in the middle of the answer.
+    yieldFinalReply prefixed =
+      traverse_ (S.yield . Just)
+        . if prefixed then streamingReplyChunksForRequest request else continuationReplyChunks
 
 requestedOpeningSystemPrompt :: Text -> Text
 requestedOpeningSystemPrompt request =
@@ -731,6 +740,14 @@ streamingReplyChunksForRequest request reply
             | otherwise = initialReplyChars
           (initial, rest) = Text.splitAt (max requiredHeadChars requiredOpeningChars) reply
       in FMBridge.fmReplyRelayBodyForRequest request initial : textChunksOf matrixLikeEditChunkChars rest
+
+-- | Chunks for a segment that continues text already delivered in this turn:
+-- the speaker prefix is not repeated, exactly as for the tail chunks of a long
+-- reply.
+continuationReplyChunks :: Text -> [Text]
+continuationReplyChunks reply
+  | Text.null reply = []
+  | otherwise = textChunksOf matrixLikeEditChunkChars reply
 
 -- | Whether the beginning of a reply may go out before the turn ends.
 -- Skipped when the user demanded an exact opening: that constraint is enforced
