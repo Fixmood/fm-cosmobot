@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-roster-20260912` (built from commit `29fd19e`)
+- image `fm-cosmobot:runtime-notices-20260912` (built from commit `4804e06`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -259,6 +259,12 @@ Two traps found the hard way on 2026-09-12:
   already keeps: a body that starts with a registered first-word trigger is a
   command, whatever the request says (fmReplyRelayBodyForRequestWith). Wiring that
   in needs a Memory effect in agentReplyTextSegments, which is the next step.
+- A progress notice is a message, and messages are what the owner notices first.
+  The fastest chat tools (mention_user, fm_member_style, chat_log, send_reply,
+  recall_recent_self_messages) carried the noisy tag, so "fm @一下子寻" cost four
+  messages, two of them progress lines for tools that had already finished.
+  shouldAnnounceProgress keeps the tag as "this may be slow" and excludes the fast
+  set in one place, and it is unit tested.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
