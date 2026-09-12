@@ -447,6 +447,10 @@ openingBeforeMarker :: Text -> Text -> Maybe Text
 openingBeforeMarker boundary request = do
   let (before, rest) = Text.breakOn boundary request
   guard (not (Text.null rest))
+  -- "以 fw 开头就可以把他叫出来" describes how ANOTHER bot is triggered, so it is
+  -- knowledge to remember, not a request for this reply's opening. Without this
+  -- guard the prefix is suppressed and our reply is forced to start with "fw".
+  guard (not (describesOutcomeAfterOpening rest))
   candidate <- shortestNonEmpty
     [ Text.strip suffix
     | marker <- ["使用", "以", "用"]
@@ -455,6 +459,15 @@ openingBeforeMarker boundary request = do
     , not (Text.null suffix)
     ]
   nonEmptyOpening candidate
+
+describesOutcomeAfterOpening :: Text -> Bool
+describesOutcomeAfterOpening afterOpening =
+  let clean = Text.toCaseFold afterOpening
+  in any (`Text.isInfixOf` clean)
+       [ "就可以", "就能", "才能", "就会", "即可"
+       , "触发", "叫出来", "叫出", "喊出来", "召唤"
+       , "相当于", "代表", "表示"
+       ]
 
 openingAfterMarker :: Text -> Text -> Maybe Text
 openingAfterMarker marker request = do

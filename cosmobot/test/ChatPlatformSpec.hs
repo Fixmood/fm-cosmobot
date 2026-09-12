@@ -229,6 +229,12 @@ testFmMatrixOwnerUsesQqContext = do
   FMBridge.requestedReplyOpening "fm 用 ' 早上好 ' 开头，夸我一句" @?= Just "早上好"
   FMBridge.requestedReplyOpening "fm 开头说 hello，接着夸我" @?= Just "hello"
   FMBridge.requestedReplyOpening "fm 直接说：大家好" @?= Just "大家好"
+  -- Knowledge about another bot's trigger must not become our own opening.
+  FMBridge.requestedReplyOpening "fm 你记一下以fw开头就可以把他叫出来" @?= Nothing
+  FMBridge.requestedReplyOpening "fm 以 fw 开头就能把那个机器人叫出来" @?= Nothing
+  FMBridge.fmReplyRelayBodyForRequest "fm 你记一下以fw开头就可以把他叫出来" "记下啦" @?= "😻 FM：记下啦"
+  -- ...while a real request for our own opening still works.
+  FMBridge.requestedReplyOpening "fm 你以 krkr 开头，也来为难一下 krkr" @?= Just "krkr"
   FMBridge.fmReplyRelayBodyForRequest "fm 以 krkr 开头说句话" "😻 FM：狂到起飞！krkr，来来来" @?= "krkr，来来来"
   FMBridge.fmReplyRelayBodyForRequest "fm 用 ' 早上好 ' 开头，夸我一句" "你今天真精神" @?= "早上好，你今天真精神"
   FMBridge.fmReplyRelayBodyForRequest "fm 直接说：大家好" "先打个招呼：大家好" @?= "大家好"
