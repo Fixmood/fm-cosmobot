@@ -16,6 +16,8 @@ module Bot.Chat.Bridge.FM
   , fmOwnerRelayBodyWithImages
   , fmReplyRelayBody
   , fmReplyRelayBodyForRequest
+  , fmReplyRelayBodyForRequestWith
+  , registeredTriggerWords
   , fmMentionBody
   , requestedReplyOpening
   , enforceRequestedReplyOpening
@@ -414,17 +416,63 @@ fmReplyRelayBody :: Text -> Text
 fmReplyRelayBody = fmReplyRelayBodyForRequest ""
 
 fmReplyRelayBodyForRequest :: Text -> Text -> Text
-fmReplyRelayBodyForRequest request body =
+fmReplyRelayBodyForRequest = fmReplyRelayBodyForRequestWith []
+
+-- | The same relay, told which first-word triggers this chat has on its bot
+-- roster (see the bot-roster skill). A body that genuinely starts with one of
+-- those words is a command for another bot, and the "😻 FM：" prefix would sit
+-- in front of the trigger and stop it firing - so it is dropped whatever words
+-- the user happened to use, while a marker volunteered on an ordinary question
+-- still does not get past the prefix.
+fmReplyRelayBodyForRequestWith :: [Text] -> Text -> Text -> Text
+fmReplyRelayBodyForRequestWith triggers request body =
   let ReplyBody.ReplyContent{text, images} = ReplyBody.replyContentFromBody body
       (markedBare, unmarkedText) = stripBareReplyMarker text
       cleanText = stripReplyPrefix unmarkedText
-      suppressPrefix = requestsDirectOpening request || (markedBare && requestsBareDelivery request)
+      rosterCommand = startsWithRosterTrigger triggers cleanText
+      suppressPrefix =
+        requestsDirectOpening request
+          || (markedBare && (requestsBareDelivery request || rosterCommand))
+          || (requestsSummon request && rosterCommand)
       constrainedText = enforceRequestedReplyOpening request cleanText
       prefixedText =
         if Text.null (Text.strip text)
           then ""
           else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else "😻 FM：" <> constrainedText
   in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
+
+-- | First-word triggers recorded in a chat's memory, e.g. the roster line
+-- "触发=@ 或首字「krkr」" contributes "krkr".
+registeredTriggerWords :: Text -> [Text]
+registeredTriggerWords memory =
+  [ word
+  | chunk <- drop 1 (Text.splitOn "首字「" memory)
+  , let word = Text.strip (Text.takeWhile (/= '」') chunk)
+  , not (Text.null word)
+  ]
+
+startsWithRosterTrigger :: [Text] -> Text -> Bool
+startsWithRosterTrigger triggers body =
+  let stripped = Text.toCaseFold (Text.strip body)
+  in any
+       (\trigger ->
+          let folded = Text.toCaseFold (Text.strip trigger)
+          in not (Text.null folded) && folded `Text.isPrefixOf` stripped)
+       triggers
+
+-- | A request that asks us to call or summon somebody out, in any of the
+-- phrasings the owner actually uses.
+requestsSummon :: Text -> Bool
+requestsSummon request =
+  let clean = Text.toCaseFold (Text.strip request)
+  in any (`Text.isInfixOf` clean)
+       [ "叫出来", "叫出", "叫一下", "叫一次", "叫一声", "叫一嗓子", "叫下", "叫来", "叫醒"
+       , "叫他", "叫她", "叫它", "把他叫", "把她叫", "把机器人叫", "把人叫", "叫他出来"
+       , "喊一下", "喊一次", "喊一声", "喊出来", "喊出", "喊他", "喊她", "把他喊", "喊他出来"
+       , "触发一下", "触发", "召唤", "呼唤"
+       , "试叫", "试着叫", "试一下叫", "试一次叫"
+       , "薅出来", "拉出来", "拉一下", "弄出来", "吼一声", "吼一嗓子", "请出来"
+       ]
 
 -- | Whether the user actually asked for a bare/direct delivery in this request
 -- (no prefix), or asked us to summon a bot that triggers on a plain first-word

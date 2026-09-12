@@ -260,6 +260,35 @@ testFmMatrixOwnerUsesQqContext = do
   FMBridge.fmReplyRelayBodyForRequest "fm 不要加前缀，说一句测试" "[[bare]]测试" @?= "测试"
   -- Summoning a bot that triggers on a plain first word still works.
   FMBridge.fmReplyRelayBodyForRequest "fm 把fw叫出来" "[[bare]]fw 快出来" @?= "fw 快出来"
+  -- A body that really starts with a registered first-word trigger is a command
+  -- for another bot: the prefix would break its trigger, whatever the wording.
+  let krkrRoster = "- 机器人 krkr（QQ 1094950020）：触发=@ 或首字「krkr」；叫法=发一条以 krkr 开头的正文"
+  FMBridge.registeredTriggerWords krkrRoster @?= ["krkr"]
+  FMBridge.fmReplyRelayBodyForRequestWith
+    (FMBridge.registeredTriggerWords krkrRoster)
+    "fm 你试着叫一次krkr看看"
+    "[[bare]]krkr 冒个泡！Fix哥在点你名"
+    @?= "krkr 冒个泡！Fix哥在点你名"
+  FMBridge.fmReplyRelayBodyForRequestWith
+    (FMBridge.registeredTriggerWords krkrRoster)
+    "fm 叫一次krkr"
+    "krkr 冒个泡"
+    @?= "krkr 冒个泡"
+  -- ...while a marker volunteered on an ordinary question still cannot get past
+  -- the prefix, even with the same roster in hand.
+  FMBridge.fmReplyRelayBodyForRequestWith
+    (FMBridge.registeredTriggerWords krkrRoster)
+    "fm Hindi 是什么语？"
+    "[[bare]]子寻你这问题一抛"
+    @?= "😻 FM：子寻你这问题一抛"
+  FMBridge.fmReplyRelayBodyForRequestWith
+    (FMBridge.registeredTriggerWords krkrRoster)
+    "fm 群里有哪些机器人"
+    "[[bare]]? 名册是空的"
+    @?= "😻 FM：? 名册是空的"
+  -- Accepted trade-off, pinned on purpose: a marked body that itself starts with
+  -- a roster trigger loses the prefix even when it is an answer, not a command.
+  FMBridge.fmReplyRelayBodyForRequestWith ["krkr"] "fm 群里有哪些机器人" "[[bare]]krkr 是机器人" @?= "krkr 是机器人"
   FMBridge.fmMentionBody "hi" @?= "hi"
   FMBridge.fmMentionBody "菜单" @?= "菜单"
   FMBridge.fmMentionBody "😻 FM：hi" @?= "hi"
