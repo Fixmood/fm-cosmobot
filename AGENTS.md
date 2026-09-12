@@ -275,8 +275,12 @@ dead history are referenced by tracked files.
 - `fm-cosmobot:runtime-471e7690b694` — `ops/Dockerfile.prefix-final`
 - `fm-cosmobot:build-test-471e7690b694` — `ops/build-prefix-final.sh`, and the
   toolchain every verification build depends on
-- `fm-cosmobot:runtime-seedream-20260912` — live production
-- `fm-cosmobot:runtime-retryfix-20260912` — newest rollback point
+- The live production image and the newest rollback point change on every
+  deploy. Read them from the machine instead of trusting this list:
+  `docker inspect fm-cosmobot --format '{{.Config.Image}}'`, and the top row of
+  the ladder in `docs/ROLLBACK.md`.
+- `fm-cosmobot:runtime-seedream-20260912` — production as of 2026-09-12
+- `fm-cosmobot:runtime-retryfix-20260912` — newest rollback point as of 2026-09-12
 
 Find tracked references with `git grep -nE 'fm-cosmobot:[a-zA-Z0-9._-]+'`, and
 also check `/opt/fm-cosmobot/*.sh`, which are outside git.
@@ -290,7 +294,8 @@ also check `/opt/fm-cosmobot/*.sh`, which are outside git.
   matching `head_sha`; wait at least 90s between polls (60 requests/hour anonymous).
 - Write access uses `/root/.ssh/id_rsa`:
   `git -c core.sshCommand='ssh -i /root/.ssh/id_rsa -o IdentitiesOnly=yes' push ...`.
-  `/opt/fm-cosmobot/work/.ssh/fm_repo_ed25519` is read-only.
+  `/opt/fm-cosmobot/work/.ssh/fm_repo_ed25519` is a read-only deploy key: use it
+  for fetching only, never for pushing.
 - Never force-push. Every push must fast-forward. A local git mirror under
   `/opt/fm-cosmobot/backups/*.git` keeps history outside GitHub.
 

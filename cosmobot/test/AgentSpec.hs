@@ -1861,7 +1861,7 @@ testAskHandlerInjectsRecentGroupChatContext = do
   runAgentCapturingMessages captured answers (ChatMock (Just replies) (Just "reply-id") Nothing) do
     ChatLog.recordMessage alice
     ChatLog.recordMessage bob
-    ChatLog.recordSelfMessage current "这条机器人消息不应进入群聊背景"
+    ChatLog.recordSelfMessage current "这条机器人消息应当进入群聊背景"
     ChatLog.recordMessage current
     threads <- newThreadStore
     runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads current
@@ -1871,7 +1871,7 @@ testAskHandlerInjectsRecentGroupChatContext = do
       [prompt] -> do
         assertBool "recent context includes first group member" ("[小明]: 今晚一起吃火锅" `Text.isInfixOf` prompt)
         assertBool "recent context includes second group member" ("[小红]: 我想吃番茄锅" `Text.isInfixOf` prompt)
-        assertBool "group context includes the bot's own earlier message" ("这条机器人消息不应进入群聊背景" `Text.isInfixOf` prompt)
+        assertBool "group context includes the bot's own earlier message" ("这条机器人消息应当进入群聊背景" `Text.isInfixOf` prompt)
         assertBool "group context excludes the current question" (not ("大家刚才在聊什么" `Text.isInfixOf` prompt))
       other -> assertFailure [i|expected one system prompt, got #{length other}|]
     other -> assertFailure [i|expected one model request, got #{length other}|]

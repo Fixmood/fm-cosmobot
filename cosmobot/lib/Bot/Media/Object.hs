@@ -170,8 +170,13 @@ downloadRemoteMediaObject manager ref request =
 
     remoteRequest =
       request
-        { HTTP.responseTimeout = HTTP.responseTimeoutMicro 15_000_000
+        { HTTP.responseTimeout = HTTP.responseTimeoutMicro remoteMediaResponseTimeoutMicro
         }
+
+-- A slow first byte is normal for the relay and for QQ file transfers, so the
+-- generic timeout applies to every non-image download.
+remoteMediaResponseTimeoutMicro :: Int
+remoteMediaResponseTimeoutMicro = 15_000_000
 
 remoteMediaDownloadAttempts :: Int
 remoteMediaDownloadAttempts = 3
@@ -187,16 +192,28 @@ downloadQQMediaObject manager ref request = do
   firstAttempt <- trySync (runAttempts manager)
   case firstAttempt of
     Right object -> pure object
-    Left _ ->
-      bracket
-        (liftIO (HTTPTLS.newTlsManagerWith (HTTPTLS.mkManagerSettings qqMediaTlsSettings Nothing)))
-        (liftIO . HTTP.closeManager)
-        runAttempts
+    Left err
+      -- Retry only transport-level failures: those are what the direct manager
+      -- works around. A rejected status, size or content type is deterministic,
+      -- so a second round would double the cost and hide the real cause.
+      | isTransportFailure err ->
+          bracket
+            (liftIO (HTTPTLS.newTlsManagerWith (HTTPTLS.mkManagerSettings qqMediaTlsSettings Nothing)))
+            (liftIO . HTTP.closeManager)
+            runAttempts
+      | otherwise -> throwIO err
   where
     runAttempts activeManager = tryDownload activeManager qqMediaDownloadAttempts
 
+    -- QQ file transfers (...-download.ftn.qq.com) need the same TLS posture but
+    -- are not images: keep the generic response timeout and headers for them.
+    downloadRequest
+      | isQQFileTransferRequest request =
+          request { HTTP.responseTimeout = HTTP.responseTimeoutMicro remoteMediaResponseTimeoutMicro }
+      | otherwise = qqMediaDownloadRequest request
+
     tryDownload activeManager attempts = do
-      result <- trySync (liftIO (HTTP.httpLbs (qqMediaDownloadRequest request) activeManager))
+      result <- trySync (liftIO (HTTP.httpLbs downloadRequest activeManager))
       case result of
         Right response -> do
           let status = HTTP.responseStatus response
@@ -233,7 +250,20 @@ isQQMediaRequest request =
   -- QQ file transfers are served from <region>-download.ftn.qq.com. They
   -- need the QQ treatment as well; the shared proxy manager's TLS settings
   -- fail their handshake with "peer does not support Extended Main Secret".
-  in host == "multimedia.nt.qq.com.cn" || Text.isSuffixOf ".ftn.qq.com" host
+  in host == "multimedia.nt.qq.com.cn" || isQQFileTransferRequest request
+
+-- The QQ file-transfer hosts, which need the QQ TLS posture but otherwise keep
+-- the generic request shape.
+isQQFileTransferRequest :: HTTP.Request -> Bool
+isQQFileTransferRequest request =
+  Text.isSuffixOf ".ftn.qq.com" (Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request)))
+
+-- A connect, DNS, TLS handshake or timeout failure surfaces as an HttpException.
+-- Media validation failures are IOErrors, and are not worth a second round
+-- through another manager.
+isTransportFailure :: SomeException -> Bool
+isTransportFailure err =
+  isJust (fromException err :: Maybe HTTP.HttpException)
 
 isQQLogoRequest :: HTTP.Request -> Bool
 isQQLogoRequest request =

@@ -26,7 +26,7 @@ docker inspect fm-cosmobot --format '{{index .Config.Labels "com.docker.compose.
 | --- | --- | --- |
 | `fm-cosmobot-prev-seedream-20260912-055215` | `fm-cosmobot:runtime-retryfix-20260912` | Exited (0) |
 | `fm-cosmobot-prev-retryfix-20260912-011727` | `fm-cosmobot:runtime-restored-20260912` | Exited (0) |
-| `fm-cosmobot-context-bad` | `fm-cosmobot:runtime-context-20260911` | Exited (0) |
+| `fm-cosmobot-context-bad` | `fm-cosmobot:runtime-context-20260911` | Exited (0) - known-bad, parked for reference only, do not start |
 | `fm-cosmobot-prev-20260912-002912` | `fm-cosmobot:runtime-direct-image-search-20260910` | Exited (0) |
 
 实时查看当前线上与所有回滚点：
