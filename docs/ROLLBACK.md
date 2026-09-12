@@ -24,6 +24,8 @@ docker inspect fm-cosmobot --format '{{index .Config.Labels "com.docker.compose.
 
 | 容器名 | 镜像 | 状态 |
 | --- | --- | --- |
+| `fm-cosmobot-prev-bare-20260912-140226` | `fm-cosmobot:runtime-context-20260912` | Exited (0) |
+| `fm-cosmobot-prev-context-20260912-130118` | `fm-cosmobot:runtime-seedream-20260912` | Exited (0) |
 | `fm-cosmobot-prev-seedream-20260912-055215` | `fm-cosmobot:runtime-retryfix-20260912` | Exited (0) |
 | `fm-cosmobot-prev-retryfix-20260912-011727` | `fm-cosmobot:runtime-restored-20260912` | Exited (0) |
 | `fm-cosmobot-context-bad` | `fm-cosmobot:runtime-context-20260911` | Exited (0) - known-bad, parked for reference only, do not start |

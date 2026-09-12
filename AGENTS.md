@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-seedream-20260912`
+- image `fm-cosmobot:runtime-bare-prefix-20260912` (built from commit `84e04f9`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -305,7 +305,8 @@ also check `/opt/fm-cosmobot/*.sh`, which are outside git.
   GHC inlines small functions and constants, so `grep -c isTransportFailure`,
   `grep -c qqMediaTlsSettings` and `grep -c remoteMediaResponseTimeoutMicro`
   all return 0 even when that code is present and correct. A release gate must
-  use literals such as `ftn.qq.com`, `volcengine_seedream`, `image_model_manage`
+  use literals such as `ftn.qq.com`, `volcengine_seedream`, `image_model_manage`,
+  `[[bare]]`
   or a prompt string, never a function or binding name. Identifiers that look
   like they should survive (top-level CAFs) do not: this was measured, not
   assumed, by grepping a binary built from the same tree.
