@@ -357,19 +357,19 @@ instance ChatDriver ChatDrivers where
   mentionUser drivers message userId body
     | FMBridge.usesMatrixReplyPipeline message = do
         result <- withMatrixBridgeDriver drivers message \driver target ->
-          sendReplyMessage driver target body
+          sendReplyMessage driver target (FMBridge.fmMentionBody body)
         case result of
           Left{} -> pure result
           Right matrixMessageId -> do
             qqResult <- withQQBridgeDriver drivers message \driver target ->
-              mentionUser driver target userId (FMBridge.fmReplyRelayBody body)
+              mentionUser driver target userId (FMBridge.fmMentionBody body)
             let qqMessageIds = rights [qqResult :: Either Text MessageId]
                 deliveryId = FMBridge.bridgeDeliveryMessageId matrixMessageId qqMessageIds
             recordRecentQQDeliveries drivers message body [deliveryId]
             pure (Right deliveryId)
     | otherwise = do
         result <- withMessageDriver drivers message \driver ->
-          mentionUser driver message userId body
+          mentionUser driver message userId (FMBridge.fmMentionBody body)
         recordRecentQQDeliveries drivers message body (maybeToList (rightToMaybe result))
         pure result
 

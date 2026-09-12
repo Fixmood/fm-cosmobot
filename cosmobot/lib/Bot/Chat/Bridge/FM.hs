@@ -16,6 +16,7 @@ module Bot.Chat.Bridge.FM
   , fmOwnerRelayBodyWithImages
   , fmReplyRelayBody
   , fmReplyRelayBodyForRequest
+  , fmMentionBody
   , requestedReplyOpening
   , enforceRequestedReplyOpening
   , fmReplyBody
@@ -522,6 +523,14 @@ openingJoiner opening reply
   | otherwise = "，"
   where
     punctuation = ['，', '。', '！', '？', '：', ':', ',', '.', '!', '?', ';', '；', '、', '～', '~']
+
+-- | Body for a real @-mention message. The mention itself is the message's
+-- opening, so no "😻 FM：" prefix is added; any prefix or [[bare]] marker the
+-- model wrote is stripped, so the mentioned bot receives the command verbatim.
+fmMentionBody :: Text -> Text
+fmMentionBody body =
+  let (_, unmarked) = stripBareReplyMarker body
+  in stripReplyPrefix unmarked
 
 fmReplyBody :: Text -> Text
 fmReplyBody body =
