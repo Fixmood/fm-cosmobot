@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-prefixfix-20260912` (built from commit `c4d9057`)
+- image `fm-cosmobot:runtime-wiring-20260912` (built from commit `908227e`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -292,6 +292,19 @@ Two traps found the hard way on 2026-09-12:
   prefixing each part put a second "😻 FM：" in the middle of the answer. Long
   replies already prefix only their first chunk; the flush now matches that, and
   chat-platform-spec pins both directions.
+- A tested helper that nobody calls is not a feature. The roster-aware relay
+  (fmReplyRelayBodyForRequestWith) existed and was unit tested for weeks, but the
+  production path passed an empty trigger list, so the only thing that ever
+  suppressed the prefix for a summoned bot was the model volunteering [[bare]] -
+  and a model that forgets breaks the summon. The chat memory the words live in was
+  already loaded a few lines away. Wire the tested thing in, then verify it.
+- Diagnosis decides what you can see: the Matrix bridge logged every sync at info
+  (28% of the stream) while the release diagnostics that matter were buried
+  underneath, so per-sync chatter is debug now.
+- The acceptance script reads the deploy stamp (/opt/fm-cosmobot/last-deploy.env)
+  instead of a hand-edited release name. Stale anchors in that file caused four
+  failed verifications across two releases; the image, candidate md5, build log and
+  parked container now come from the deploy itself.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
