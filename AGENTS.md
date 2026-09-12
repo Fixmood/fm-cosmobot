@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-baregate-20260912` (built from commit `17609ff`)
+- image `fm-cosmobot:runtime-roster-20260912` (built from commit `29fd19e`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -252,6 +252,13 @@ Two traps found the hard way on 2026-09-12:
   changes user-visible formatting, gate it on something deterministic - and pin
   the phrasings that must keep working, because the suite previously encoded the
   over-permissive reading as intended (it asserted a bare reply for "fm 你好").
+- An allow-list of request phrasings is always one phrasing short. The owner said
+  "叫一次", the list only knew "叫一下", so a correct [[bare]] was vetoed and the
+  prefix landed in front of the other bot's trigger word - which is exactly what
+  stops a first-word bot from firing. The reliable input is the roster the bot
+  already keeps: a body that starts with a registered first-word trigger is a
+  command, whatever the request says (fmReplyRelayBodyForRequestWith). Wiring that
+  in needs a Memory effect in agentReplyTextSegments, which is the next step.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
