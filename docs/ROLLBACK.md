@@ -24,6 +24,7 @@ docker inspect fm-cosmobot --format '{{index .Config.Labels "com.docker.compose.
 
 | 容器名 | 镜像 | 状态 |
 | --- | --- | --- |
+| `fm-cosmobot-prev-mentionfix-20260912-201049` | `fm-cosmobot:runtime-wiring-20260912` | Exited (0) |
 | `fm-cosmobot-prev-wiring-20260912-194138` | `fm-cosmobot:runtime-prefixfix-20260912` | Exited (0) |
 | `fm-cosmobot-prev-prefixfix-20260912-191344` | `fm-cosmobot:runtime-flushfix-20260912` | Exited (0) |
 | `fm-cosmobot-prev-flushfix-20260912-180646` | `fm-cosmobot:runtime-latency-20260912` | Exited (0) |

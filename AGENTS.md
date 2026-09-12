@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-wiring-20260912` (built from commit `908227e`)
+- image `fm-cosmobot:runtime-mentionfix-20260912` (built from commit `f33a6c3`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -305,6 +305,12 @@ Two traps found the hard way on 2026-09-12:
   instead of a hand-edited release name. Stale anchors in that file caused four
   failed verifications across two releases; the image, candidate md5, build log and
   parked container now come from the deploy itself.
+- A message that has to cross two platforms must not report one platform's success
+  as the whole result. mention_user sent the @ to the Matrix room, relayed a copy to
+  QQ, folded the QQ failure through `rights`, and told the model "Sent mention
+  message id: ... qq: []" - so the model announced a summon no QQ user ever saw
+  ("真·@ 事件直奔 krkr 的脑门"), and the OneBot reason was thrown away with the Left.
+  Report per destination and let the failure reach the caller.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that
