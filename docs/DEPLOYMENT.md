@@ -24,9 +24,16 @@ production Compose paths can be selected with `FM_BOT_COMPOSE` and
 
 ## Release procedure
 
+> Historical pipeline. Production today is a hand-cut `docker run`
+> container, and the `ops/deploy_*.sh` default `FM_STABLE_BOT_IMAGE`
+> (`fm-cosmobot:runtime-fm-tools`) is many generations behind it. The
+> steps below describe the Compose-era flow and must not be run against
+> the live container. See `AGENTS.md` (Deployment And Runtime) and
+> `docs/ROLLBACK.md` for the current procedure and the rollback ladder.
+
 ```bash
-git fetch origin fm/main
-git switch --detach origin/fm/main
+git fetch origin main
+git switch --detach origin/main
 bash ops/fm_regression.sh
 bash ops/deploy_production.sh
 ```

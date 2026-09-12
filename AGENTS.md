@@ -190,6 +190,120 @@ cleanup, and tool-call transcript completeness together.
 - Always use `-j` for `cabal` build and test, and pass
   `--test-options=--hide-successes` to `cabal test`.
 
+## Deployment And Runtime
+
+Production facts live here rather than in the Compose files. Read this before
+touching images, containers, or the rollback path.
+
+### Live Runtime
+
+The production bot is a plain `docker run` container named `fm-cosmobot`; it
+carries no Compose labels. The container itself is the authoritative record:
+
+```bash
+docker inspect fm-cosmobot --format '{{.Config.Image}}'
+docker inspect fm-cosmobot --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}} {{.Config.WorkingDir}}'
+docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} rw={{.RW}}{{"\n"}}{{end}}'
+```
+
+Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
+
+- image `fm-cosmobot:runtime-seedream-20260912`
+- entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
+- restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
+- env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
+- mounts `/opt/fm-cosmobot/runtime -> /data`, `/opt/fm-cosmobot/work -> /work`,
+  `/var/run/docker.sock`, `/var/www/html -> /host-sites:ro`, `/etc/nginx -> /host-nginx:ro`
+
+Runtime state (config, sqlite, memory git repo, media cache) lives in
+`/opt/fm-cosmobot/runtime`, outside the image and outside git.
+
+### Never Drive Production From The Compose Pipeline
+
+`/opt/fm-cosmobot/compose.yaml`, `deploy/cosmobot.compose.yaml`, and the
+`FM_STABLE_BOT_IMAGE` defaults in `ops/deploy_*.sh` all name
+`fm-cosmobot:runtime-fm-tools`, which is many generations behind production.
+Running `docker compose ... up -d --force-recreate fm-cosmobot` or
+`ops/deploy_production.sh` against the live container would downgrade
+production (and fail on the container-name conflict). Those files are historic.
+`docs/ROLLBACK.md` holds the verified container-level procedure.
+
+### Building And Deploying A Change
+
+Build and test inside the pinned toolchain image, never on the host, and never
+run two builds at once (they share `/opt/fm-cosmobot/build/source/dist-newstyle`):
+
+```bash
+docker run --rm --network host \
+  -v <tree>:/source-current:ro \
+  -v /opt/fm-cosmobot/build/source/dist-newstyle:/build/dist-newstyle \
+  -v /opt/fm-cosmobot/tool-output:/out \
+  -v /opt/fm-cosmobot/cabal.project.local:/build/cabal.project.local:ro \
+  -v /opt/fm-cosmobot/build/source/vendor:/build/vendor:ro \
+  -v /opt/fm-cosmobot/build/cabal-home/config:/root/.cabal \
+  -v /opt/fm-cosmobot/build/cabal-home/packages:/root/.cabal/packages \
+  -v /opt/fm-cosmobot/build/cabal-home/data:/root/.local/share/cabal \
+  -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
+  -e PATH=/opt/ghc/9.10.3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  --entrypoint bash fm-cosmobot:build-test-471e7690b694 -c '...'
+```
+
+Inside, use `cabal --project-file=cabal.project.production build cosmobot cosmocode -j all`
+and `cabal --project-file=cabal.project.production test cosmobot -j4 --test-options=--hide-successes`.
+The warm `dist-newstyle` makes an incremental rebuild take about a minute; a
+cold full build takes much longer. `touch` files whose only change is line
+endings, otherwise cabal skips them.
+
+Then preflight the candidate image before touching production: `docker run --rm`
+it and check the deployed binary's md5 and `--help`. Only then stop and rename
+the live container to `fm-cosmobot-prev-<stamp>`, start the candidate with the
+exact flag set above, wait about 45 seconds, and verify health. Keep the
+previous container parked; never delete the newest rollback point.
+
+### Image Reference Map
+
+Do not delete an image before checking this map: several images that look like
+dead history are referenced by tracked files.
+
+- `fm-cosmobot:build-4c782b1` — `deploy/Dockerfile.build-test`,
+  `ops/deploy_production.sh`, `ops/deploy_prefix_tmp.sh`, `ops/deploy_skip_tests.sh`,
+  `docs/DEPLOYMENT.md`, `/opt/fm-cosmobot/rebuild-*.sh`
+- `fm-cosmobot:compiled-current` — `deploy/Dockerfile.runtime`, the `ops/deploy_*.sh` scripts
+- `fm-cosmobot:runtime-fm-tools` (also tagged `runtime-image-download-fix`) —
+  `/opt/fm-cosmobot/compose.yaml`, `deploy/cosmobot.compose.yaml`, `docs/ROLLBACK.md`
+  (historic; keep only because those files reference it)
+- `fm-cosmobot:runtime-471e7690b694` — `ops/Dockerfile.prefix-final`
+- `fm-cosmobot:build-test-471e7690b694` — `ops/build-prefix-final.sh`, and the
+  toolchain every verification build depends on
+- `fm-cosmobot:runtime-seedream-20260912` — live production
+- `fm-cosmobot:runtime-retryfix-20260912` — newest rollback point
+
+Find tracked references with `git grep -nE 'fm-cosmobot:[a-zA-Z0-9._-]+'`, and
+also check `/opt/fm-cosmobot/*.sh`, which are outside git.
+
+### CI And Pushes
+
+- `.github/workflows/ci.yml` triggers on every `push` (no branch filter), so any
+  pushed branch runs four jobs: Source safety, Cabal, FM Domain, FM Control Center.
+- There is no `gh` on the server. Watch a run through the unauthenticated API:
+  `https://api.github.com/repos/Fixmood/fm-cosmobot/actions/runs?branch=<branch>&per_page=10`,
+  matching `head_sha`; wait at least 90s between polls (60 requests/hour anonymous).
+- Write access uses `/root/.ssh/id_rsa`:
+  `git -c core.sshCommand='ssh -i /root/.ssh/id_rsa -o IdentitiesOnly=yes' push ...`.
+  `/opt/fm-cosmobot/work/.ssh/fm_repo_ed25519` is read-only.
+- Never force-push. Every push must fast-forward. A local git mirror under
+  `/opt/fm-cosmobot/backups/*.git` keeps history outside GitHub.
+
+### Repository Hygiene
+
+- `.gitignore` covers backup shapes (`*.bak`, `*.bak.*`, `*.before-*`, `*.pre-*`,
+  `*.orig`, `*.rej`). Keep the tracked tree clean: `git status --porcelain` must
+  be empty before committing.
+- Do not leave backup copies inside the source tree. Archive them under
+  `/opt/fm-cosmobot/backups/<date>-<reason>/` instead; agent greps otherwise
+  match stale duplicates of files such as `AgentRun.hs` or `HTTP.hs`.
+- Run `git diff --check` before finishing.
+
 ## Cosmocode
 
 A TUI interface to interact with Cosmobot RPC server, and specifically, designed for coding tasks.

@@ -127,6 +127,11 @@ qlogoTlsSettings =
           }
     }
 
+-- The QQ media hosts want the same TLS posture as qlogo: with EMS demanded
+-- the handshake dies with "peer does not support Extended Main Secret".
+qqMediaTlsSettings :: TLSSettings
+qqMediaTlsSettings = qlogoTlsSettings
+
 downloadRemoteMediaObject :: IOE :> es => HTTP.Manager -> Text -> HTTP.Request -> Eff es MediaObject
 downloadRemoteMediaObject manager ref request =
   tryDownload remoteMediaDownloadAttempts
@@ -175,11 +180,23 @@ remoteMediaMaxBytes :: Int
 remoteMediaMaxBytes = 25 * 1024 * 1024
 
 downloadQQMediaObject :: IOE :> es => HTTP.Manager -> Text -> HTTP.Request -> Eff es MediaObject
-downloadQQMediaObject manager ref request =
-  tryDownload qqMediaDownloadAttempts
+downloadQQMediaObject manager ref request = do
+  -- First honour the caller's (proxy) manager, then fall back to a fresh direct
+  -- manager with EMS disabled. A fresh manager also re-resolves DNS instead of
+  -- reusing a failed address from the process-wide connection pool.
+  firstAttempt <- trySync (runAttempts manager)
+  case firstAttempt of
+    Right object -> pure object
+    Left _ ->
+      bracket
+        (liftIO (HTTPTLS.newTlsManagerWith (HTTPTLS.mkManagerSettings qqMediaTlsSettings Nothing)))
+        (liftIO . HTTP.closeManager)
+        runAttempts
   where
-    tryDownload attempts = do
-      result <- trySync (liftIO (HTTP.httpLbs (qqMediaDownloadRequest request) manager))
+    runAttempts activeManager = tryDownload activeManager qqMediaDownloadAttempts
+
+    tryDownload activeManager attempts = do
+      result <- trySync (liftIO (HTTP.httpLbs (qqMediaDownloadRequest request) activeManager))
       case result of
         Right response -> do
           let status = HTTP.responseStatus response
@@ -202,7 +219,7 @@ downloadQQMediaObject manager ref request =
             }
         Left err
           | attempts > 1 ->
-              tryDownload (attempts - 1)
+              tryDownload activeManager (attempts - 1)
           | otherwise ->
               throwIO err
 
@@ -212,8 +229,11 @@ requestSourceName =
 
 isQQMediaRequest :: HTTP.Request -> Bool
 isQQMediaRequest request =
-  Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request))
-    == "multimedia.nt.qq.com.cn"
+  let host = Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request))
+  -- QQ file transfers are served from <region>-download.ftn.qq.com. They
+  -- need the QQ treatment as well; the shared proxy manager's TLS settings
+  -- fail their handshake with "peer does not support Extended Main Secret".
+  in host == "multimedia.nt.qq.com.cn" || Text.isSuffixOf ".ftn.qq.com" host
 
 isQQLogoRequest :: HTTP.Request -> Bool
 isQQLogoRequest request =

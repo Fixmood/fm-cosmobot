@@ -139,7 +139,9 @@ loadRecentChatContext cfg message now
   | message.kind `notElem` [ChatGroup, ChatPrivate] = pure (0, "")
   | otherwise = do
       let since = addUTCTime (negate (fromIntegral (cfg.recentChatContextMinutes * 60))) now
-          includeBotMessages = message.kind == ChatPrivate
+          -- Group chats keep the bot's own earlier turns as background too;
+          -- otherwise the bot cannot see what it just said.
+          includeBotMessages = True
           timeRange = ChatLog.ChatLogTimeRange (Just since) Nothing
       entries <- ChatLog.queryChat message Nothing (cfg.recentChatContextLimit + 1) includeBotMessages timeRange
       let usable = filter (isUsefulRecentEntry message) entries
@@ -156,7 +158,6 @@ isUsefulRecentEntry :: IncomingMessage -> ChatLog.ChatLogEntry -> Bool
 isUsefulRecentEntry message entry =
   entry.messageId /= message.messageId
     && not (Text.null (Text.strip entry.text))
-    && (message.kind == ChatPrivate || not entry.isBot)
 
 renderRecentEntry :: ChatLog.ChatLogEntry -> Text
 renderRecentEntry entry =
