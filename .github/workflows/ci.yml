@@ -86,7 +86,7 @@ jobs:
           path: |
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-ghc-9.10.3-cabal-${{ hashFiles('cabal.project', 'cosmobot/cosmobot.cabal', 'cosmocode/cosmocode.cabal') }}
+          key: ${{ runner.os }}-ghc-9.10.3-cabal-${{ hashFiles('cabal.project.production', 'cosmobot/cosmobot.cabal', 'cosmocode/cosmocode.cabal') }}
           restore-keys: |
             ${{ runner.os }}-ghc-9.10.3-cabal-
 
@@ -100,8 +100,12 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+      # Build with the overlay the deploy uses. The dependency sources it points at
+      # (vendor/katip-effectful, vendor/amazonka/lib/...) are committed to this repo
+      # on purpose: they are aligned for GHC 9.10, and building from upstream pins
+      # instead is what kept this job red while production built fine.
       - name: Build
-        run: cabal build cosmobot cosmocode -j all
+        run: cabal build --project-file=cabal.project.production cosmobot cosmocode -j all
 
       - name: Test
-        run: cabal test cosmobot -j all --test-options=--hide-successes
+        run: cabal test --project-file=cabal.project.production cosmobot -j all --test-options=--hide-successes
