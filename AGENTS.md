@@ -208,7 +208,7 @@ docker inspect fm-cosmobot --format '{{range .Mounts}}{{.Source}} -> {{.Destinat
 
 Recorded on 2026-09-12 (verify with the commands above, do not trust the prose):
 
-- image `fm-cosmobot:runtime-notices-20260912` (built from commit `4804e06`)
+- image `fm-cosmobot:runtime-latency-20260912` (built from commit `3d1d986`)
 - entrypoint `/opt/cosmobot/cosmobot`, cmd `serve --config config.toml`, workdir `/data`
 - restart `unless-stopped`, network `fm-runtime`, `cap_add CAP_SYS_ADMIN`
 - env `TZ=Asia/Shanghai`, `LANG`/`LC_ALL=C.UTF-8`, `cosmobot_datadir=/opt/cosmobot/share`
@@ -265,6 +265,14 @@ Two traps found the hard way on 2026-09-12:
   messages, two of them progress lines for tools that had already finished.
   shouldAnnounceProgress keeps the tag as "this may be slow" and excludes the fast
   set in one place, and it is unit tested.
+- Answer latency is a product of two structures, not of tuning: the reply was
+  buffered until the whole model turn was final, and `command` let the model wait
+  up to the 5 minute resource TTL inline. Measured: median 4.4s, p90 20.7s, worst
+  122s, and one 122s turn was eight `command` polls at 300s each (plus a model
+  round trip per poll). Fixes: flush the first finished sentence of an answer of
+  140+ characters, and cap command waits at 20s while a watcher thread posts the
+  output when the command ends. Keep the requested-opening exception: that
+  constraint is enforced on the completed reply.
 The `😻 FM：` prefix is decided from a marker the model may write at the head of
 its reply (`[[bare]]`, see `Bot.Chat.Bridge.FM`). That only works if the text
 reaching the prefixing step still starts with the marker, so every path that

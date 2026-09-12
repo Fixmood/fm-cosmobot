@@ -24,6 +24,7 @@ docker inspect fm-cosmobot --format '{{index .Config.Labels "com.docker.compose.
 
 | 容器名 | 镜像 | 状态 |
 | --- | --- | --- |
+| `fm-cosmobot-prev-latency-20260912-173215` | `fm-cosmobot:runtime-notices-20260912` | Exited (0) |
 | `fm-cosmobot-prev-notices-20260912-171124` | `fm-cosmobot:runtime-roster-20260912` | Exited (0) |
 | `fm-cosmobot-prev-roster-20260912-163712` | `fm-cosmobot:runtime-baregate-20260912` | Exited (0) |
 | `fm-cosmobot-prev-baregate-20260912-155422` | `fm-cosmobot:runtime-opening-guard-20260912` | Exited (0) |
