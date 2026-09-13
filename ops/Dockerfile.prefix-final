@@ -1,2 +1,0 @@
-FROM fm-cosmobot:runtime-471e7690b694
-COPY cosmobot-candidate /opt/cosmobot/cosmobot

@@ -400,15 +400,14 @@ Do not delete an image before checking this map: several images that look like
 dead history are referenced by tracked files.
 
 - `fm-cosmobot:build-4c782b1` — `deploy/Dockerfile.build-test`,
-  `ops/deploy_production.sh`, `ops/deploy_prefix_tmp.sh`, `ops/deploy_skip_tests.sh`,
+  `ops/deploy_production.sh`, `ops/deploy_prefix_tmp.sh`,
   `docs/DEPLOYMENT.md`, `/opt/fm-cosmobot/rebuild-*.sh`
 - `fm-cosmobot:compiled-current` — `deploy/Dockerfile.runtime`, the `ops/deploy_*.sh` scripts
 - `fm-cosmobot:runtime-fm-tools` (also tagged `runtime-image-download-fix`) —
   `/opt/fm-cosmobot/compose.yaml`, `deploy/cosmobot.compose.yaml`, `docs/ROLLBACK.md`
   (historic; keep only because those files reference it)
-- `fm-cosmobot:runtime-471e7690b694` — `ops/Dockerfile.prefix-final`
-- `fm-cosmobot:build-test-471e7690b694` — `ops/build-prefix-final.sh`, and the
-  toolchain every verification build depends on
+- `fm-cosmobot:build-test-471e7690b694` — the toolchain every verification
+  build depends on
 - The live production image and the newest rollback point change on every
   deploy. Read them from the machine instead of trusting this list:
   `docker inspect fm-cosmobot --format '{{.Config.Image}}'`, and the top row of
