@@ -441,8 +441,8 @@ observeEvent =
 
 modelResponses :: [(TurnState, LLM.ChatAnswer)]
 modelResponses =
-  [ (emptyState 0, LLM.ChatFinalAnswer "answer" Nothing)
-  , (emptyState 1, LLM.ChatToolRequest "" (toolCall 0 :| []) Nothing)
+  [ (emptyState 0, LLM.ChatFinalAnswer "answer" Nothing Nothing)
+  , (emptyState 1, LLM.ChatToolRequest "" (toolCall 0 :| []) Nothing Nothing)
   ]
 
 data ObservedOutput

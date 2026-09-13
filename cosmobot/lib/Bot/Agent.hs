@@ -434,8 +434,8 @@ joinSystemPrompts systemPrompt context =
   Text.strip $ Text.intercalate "\n\n" [systemPrompt, context]
 
 replaceMessageContent :: Maybe LLM.MessageContent -> LLM.ChatMessage -> LLM.ChatMessage
-replaceMessageContent content LLM.ChatMessage{role, toolCalls, toolCallId} =
-  LLM.ChatMessage role content toolCalls toolCallId
+replaceMessageContent content LLM.ChatMessage{role, toolCalls, toolCallId, reasoningContent} =
+  LLM.ChatMessage role content toolCalls toolCallId reasoningContent
 
 -----------------------------------------------------------------------------------------
 -- * Tool execution

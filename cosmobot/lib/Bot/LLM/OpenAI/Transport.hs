@@ -1070,6 +1070,10 @@ lastOrEmpty xs = fromMaybe "" (viaNonEmpty last xs)
 
 data StreamState = StreamState
   { contentAccumulator :: !TextBuilder.Builder
+    -- | Thinking-mode reasoning accumulated for this turn. Kept so the
+    -- assistant message we send on the next tool round can echo it back;
+    -- DeepSeek 400s on a tool-call turn whose reasoning_content is missing.
+  , reasoningAccumulator :: !TextBuilder.Builder
   , toolAccumulator :: !(Map Int PartialToolCall)
   , pendingContentOutputs :: ![Text]
   , tokenUsage :: !(Maybe TokenUsage)
@@ -1078,7 +1082,7 @@ data StreamState = StreamState
 
 emptyStreamState :: StreamState
 emptyStreamState =
-  StreamState mempty Map.empty [] Nothing
+  StreamState mempty mempty Map.empty [] Nothing
 
 data PartialToolCall = PartialToolCall
   { partialId :: !(Maybe Text)
@@ -1093,9 +1097,14 @@ emptyPartialToolCall = PartialToolCall Nothing Nothing mempty
 streamStateAnswer :: StreamState -> ChatAnswer
 streamStateAnswer streamState =
   withChatAnswerTokenUsage streamState.tokenUsage $
-    chatAnswer
+    chatAnswerWithReasoning
       (Text.strip (builderToStrictText streamState.contentAccumulator))
       (mapMaybe completePartialToolCall (Map.elems streamState.toolAccumulator))
+      reasoning
+  where
+    reasoning =
+      let text = Text.strip (builderToStrictText streamState.reasoningAccumulator)
+      in if Text.null text then Nothing else Just text
 
 completePartialToolCall :: PartialToolCall -> Maybe ToolCall
 completePartialToolCall PartialToolCall{partialId, partialName, partialArguments} = do
@@ -1117,9 +1126,11 @@ applyStreamChunk emitContentDeltas streamState chunk =
   where
     applyStreamChoice (acc, outputs) StreamChoice{delta} =
       let contentDelta = fromMaybe "" delta.content
+          reasoningDelta = fromMaybe "" delta.reasoningContent
       in
       ( acc
           & #contentAccumulator %~ (<> TextBuilder.fromText contentDelta)
+          & #reasoningAccumulator %~ (<> TextBuilder.fromText reasoningDelta)
           & #toolAccumulator %~ (\toolAccumulator ->
               foldl' applyToolCallDelta toolAccumulator delta.toolCalls)
           & #pendingContentOutputs %~ appendPendingContent contentDelta
@@ -1132,6 +1143,7 @@ streamStateWithUsage :: StreamState -> Maybe TokenUsage -> StreamState
 streamStateWithUsage streamState usage =
   StreamState
     { contentAccumulator = streamState.contentAccumulator
+    , reasoningAccumulator = streamState.reasoningAccumulator
     , toolAccumulator = streamState.toolAccumulator
     , pendingContentOutputs = streamState.pendingContentOutputs
     , tokenUsage = usage <|> streamState.tokenUsage
@@ -1208,6 +1220,7 @@ data StreamChoice = StreamChoice
 data StreamDelta = StreamDelta
   { content :: !(Maybe Text)
   , toolCalls :: ![ToolCallDelta]
+  , reasoningContent :: !(Maybe Text)
   }
   deriving (Show)
 
@@ -1215,7 +1228,8 @@ instance Aeson.FromJSON StreamDelta where
   parseJSON = Aeson.withObject "StreamDelta" $ \o -> do
     content <- o Aeson..:? "content"
     toolCalls <- fromMaybe [] <$> o Aeson..:? "tool_calls"
-    pure StreamDelta{content, toolCalls}
+    reasoningContent <- o Aeson..:? "reasoning_content"
+    pure StreamDelta{content, toolCalls, reasoningContent}
 
 data ToolCallDelta = ToolCallDelta
   { index :: !Int

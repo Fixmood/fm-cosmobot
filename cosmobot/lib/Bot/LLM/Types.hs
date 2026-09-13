@@ -21,8 +21,10 @@ module Bot.LLM.Types
   , memorySystemPrompt
   , assistantText
   , assistantAnswer
+  , chatAnswerReasoning
   , toolResult
   , chatAnswer
+  , chatAnswerWithReasoning
   , chatAnswerContent
   , chatAnswerToolCalls
   , chatAnswerTokenUsage
@@ -128,17 +130,32 @@ data ChatMessage = ChatMessage
   , content :: !(Maybe MessageContent)
   , toolCalls :: ![ToolCall]
   , toolCallId :: !(Maybe Text)
+    -- | Thinking-mode reasoning that accompanied this assistant turn.
+    --
+    -- DeepSeek rejects (HTTP 400: "The reasoning_content in the thinking mode
+    -- must be passed back to the API") a request whose assistant message carries
+    -- tool_calls but drops the reasoning_content the model produced for those
+    -- calls. The server currently tolerates the omission while the tool_call_id
+    -- is one it just issued, so upstream leniency is all that keeps this working;
+    -- do not rely on it. We keep the text and echo it back.
+    --
+    -- Only emitted when non-empty, so text-only turns are unaffected.
+  , reasoningContent :: !(Maybe Text)
   }
   deriving (Show)
 
 instance Aeson.ToJSON ChatMessage where
-  toJSON ChatMessage{role, content, toolCalls, toolCallId} =
+  toJSON ChatMessage{role, content, toolCalls, toolCallId, reasoningContent} =
     Aeson.object $
       [ "role" Aeson..= role
       ]
       <> maybe [] (\value -> ["content" Aeson..= value]) content
       <> [ "tool_calls" Aeson..= toolCalls | not (null toolCalls) ]
       <> maybe [] (\value -> ["tool_call_id" Aeson..= value]) toolCallId
+      <> [ "reasoning_content" Aeson..= value
+         | value <- maybeToList reasoningContent
+         , not (Text.null (Text.strip value))
+         ]
 
 instance Aeson.FromJSON ChatMessage where
   parseJSON = Aeson.withObject "ChatMessage" $ \o -> do
@@ -146,11 +163,13 @@ instance Aeson.FromJSON ChatMessage where
     content <- o Aeson..:? "content"
     toolCalls <- fromMaybe [] <$> o Aeson..:? "tool_calls"
     toolCallId <- o Aeson..:? "tool_call_id"
+    reasoningContent <- o Aeson..:? "reasoning_content"
     pure ChatMessage
       { role = role
       , content = content
       , toolCalls = toolCalls
       , toolCallId = toolCallId
+      , reasoningContent = reasoningContent
       }
 
 -- | Chat message content as plain text or OpenAI-compatible content parts.
@@ -232,11 +251,15 @@ data ChatAnswer
   = ChatFinalAnswer
       { content :: !Text
       , tokenUsage :: !(Maybe TokenUsage)
+        -- | Thinking-mode reasoning for this turn, echoed back on the next
+        -- tool round. See 'ChatMessage.reasoningContent' for why.
+      , reasoningContent :: !(Maybe Text)
       }
   | ChatToolRequest
       { content   :: !Text
       , toolCalls :: !(NonEmpty ToolCall)
       , tokenUsage :: !(Maybe TokenUsage)
+      , reasoningContent :: !(Maybe Text)
       }
   deriving (Show, Generic)
 
@@ -281,11 +304,25 @@ instance Aeson.ToJSON TokenUsage where
 
 chatAnswer :: Text -> [ToolCall] -> ChatAnswer
 chatAnswer content calls =
+  chatAnswerWithReasoning content calls Nothing
+
+-- | Like 'chatAnswer', but carries the thinking-mode reasoning produced for
+-- this turn so the next request can echo it back.
+chatAnswerWithReasoning :: Text -> [ToolCall] -> Maybe Text -> ChatAnswer
+chatAnswerWithReasoning content calls reasoning =
   case nonEmpty calls of
     Nothing ->
-      ChatFinalAnswer{content, tokenUsage = Nothing}
+      ChatFinalAnswer{content, tokenUsage = Nothing, reasoningContent = reasoning}
     Just toolCalls ->
-      ChatToolRequest{content, toolCalls, tokenUsage = Nothing}
+      ChatToolRequest{content, toolCalls, tokenUsage = Nothing, reasoningContent = reasoning}
+
+-- | The reasoning that accompanied this answer, when the provider sent any.
+chatAnswerReasoning :: ChatAnswer -> Maybe Text
+chatAnswerReasoning = \case
+  ChatFinalAnswer{reasoningContent} ->
+    reasoningContent
+  ChatToolRequest{reasoningContent} ->
+    reasoningContent
 
 chatAnswerContent :: ChatAnswer -> Text
 chatAnswerContent = \case
@@ -310,10 +347,10 @@ chatAnswerTokenUsage = \case
 
 withChatAnswerTokenUsage :: Maybe TokenUsage -> ChatAnswer -> ChatAnswer
 withChatAnswerTokenUsage usage = \case
-  ChatFinalAnswer{content} ->
-    ChatFinalAnswer{content, tokenUsage = usage}
-  ChatToolRequest{content, toolCalls} ->
-    ChatToolRequest{content, toolCalls, tokenUsage = usage}
+  ChatFinalAnswer{content, reasoningContent} ->
+    ChatFinalAnswer{content, tokenUsage = usage, reasoningContent}
+  ChatToolRequest{content, toolCalls, reasoningContent} ->
+    ChatToolRequest{content, toolCalls, tokenUsage = usage, reasoningContent}
 
 -- | A single function call requested by the model.
 data ToolCall = ToolCall
@@ -356,12 +393,12 @@ instance Aeson.ToJSON ToolCall where
 -- | Construct a text-only user message.
 userText :: Text -> ChatMessage
 userText prompt =
-  ChatMessage "user" (Just (TextContent prompt)) [] Nothing
+  ChatMessage "user" (Just (TextContent prompt)) [] Nothing Nothing
 
 -- | Construct a system prompt message.
 systemText :: Text -> ChatMessage
 systemText prompt =
-  ChatMessage "system" (Just (TextContent prompt)) [] Nothing
+  ChatMessage "system" (Just (TextContent prompt)) [] Nothing Nothing
 
 memorySystemPrompt :: Text -> Maybe Text -> Maybe Text -> Text
 memorySystemPrompt systemPrompt senderMemory chatMemory =
@@ -392,17 +429,22 @@ userWithImages :: Text -> [Text] -> ChatMessage
 userWithImages prompt [] =
   userText prompt
 userWithImages prompt urls =
-  ChatMessage "user" (Just (PartsContent (TextPart prompt : map ImageUrlPart urls))) [] Nothing
+  ChatMessage "user" (Just (PartsContent (TextPart prompt : map ImageUrlPart urls))) [] Nothing Nothing
 
 -- | Construct a text-only assistant message.
 assistantText :: Text -> ChatMessage
 assistantText answer =
-  ChatMessage "assistant" (Just (TextContent answer)) [] Nothing
+  ChatMessage "assistant" (Just (TextContent answer)) [] Nothing Nothing
 
 -- | Convert a normalized answer back into transcript form.
 assistantAnswer :: ChatAnswer -> ChatMessage
 assistantAnswer answer =
-  ChatMessage "assistant" messageContent (chatAnswerToolCalls answer) Nothing
+  ChatMessage
+    "assistant"
+    messageContent
+    (chatAnswerToolCalls answer)
+    Nothing
+    (chatAnswerReasoning answer)
   where
     content = chatAnswerContent answer
     messageContent
@@ -412,7 +454,7 @@ assistantAnswer answer =
 -- | Construct a tool result message for a previously requested call.
 toolResult :: ToolCall -> Text -> ChatMessage
 toolResult call result =
-  ChatMessage "tool" (Just (TextContent result)) [] (Just call.id)
+  ChatMessage "tool" (Just (TextContent result)) [] (Just call.id) Nothing
 
 previewText :: Int -> Text -> Text
 previewText maxChars text =

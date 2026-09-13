@@ -854,6 +854,7 @@ resolveChatMessage message =
         , content = Just (PartsContent resolvedParts)
         , toolCalls = message.toolCalls
         , toolCallId = message.toolCallId
+        , reasoningContent = message.reasoningContent
         }
     _ ->
       pure message

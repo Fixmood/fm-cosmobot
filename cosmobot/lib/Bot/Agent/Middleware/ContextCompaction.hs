@@ -141,7 +141,7 @@ preserveToolEnableCalls messages =
     , call <- message.toolCalls
     , call.name == toolEnableName
     , preserved <-
-        [ LLM.ChatMessage "assistant" Nothing [call] Nothing
+        [ LLM.ChatMessage "assistant" Nothing [call] Nothing Nothing
         , fromMaybe (LLM.toolResult call "Enabled.") (find ((== Just call.id) . (.toolCallId)) toolResults)
         ]
     ]
