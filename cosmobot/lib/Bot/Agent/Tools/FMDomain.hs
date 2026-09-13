@@ -40,7 +40,8 @@ import Bot.Agent.Tools.Common
   , requiredText
   , superuserOnly
   )
-import Bot.Agent.Types (Context (..), ToolResult, toolText)
+import Bot.Agent.Types (Context (..), ToolResult, toolFailure, toolText)
+import qualified Bot.Agent.Failure as Failure
 import Bot.Core.Message
   ( ChatPlatform (PlatformQQ)
   , IncomingMessage (..)
@@ -472,9 +473,15 @@ fmLiveCompetitionRankTool =
                       imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
                         <> "&date=" <> actualDate <> "&combined=1"
                   sent <- Chat.replyTo context.message (ReplyBody.imageDirective imageUrl)
-                  pure . toolText $ case rights sent of
-                    _ : _ -> "实时排行榜图片已发送。不要在最终回复中重复排行榜内容。"
-                    [] -> "实时排行榜已生成，但图片发送失败：" <> Text.intercalate "；" (lefts sent)
+                  case rights sent of
+                    _ : _ -> pure (toolText "实时排行榜图片已发送。不要在最终回复中重复排行榜内容。")
+                    [] -> do
+                      let err = Text.intercalate "；" (lefts sent)
+                      pure (toolFailure Failure.Failure
+                        { category = Failure.ExternalServiceUnavailable
+                        , userMessage = "实时排行榜已生成，但图片发送失败：" <> err
+                        , detail = err
+                        })
   where
     parseLiveRank :: Aeson.Value -> AesonTypes.Parser (Text, Text, Text, Text, Int, Text)
     parseLiveRank = Aeson.withObject "FM live competition rank" \o ->
@@ -517,9 +524,15 @@ fmLiveCompetitionTextTool =
                         "[FM/赛文·" <> contestDisplayName displaySource <> "] 《" <> title <> "》 [字数" <> show wordNumber <> "]\n\n"
                           <> body <> "\n\n-----第" <> contestShortName displaySource <> "段-FM发文"
                   sent <- Chat.replyTo context.message formatted
-                  pure . toolText $ case rights sent of
-                    _ : _ -> "实时赛文已发送。不要在最终回复中重复正文。"
-                    [] -> "实时赛文已取得，但发送失败：" <> Text.intercalate "；" (lefts sent)
+                  case rights sent of
+                    _ : _ -> pure (toolText "实时赛文已发送。不要在最终回复中重复正文。")
+                    [] -> do
+                      let err = Text.intercalate "；" (lefts sent)
+                      pure (toolFailure Failure.Failure
+                        { category = Failure.ExternalServiceUnavailable
+                        , userMessage = "实时赛文已取得，但发送失败：" <> err
+                        , detail = err
+                        })
   where
     parseLiveText :: Aeson.Value -> AesonTypes.Parser (Text, Text, Text, Int, Text, Text)
     parseLiveText = Aeson.withObject "FM live competition text" \o ->
@@ -628,7 +641,13 @@ fmAiContestLeaderboardImageTool =
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _:_ -> pure (toolText "Leaderboard image sent successfully.")
-            [] -> pure (toolText ("Leaderboard image send failed: " <> Text.intercalate "; " (lefts sent)))
+            [] -> do
+              let err = Text.intercalate "; " (lefts sent)
+              pure (toolFailure Failure.Failure
+                { category = Failure.ExternalServiceUnavailable
+                , userMessage = "Leaderboard image send failed: " <> err
+                , detail = err
+                })
 
 fmCompetitionScoreQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmCompetitionScoreQueryTool =
@@ -724,7 +743,13 @@ fmCompetitionScoreImageTool =
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _ : _ -> pure (toolText "成绩图片已发送。")
-            [] -> pure (toolText ("成绩图片发送失败：" <> Text.intercalate "；" (lefts sent)))
+            [] -> do
+              let err = Text.intercalate "；" (lefts sent)
+              pure (toolFailure Failure.Failure
+                { category = Failure.ExternalServiceUnavailable
+                , userMessage = "成绩图片发送失败：" <> err
+                , detail = err
+                })
 
 fmChartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmChartTool =
@@ -747,7 +772,13 @@ fmChartTool =
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _ : _ -> pure (toolText "成绩图表已发送。")
-            [] -> pure (toolText ("成绩图表发送失败：" <> Text.intercalate "；" (lefts sent)))
+            [] -> do
+              let err = Text.intercalate "；" (lefts sent)
+              pure (toolFailure Failure.Failure
+                { category = Failure.ExternalServiceUnavailable
+                , userMessage = "成绩图表发送失败：" <> err
+                , detail = err
+                })
 
 fmBotGuardAccountsTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmBotGuardAccountsTool =
@@ -782,9 +813,15 @@ sendAiContestText context response =
             "[FM/AI赛文·" <> difficulty <> "] 《" <> title <> "》 [字数" <> show (Text.length body) <> "]\n"
             <> body <> "\n-----第555段 " <> competitionDate <> "-FM赛文"
       sent <- Chat.replyTo context.message message
-      pure . toolText $ case rights sent of
-        _ : _ -> "AI 赛文已发送。不要在最终回复中重复正文。"
-        [] -> "AI 赛文已保存，但发送失败：" <> Text.intercalate "；" (lefts sent)
+      case rights sent of
+        _ : _ -> pure (toolText "AI 赛文已发送。不要在最终回复中重复正文。")
+        [] -> do
+          let err = Text.intercalate "；" (lefts sent)
+          pure (toolFailure Failure.Failure
+            { category = Failure.ExternalServiceUnavailable
+            , userMessage = "AI 赛文已保存，但发送失败：" <> err
+            , detail = err
+            })
   where
     parse = Aeson.withObject "FM AI contest publish" \outer -> do
       textValue <- outer Aeson..: "text"

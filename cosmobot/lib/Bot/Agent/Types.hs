@@ -32,6 +32,7 @@ module Bot.Agent.Types
 where
 
 import Bot.Agent.Failure
+import qualified Data.Text as Text
 import Bot.Core.Message
 import Bot.Core.Thread (ThreadMessageKey)
 import qualified Bot.Effect.Concurrency as Concurrency
@@ -221,7 +222,46 @@ toolResultContent = \case
   ToolSucceeded{content} ->
     content
   ToolFailed{failure} ->
-    failure.userMessage
+    failureContent failure
+
+-- | Text shown to the model for a failed tool call.
+--
+-- The model only ever sees this string, so dropping 'detail' entirely hides the
+-- actual cause (usually the raw exception) and leaves the model a summary it
+-- cannot act on -- or worse, one it glosses over as success.
+--
+-- Many failures are built as @makeFailure category message message@, so the
+-- detail is frequently identical to (or a prefix of) the summary. In that case
+-- appending it would only repeat text the model already has, so we stay quiet.
+failureContent :: Failure -> Text
+failureContent failure =
+  case Text.strip failure.detail of
+    "" ->
+      failure.userMessage
+    detail
+      | detail == summary -> failure.userMessage
+      | summary `Text.isPrefixOf` detail -> failure.userMessage
+      | otherwise ->
+          failure.userMessage
+            <> "\nRaw detail: "
+            <> previewFailureDetail detail
+            <> "\nReport the failure honestly; do not claim the action succeeded."
+      where
+        summary = Text.strip failure.userMessage
+
+-- | Cap on how much raw failure detail is handed to the model.
+failureDetailPreviewChars :: Int
+failureDetailPreviewChars = 800
+
+-- | Collapse whitespace and cap the length so a raw exception cannot flood the
+-- transcript. Local to this module on purpose: the equivalent helpers elsewhere
+-- live in LLM modules that this one must not depend on.
+previewFailureDetail :: Text -> Text
+previewFailureDetail text =
+  let oneLine = Text.unwords (Text.words text)
+  in if Text.length oneLine > failureDetailPreviewChars
+       then Text.take failureDetailPreviewChars oneLine <> "..."
+       else oneLine
 
 toolResultImageUrls :: ToolResult -> [Text]
 toolResultImageUrls = \case

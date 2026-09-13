@@ -15,7 +15,8 @@ import Bot.Agent.Tools.Common
   , requiredText
   , superuserOnly
   )
-import Bot.Agent.Types (Context (..), toolText)
+import Bot.Agent.Types (Context (..), toolFailure, toolText)
+import qualified Bot.Agent.Failure as Failure
 import qualified Bot.Chat.Bridge.FM as FMBridge
 import Bot.Core.Message
   ( ChatKind (ChatGroup, ChatPrivate)
@@ -151,7 +152,13 @@ fmRelayToOwnerTool =
             sent <- Chat.replyTo (ownerPrivateTarget context.message) body
             if any isRight sent
               then pure (toolText "已通过 QQ 私聊转告 Fix哥。")
-              else pure (toolText "传话失败：QQ 私聊消息没有成功发送。")
+              else do
+                let err = Text.intercalate "；" (lefts sent)
+                pure (toolFailure Failure.Failure
+                  { category = Failure.ExternalServiceUnavailable
+                  , userMessage = "传话失败：QQ 私聊消息没有成功发送。"
+                  , detail = err
+                  })
 
 explicitRelayRequest :: Text -> Bool
 explicitRelayRequest value =
@@ -206,7 +213,13 @@ fmRelayMessageTool =
                 sent <- Chat.replyTo (qqPrivateTarget context.message userId) body
                 if any isRight sent
                   then pure (toolText ("已通过 QQ 私聊转告 " <> target <> "。"))
-                  else pure (toolText ("传话失败：QQ 私聊消息没有成功发送给 " <> target <> "。"))
+                  else do
+                    let err = Text.intercalate "；" (lefts sent)
+                    pure (toolFailure Failure.Failure
+                      { category = Failure.ExternalServiceUnavailable
+                      , userMessage = "传话失败：QQ 私聊消息没有成功发送给 " <> target <> "。"
+                      , detail = err
+                      })
 
 resolveRelayTarget :: Chat.Chat :> es => Text -> IncomingMessage -> Eff es (Either Text Text)
 resolveRelayTarget rawTarget message =
