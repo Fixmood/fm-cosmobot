@@ -89,7 +89,8 @@ fmTellMemberTool =
             case chooseCandidate candidates of
               Left reason -> pure (toolText reason)
               Right member -> do
-                let body = mentionBody member.memberUserId ("Fix哥说：" <> Text.strip content)
+                let contentText = "Fix哥说：" <> Text.strip content
+                    preview = mentionBody member.memberUserId contentText
                     destination =
                       context.message
                         { platform = PlatformQQ
@@ -106,15 +107,19 @@ fmTellMemberTool =
                 if dryRun
                   then
                     pure . toolText $
-                      [i|干跑：本应发到 QQ群 #{member.memberGroup}，@#{member.memberUserId}（#{member.memberName}），内容：#{body}|]
+                      [i|干跑：本应发到 QQ群 #{member.memberGroup}，@#{member.memberUserId}（#{member.memberName}），内容：#{preview}|]
                   else do
-                    sent <- Chat.replyTo destination body
-                    if any isRight sent
-                      then
+                    -- Chat.mentionUser is the driver's own mention operation (Bot.Effect.Chat
+                    -- re-exports the ChatDriver module). It builds a structured at-segment
+                    -- and posts it with send_group_msg, so the mention is real. Sending
+                    -- "[CQ:at,qq=...]" through replyTo instead delivers that text literally,
+                    -- which is exactly what the group saw.
+                    sent <- Chat.mentionUser destination (show member.memberUserId) contentText
+                    case sent of
+                      Right _ ->
                         pure . toolText $
-                          [i|已发到 QQ群 #{member.memberGroup}：@#{member.memberUserId}，内容：#{body}|]
-                      else do
-                        let err = Text.intercalate "；" (lefts sent)
+                          [i|已发到 QQ群 #{member.memberGroup}：@#{member.memberUserId}，内容：#{contentText}|]
+                      Left err ->
                         pure (toolFailure Failure.Failure
                           { category = Failure.ExternalServiceUnavailable
                           , userMessage = [i|发送失败：没能把话送到 QQ群 #{member.memberGroup}。|]
