@@ -32,6 +32,7 @@ import Bot.Agent.Tools.Continuation
 import Bot.Agent.Tools.Meta
 import Bot.Agent.Tools.Model
 import Bot.Agent.Tools.Python
+import Bot.Agent.Tools.Relay
 import Bot.Agent.Tools.Repository
 import Bot.Agent.Tools.Terminal
 import Bot.Agent.Tools.Time
@@ -160,6 +161,7 @@ defaultToolsWith extraTools = tools
       , fmBridgeTestTool
       , fmRelayToOwnerTool
       , fmRelayMessageTool
+      , fmTellMemberTool
       , fmTakeoverManageTool
       , fmContestSearchTool
       , fmContestSendTool

@@ -206,6 +206,7 @@ library
         Bot.Agent.Tools.Meta
         Bot.Agent.Tools.Python
         Bot.Agent.Tools.Repository
+        Bot.Agent.Tools.Relay
         Bot.Agent.Tools.Emacs
         Bot.Agent.Tools.Files
         Bot.Agent.Tools.FMDomain
