@@ -32,9 +32,11 @@ withLinkingToolEmittedMessagesToThread sink program =
           program.aroundToolCall turn call context action
     }
 
+-- | The sink receives the platform id of the message that was just sent, so the
+-- recorded row can be found again later; without it a self row has no id.
 withRecordingToolSelfMessages
   :: Chat.Chat :> es
-  => (Text -> Eff es ())
+  => (Maybe MessageId -> Text -> Eff es ())
   -> Runtime context (Eff es)
   -> Runtime context (Eff es)
 withRecordingToolSelfMessages recordSelfMessage program =

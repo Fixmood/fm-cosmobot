@@ -41,6 +41,7 @@ data ChatLog :: Effect where
     -> ChatLog m ()
   RecordSelfMessage
     :: IncomingMessage
+    -> Maybe MessageId
     -> Text
     -> ChatLog m ()
   QueryChat
@@ -90,9 +91,9 @@ recordIncomingMessages =
     pure message
 
 -- | Record a logical self reply in the same chat as its triggering message.
-recordSelfMessage :: ChatLog :> es => IncomingMessage -> Text -> Eff es ()
-recordSelfMessage context body =
-  send (RecordSelfMessage context body)
+recordSelfMessage :: ChatLog :> es => IncomingMessage -> Maybe MessageId -> Text -> Eff es ()
+recordSelfMessage context sentMessageId body =
+  send (RecordSelfMessage context sentMessageId body)
 
 -- | Query recent messages from the current chat in chronological order.
 queryChat :: ChatLog :> es => IncomingMessage -> Maybe Text -> Int -> Bool -> ChatLogTimeRange -> Eff es [ChatLogEntry]
@@ -123,8 +124,8 @@ runChatLog inner =
     (\_ -> \case
       RecordMessage message ->
         ChatLogStorage.persistRecord (userRecord message)
-      RecordSelfMessage context body ->
-        ChatLogStorage.persistRecord (selfRecord context body)
+      RecordSelfMessage context sentMessageId body ->
+        ChatLogStorage.persistRecord (selfRecord context sentMessageId body)
       QueryChat message sender limit includeBotMessages timeRange ->
         ChatLogStorage.queryStored message sender limit includeBotMessages timeRange
       LookupMessage message messageId ->

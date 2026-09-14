@@ -768,7 +768,7 @@ testPythonControlAndNestedScopes = do
         sink = Agent.ToolEmittedMessageSink \messageId ->
           liftIO $ IORef.modifyIORef' remembered (<> [messageId])
         program =
-          (Agent.withRecordingToolSelfMessages \body ->
+          (Agent.withRecordingToolSelfMessages \_sentId body ->
             liftIO $ IORef.modifyIORef' recorded (<> [body]))
           . Agent.withLinkingToolEmittedMessagesToThread sink
           $ observed
@@ -1861,7 +1861,7 @@ testAskHandlerInjectsRecentGroupChatContext = do
   runAgentCapturingMessages captured answers (ChatMock (Just replies) (Just "reply-id") Nothing) do
     ChatLog.recordMessage alice
     ChatLog.recordMessage bob
-    ChatLog.recordSelfMessage current "这条机器人消息应当进入群聊背景"
+    ChatLog.recordSelfMessage current Nothing "这条机器人消息应当进入群聊背景"
     ChatLog.recordMessage current
     threads <- newThreadStore
     runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads current
@@ -1900,7 +1900,7 @@ testAskHandlerInjectsPrivateChatContext = do
         }
   runAgentCapturingMessages captured answers (ChatMock Nothing (Just "private-reply") Nothing) do
     ChatLog.recordMessage prior
-    ChatLog.recordSelfMessage prior "当然记得"
+    ChatLog.recordSelfMessage prior Nothing "当然记得"
     ChatLog.recordMessage unrelated
     ChatLog.recordMessage current
     threads <- newThreadStore
@@ -5438,7 +5438,7 @@ runAgentWithToolMessageCapture maxTurns context tools transcript recorded rememb
   let sink = Agent.ToolEmittedMessageSink \messageId ->
         liftIO $ IORef.modifyIORef' remembered (<> [messageId])
       program =
-        ( Agent.withRecordingToolSelfMessages \body ->
+        ( Agent.withRecordingToolSelfMessages \_sentId body ->
             liftIO $ IORef.modifyIORef' recorded (<> [body])
         )
           . Agent.withLinkingToolEmittedMessagesToThread sink

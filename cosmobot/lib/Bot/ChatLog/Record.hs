@@ -31,14 +31,14 @@ userRecord :: IncomingMessage -> ChatLogRecord
 userRecord message =
   ChatLogRecord message False
 
-selfRecord :: IncomingMessage -> Text -> ChatLogRecord
-selfRecord context body =
+selfRecord :: IncomingMessage -> Maybe MessageId -> Text -> ChatLogRecord
+selfRecord context sentMessageId body =
   ChatLogRecord
-    (selfMessage context body)
+    (selfMessage context sentMessageId body)
     True
 
-selfMessage :: IncomingMessage -> Text -> IncomingMessage
-selfMessage context body =
+selfMessage :: IncomingMessage -> Maybe MessageId -> Text -> IncomingMessage
+selfMessage context sentMessageId body =
   IncomingMessage
     { eventKind = IncomingMessageCreated
     , platform = context.platform
@@ -46,9 +46,14 @@ selfMessage context body =
     , chatId = context.chatId
     , chatAliases = context.chatAliases
     , digest = emptyMessageDigest
-    , senderId = Nothing
+    -- The bot's own id, so a self row can be told apart from a user row by more
+    -- than the is_bot flag. The digest carries it on platforms that report it.
+    , senderId = context.digest.botId
     , senderUsername = Nothing
-    , messageId = Nothing
+    -- The id the platform handed back for the message we actually sent. Without
+    -- it the row cannot be found again by id, which is why FM could not see its
+    -- own message when someone quoted it.
+    , messageId = sentMessageId
     , replyToMessageId = context.messageId
     , mentions = []
     , mentionUsernames = []

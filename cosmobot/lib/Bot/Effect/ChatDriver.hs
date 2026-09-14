@@ -323,25 +323,29 @@ runChatMappingReplies rewrite =
 -- platform operations still delegate to the outer 'Chat' interpreter.
 runChatRecordingSelfMessages
   :: ChatDriver :> es
-  => (Text -> Eff es ())
+  => (Maybe MessageId -> Text -> Eff es ())
   -> Eff es a
   -> Eff es a
 runChatRecordingSelfMessages recordSelf =
   interpose $ \localEnv -> \case
     operation@(SendReplyMessage _ body) -> do
       sent <- passthrough localEnv operation
-      recordSelf body
+      recordSelf (firstSentId sent) body
       pure sent
     operation@(SendStreamingReplyMessage _ body) -> do
       sent <- passthrough localEnv operation
-      recordSelf body
+      recordSelf (rightToMaybe sent) body
       pure sent
     operation@(MentionUser _ _ body) -> do
       sent <- passthrough localEnv operation
-      recordSelf body
+      recordSelf (rightToMaybe sent) body
       pure sent
     operation ->
       passthrough localEnv operation
+  where
+    -- The send result carries the platform message id, which is exactly what the
+    -- recorded row needs; without it FM's own replies are unfindable by id.
+    firstSentId = listToMaybe . mapMaybe rightToMaybe
 
 runChatRecordingExtraMessages
   :: ChatDriver :> es

@@ -994,7 +994,10 @@ commitAgentReply
   -> Eff es (Text, Transcript)
 commitAgentReply observer activeReply message AgentReply{responseId, answer, result} = do
   traverse_ (AgentObservation.observeThreadLinked observer . threadLink message result (activeReply.parentMessageKey <&> (.messageId))) responseId
-  ChatLog.recordSelfMessage message answer
+  -- Use the reply's own message id. It is the platform id of the message just
+  -- sent, so a later quote of it can be resolved; without it the row has no id
+  -- and FM cannot see its own message.
+  ChatLog.recordSelfMessage message responseId answer
   active <- IORef.readIORef activeReply.activeRef
   case active of
     Just activeHandle -> do

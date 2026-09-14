@@ -87,18 +87,24 @@ testBotMessageVisibility :: IO ()
 testBotMessageVisibility = runChatLogTest do
   let context = messageFromChat 100 200 "user"
   ChatLog.recordMessage context
-  ChatLog.recordSelfMessage context "bot reply"
+  -- The platform returns the id of the message it just sent; recording it is what
+  -- lets a later quote of our own message be resolved.
+  ChatLog.recordSelfMessage context (Just "900") "bot reply"
   userOnly <- ChatLog.queryChat context Nothing 10 False ChatLog.unboundedChatLogTimeRange
   withBot <- ChatLog.queryChat context Nothing 10 True ChatLog.unboundedChatLogTimeRange
   liftIO $ map (.text) userOnly @?= ["user"]
   liftIO $ map (.text) withBot @?= ["user", "bot reply"]
   liftIO $ map (.isBot) withBot @?= [False, True]
-  liftIO $ map (.messageId) withBot @?= [Just "100", Nothing]
+  liftIO $ map (.messageId) withBot @?= [Just "100", Just "900"]
+  -- A self row with no id from the platform still records, it is just unfindable.
+  ChatLog.recordSelfMessage context Nothing "no id reply"
+  withoutId <- ChatLog.queryChat context Nothing 10 True ChatLog.unboundedChatLogTimeRange
+  liftIO $ map (.messageId) withoutId @?= [Just "100", Just "900", Nothing]
 
 testImageSanitization :: IO ()
 testImageSanitization = runChatLogTest do
   ChatLog.recordMessage (messageFromChatWithImages 100 200 "look" [base64Image])
-  ChatLog.recordSelfMessage (messageFromChat 100 200 "user") ("[image] " <> base64Image)
+  ChatLog.recordSelfMessage (messageFromChat 100 200 "user") (Just "901") ("[image] " <> base64Image)
   entries <- ChatLog.queryChat (messageFromChat 999 200 "query") Nothing 10 True ChatLog.unboundedChatLogTimeRange
   liftIO $ map (.imageUrls) entries @?= [["[Picture]"], ["[Picture]"]]
   liftIO $ map (.text) entries @?= ["look", ""]
