@@ -116,7 +116,7 @@ fmLibraryStartTool =
 
 fmLibraryContinueTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLibraryContinueTool =
-  withDescription "Continue an ALREADY RUNNING typing-practice session by selecting and sending the next article. Requires a session that is currently in progress in this chat for this person; it fails with an error when there is none, so never use it to open the first article -- use fm_library_start for that. Typically used right after a typing score is submitted. A requested difficulty selects another article strictly inside that same interval."
+  withDescription "Continue an ALREADY RUNNING typing-practice session by selecting and sending the next article. Requires a session currently in progress in this chat for this person. If it answers that there is no article in progress, that is NOT a limitation of FM: immediately call fm_library_start to open one, in the same turn, and never report the absence as something the system cannot do. Never use this tool to open the first article. Typically used right after a typing score is submitted. A requested difficulty selects another article strictly inside that same interval."
   $ tool "fm_library_continue" noArguments do
       context <- askToolContext
       withCapability context "library" do
