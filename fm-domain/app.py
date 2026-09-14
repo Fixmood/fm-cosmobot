@@ -285,6 +285,11 @@ LIBRARY_DIFFICULTY_ALIASES = {
     "nan": "难", "难级": "难", "困难": "难",
     "nue": "虐", "虐级": "虐", "爆表": "虐", "爆虐": "虐",
 }
+# An article session that has seen no activity for this long is treated as
+# abandoned and stopped on the next status read. Without it, sessions stay
+# status='active' forever and keep occupying the "current article" slot.
+LIBRARY_SESSION_IDLE_SECONDS = 30 * 60
+
 LIBRARY_DEFAULT_MIN_LENGTH = 200
 LIBRARY_DEFAULT_MAX_LENGTH = 400
 LIBRARY_MAX_LENGTH = 1400
@@ -2354,8 +2359,36 @@ def library_stats(db: sqlite3.Connection) -> dict:
     }
 
 
+def expire_idle_library_sessions(db: sqlite3.Connection, platform: str,
+                                 chat_id: str, requester_id: str) -> int:
+    """Stop abandoned sessions for this chat+person; return how many were stopped.
+
+    Lazy expiry: called on every status read instead of running a timer.
+    """
+    cutoff = time.time() - LIBRARY_SESSION_IDLE_SECONDS
+    stopped = 0
+    for table in ("library_sessions", "single_sessions"):
+        rows = db.execute(
+            f"SELECT session_id FROM {table} WHERE platform=? AND chat_id=? "
+            f"AND requester_id=? AND status='active' AND updated_at < ?",
+            (platform, chat_id, requester_id, cutoff),
+        ).fetchall()
+        if not rows:
+            continue
+        db.execute(
+            f"UPDATE {table} SET status='stopped', updated_at=? WHERE platform=? "
+            f"AND chat_id=? AND requester_id=? AND status='active' AND updated_at < ?",
+            (time.time(), platform, chat_id, requester_id, cutoff),
+        )
+        stopped += len(rows)
+    if stopped:
+        db.commit()
+    return stopped
+
+
 def library_session_status(db: sqlite3.Connection, payload: dict) -> dict:
     platform, chat_id, requester_id, _ = library_payload_identity(payload)
+    expire_idle_library_sessions(db, platform, chat_id, requester_id)
     article = db.execute(
         "SELECT s.*,m.requested_difficulty,m.requested_length,m.requested_genre FROM library_sessions s "
         "LEFT JOIN library_session_modes m ON m.session_id=s.session_id "
