@@ -49,6 +49,7 @@ main =
       , testCase "FM mapped QQ group uses the Matrix reply pipeline" testFmMappedQqGroupUsesMatrixReplyPipeline
       , testCase "FM Matrix reply body is relayed at most once" testFmMatrixReplyBodyIsRelayedAtMostOnce
       , testCase "FM bridge delivery ids preserve Matrix and QQ recall targets" testFmBridgeDeliveryIds
+      , testCase "the DSML tool protocol never reaches chat" testDsmlProtocolIsNeverShown
       , testCase "FM exact library commands bypass the agent" testFmExactLibraryCommands
       , testCase "FM direct library route accepts QQ and Matrix" testFmDirectLibraryPlatforms
       , testCase "FM typing scores continue on QQ and Matrix" testFmTypingScorePlatforms
@@ -1810,3 +1811,42 @@ discordUser userId username fromBot =
     , Discord.bot = fromBot
     , Discord.avatar = Nothing
     }
+
+-- The endpoint sometimes emits its internal DSML tool protocol as ordinary
+-- content instead of a tool call. It reached a real group on 2026-09-14 while
+-- every pre-existing test still passed, because those only covered the
+-- single-bar marker. These pin the shapes actually observed.
+testDsmlProtocolIsNeverShown :: Assertion
+testDsmlProtocolIsNeverShown = do
+  let bar = "\xff5c\xff5c"
+      leaked =
+        "<" <> bar <> "DSML" <> bar <> " calls>\n"
+          <> "<" <> bar <> "DSML" <> bar <> " invoke name=\"chat_memory\">\n"
+          <> "<" <> bar <> "DSML" <> bar <> " parameter name=\"content\" string=\"true\">"
+          <> "希望 FM 看到他在本群发言时，顺手给他一个「更好的说法」"
+          <> "</" <> bar <> "DSML" <> bar <> " parameter>\n"
+          <> "</" <> bar <> "DSML" <> bar <> " invoke>\n"
+          <> "</" <> bar <> "DSML" <> bar <> " calls>"
+  -- pure protocol: nothing survives, and a placeholder stands in for it
+  AgentRun.sanitizeUserFacingReply leaked @?= "处理已完成。"
+  -- a real answer after the block is kept
+  AgentRun.sanitizeUserFacingReply (leaked <> "\n\n行，我记下了。") @?= "行，我记下了。"
+  -- a real answer before the block is kept
+  AgentRun.sanitizeUserFacingReply ("好嘞，这就去记——\n" <> leaked) @?= "好嘞，这就去记——"
+  -- the parameter payload must not be published either
+  let cleaned = AgentRun.sanitizeUserFacingReply leaked
+  assertBool "the parameter payload must not reach chat" (not ("更好的说法" `Text.isInfixOf` cleaned))
+  -- the older single-bar form still goes
+  AgentRun.sanitizeUserFacingReply "<|DSML|>calls</|DSML|>" @?= "处理已完成。"
+  -- tag-only variant with no DSML word
+  AgentRun.sanitizeUserFacingReply ("<" <> bar <> "calls" <> bar <> ">") @?= "处理已完成。"
+  -- ordinary prose must be untouched
+  let ordinary =
+        [ "普通一句话。"
+        , "我用了 < 和 > 这两个符号。"
+        , "价格是 3|4 元，a|b 二选一。"
+        , "全角竖线测试：｜这是普通文本｜"
+        , "聊聊 DSML 这个词本身。"
+        , "今天写了一天的代码，感觉啥也没干成"
+        ]
+  mapM_ (\line -> AgentRun.sanitizeUserFacingReply line @?= line) ordinary

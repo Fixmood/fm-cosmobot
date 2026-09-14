@@ -9,6 +9,7 @@ Stability   : experimental
 module Bot.Handler.Ask.AgentRun
   ( runAskAgentThread
   , askSystemPrompt
+  , sanitizeUserFacingReply
   , streamingReplyChunks
   , streamingReplyChunksForRequest
   , earlyFlushDue
@@ -813,7 +814,12 @@ renderReplyText =
 
 sanitizeUserFacingReply :: Text -> Text
 sanitizeUserFacingReply reply
-  | any (`Text.isInfixOf` normalized) protocolMarkers =
+  -- Test for the SHAPE of the protocol rather than a list of literals. Enumerating
+  -- literals is what let the leak through: the model emits the marker with one or
+  -- two bars, ASCII or fullwidth, and sometimes with no DSML word at all
+  -- (<｜｜calls｜｜>), none of which matched the old list, so the reply was
+  -- returned untouched and the raw protocol was posted to chat.
+  | hasProtocolMarker reply || hasBareProtocolTag reply || "tool_calls" `Text.isInfixOf` normalized =
       let cleaned = stripDsmlProtocol reply
       in if Text.null (Text.strip cleaned) then "处理已完成。" else Text.strip cleaned
   | any (`Text.isInfixOf` normalized) internalMarkers =
@@ -823,11 +829,6 @@ sanitizeUserFacingReply reply
   | otherwise = reply
   where
     normalized = Text.toCaseFold reply
-    protocolMarkers =
-      [ "<|dsml|>"
-      , "<｜dsml｜>"
-      , "tool_calls"
-      ]
     internalMarkers =
       [ "send_media"
       , "file_to_media"
@@ -835,24 +836,154 @@ sanitizeUserFacingReply reply
       , "我需要用发送图片"
       ]
 
--- DeepSeek-compatible endpoints can occasionally emit their internal DSML
--- tool protocol as ordinary content. Never expose that protocol to chat.
+-- | Cut the model's internal DSML tool protocol out of a reply.
+--
+-- The protocol reaches chat when the endpoint emits it as ordinary content
+-- instead of a tool call. It shows up as tags with one or two vertical bars,
+-- ASCII or fullwidth, sometimes with a space before the element name:
+--
+-- > <｜｜DSML｜｜ calls>
+-- > <｜｜DSML｜｜ invoke name="chat_memory">
+-- > <｜｜DSML｜｜ parameter name="content" string="true">..</｜｜DSML｜｜ parameter>
+--
+-- Earlier code matched two exact literals, so none of those were removed.
+--
+-- Every leaked reply observed on the live endpoint was protocol-only: nothing
+-- followed the closing tag, and the parameter payload must go too (publishing it
+-- would expose what the model meant to store rather than say). So drop the span
+-- from the first marker to the end of the last one.
 stripDsmlProtocol :: Text -> Text
 stripDsmlProtocol input =
-  stripWithOpen "<|DSML|>" "</|DSML|>" input
-    & stripWithOpen "<｜DSML｜>" "</｜DSML｜>"
+  case protocolSpans input of
+    Nothing -> stripBareProtocolTags input
+    Just stripped -> collapseBlankLines stripped
+
+-- | The reply with the protocol block removed: text before the first marker is
+-- kept, everything from the first marker to the end of the last one is dropped.
+protocolSpans :: Text -> Maybe Text
+protocolSpans input =
+  case firstMarkerAt input of
+    Nothing -> Nothing
+    Just (start, afterFirst) ->
+      let head_ = Text.take start input
+          body =
+            if Text.null afterFirst
+              then ""
+              else Text.drop 1 (snd (Text.breakOn ">" afterFirst))
+       in case lastMarkerStart body of
+            Nothing -> Just (Text.dropWhileEnd isSpaceLike head_)
+            Just offset ->
+              let tailFromLast = Text.drop offset body
+                  remainder = snd (Text.breakOn ">" tailFromLast)
+                  kept =
+                    if Text.null remainder
+                      then ""
+                      else Text.drop 1 remainder
+               in Just (Text.strip (head_ <> kept))
+
+-- | What follows the first protocol marker, or Nothing when there is none.
+-- The offset of that marker is always 0 from the caller's point of view.
+firstMarker :: Text -> Maybe Text
+firstMarker text = case firstMarkerAt text of
+  Nothing -> Nothing
+  Just (_, after) -> Just after
+
+-- | First protocol marker anywhere in the text, returned as
+-- (offset of its '<', text that follows it).
+firstMarkerAt :: Text -> Maybe (Int, Text)
+firstMarkerAt = scan 0
   where
-    stripWithOpen open close text =
-      case Text.breakOn open text of
+    scan offset remaining =
+      case Text.uncons remaining of
+        Nothing -> Nothing
+        Just (_, rest) ->
+          case consumeMarker remaining of
+            Just after -> Just (offset, after)
+            Nothing -> scan (offset + 1) rest
+
+-- | Offset of the last protocol marker start, or Nothing.
+lastMarkerStart :: Text -> Maybe Int
+lastMarkerStart text = go 0 Nothing text
+  where
+    go offset found remaining =
+      case Text.uncons remaining of
+        Nothing -> found
+        Just (_, rest) ->
+          case consumeMarker remaining of
+            Just after ->
+              let consumed = Text.length remaining - Text.length after
+              in go (offset + consumed) (Just offset) after
+            Nothing -> go (offset + 1) found rest
+
+-- | True when any protocol marker appears.
+hasProtocolMarker :: Text -> Bool
+hasProtocolMarker = isJust . firstMarkerAt
+
+-- | Match a protocol marker at the very start of the text and return what
+-- follows it. Shape: '<' '/'? bar+ zero-width* "DSML" (case-insensitive).
+consumeMarker :: Text -> Maybe Text
+consumeMarker text = do
+  afterAngle <- Text.stripPrefix "<" text
+  let afterSlash = fromMaybe afterAngle (Text.stripPrefix "/" afterAngle)
+      afterBars =
+        Text.dropWhile (== '|')
+          (Text.dropWhile (== '\xff5c')
+            (Text.dropWhile (== '|') afterSlash))
+  if Text.length afterBars >= Text.length afterSlash
+    then Nothing
+    else do
+      let afterZw = Text.dropWhile isZeroWidth afterBars
+      if "dsml" `Text.isPrefixOf` Text.toCaseFold afterZw
+        then Just (Text.drop 4 afterZw)
+        else Nothing
+
+isZeroWidth :: Char -> Bool
+isZeroWidth c = c `elem` ['\x200b', '\x200c', '\x200d', '\xfeff']
+
+isSpaceLike :: Char -> Bool
+isSpaceLike c = c `elem` [' ', '\t', '\n', '\r', '\x3000']
+
+-- | Tags with doubled bars but no DSML word, e.g. <｜｜calls｜｜>.
+stripBareProtocolTags :: Text -> Text
+stripBareProtocolTags text
+  | hasBareProtocolTag text = collapseBlankLines (Text.strip (go text))
+  | otherwise = text
+  where
+    go remaining =
+      case Text.breakOn "<" remaining of
         (before, rest)
-          | Text.null rest -> text
+          | Text.null rest -> before
           | otherwise ->
-              let afterOpen = Text.drop (Text.length open) rest
-                  afterBlock =
-                    case Text.breakOn close afterOpen of
-                      (_, closing) | not (Text.null closing) -> Text.drop (Text.length close) closing
-                      _ -> ""
-              in before <> stripWithOpen open close afterBlock
+              let (candidate, _) = Text.breakOn ">" rest
+                  lowered = Text.toCaseFold candidate
+                  isBare =
+                    any (`Text.isInfixOf` lowered) ["calls", "invoke", "parameter"]
+                      && any (`Text.isInfixOf` candidate) ["||", "\xff5c\xff5c"]
+               in if isBare
+                    then before <> go (Text.drop 1 (snd (Text.breakOn ">" rest)))
+                    else before <> Text.take 1 rest <> go (Text.drop 1 rest)
+
+hasBareProtocolTag :: Text -> Bool
+hasBareProtocolTag text = go text
+  where
+    go remaining =
+      case Text.breakOn "<" remaining of
+        (_, rest)
+          | Text.null rest -> False
+          | otherwise ->
+              let (candidate, _) = Text.breakOn ">" rest
+                  lowered = Text.toCaseFold candidate
+               in (any (`Text.isInfixOf` lowered) ["calls", "invoke", "parameter"]
+                     && any (`Text.isInfixOf` candidate) ["||", "\xff5c\xff5c"])
+                    || go (Text.drop 1 rest)
+
+collapseBlankLines :: Text -> Text
+collapseBlankLines = Text.strip . Text.unlines . squeeze . Text.lines
+  where
+    squeeze [] = []
+    squeeze (line : more)
+      | Text.null (Text.strip line) = squeeze (dropWhile (Text.null . Text.strip) more)
+      | otherwise = line : squeeze more
 
 commitAgentReply
   :: (ChatLog.ChatLog :> es, Storage.Storage :> es, KatipE :> es, Prim :> es, Concurrent :> es, IOE :> es)
