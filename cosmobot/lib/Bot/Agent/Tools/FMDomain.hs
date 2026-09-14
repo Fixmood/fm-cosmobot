@@ -857,8 +857,14 @@ hasExplicitLibraryIntent context =
   where
     normalized = Text.toLower . Text.filter (not . (`elem` [' ', '\t', '\r', '\n'])) $ context.input.text
     libraryTerms =
-      [ "发文", "文来", "来一篇", "发一篇", "文章", "练习文", "文库"
+      [ "发文", "文来", "来一篇", "来篇", "来点文", "发一篇", "发篇"
+      , "文章", "练习文", "文库", "开一篇", "开篇"
       , "续文", "续段", "上一篇", "这篇文", "停止发文", "单字练习"
+      -- Difficulty words on their own count as an article request; the model
+      -- passes the character in `difficulty`. Without this, "来篇水文" fell
+      -- through the gate entirely and the tools were hidden from the model.
+      , "淼文", "水文", "易文", "普文", "难文", "虐文"
+      , "淼档", "水档", "易档", "普档", "难档", "虐档"
       ]
     isDifficultyCommand input =
       any (`Text.isInfixOf` input)
