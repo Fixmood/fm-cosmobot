@@ -1660,7 +1660,8 @@ def start_contest_session(db: sqlite3.Connection, payload: dict) -> dict:
     competition_date = str(payload.get("date") or "").strip()
     row = pick_contest_row(db, query, source_group, competition_date)
     if not row:
-        return {"status": "not_found", "message": "没有找到符合条件的历史赛文。"}
+        return {"status": "not_found", "message": "没有找到符合条件的历史赛文。",
+                "next_action": "这是查询结果为空，不是能力限制：换关键词或换难度再试，或改用 fm_contest_search 列出现有赛文。"}
     now = time.time()
     session = {
         "session_id": contest_session_id(platform, chat_id, requester_id),
@@ -1700,7 +1701,8 @@ def continue_contest_session(db: sqlite3.Connection, payload: dict) -> dict:
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的赛文。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的赛文。",
+                "next_action": "这是状态，不是能力限制：调用 fm_contest_send 或 fm_ai_contest_text 新发一篇，不要告诉用户系统做不到。"}
     selected = pick_contest_row(
         db, row["query_text"], row["source_group"], "", row["last_text_id"],
     )
@@ -1822,12 +1824,14 @@ def start_library_session(db: sqlite3.Connection, payload: dict) -> dict:
     )
     if not selected:
         detail = f"“{difficulty}”难度区间" if difficulty else "要求"
-        return {"status": "not_found", "message": f"没有找到符合{detail}的文库文章。"}
+        return {"status": "not_found", "message": f"没有找到符合{detail}的文库文章。",
+                "next_action": "这是筛选结果为空，不是能力限制：去掉难度或换关键词再调一次，或先用 fm_library_search 看有哪些可选。"}
     row, body, score, actual_difficulty = selected
     content = normalize_library_content(row["content"])
     metadata = classify_library_row(db, row)
     if not body:
-        return {"status": "not_found", "message": "找到的文章没有可发送正文。"}
+        return {"status": "not_found", "message": "找到的文章没有可发送正文。",
+                "next_action": "换一篇再试一次（重调本工具或换 query），不要把这一篇的问题说成系统做不到。"}
     save_previous_library_session(db, platform, chat_id, requester_id)
     end = len(body)
     now = time.time()
@@ -1885,7 +1889,8 @@ def continue_library_session(db: sqlite3.Connection, payload: dict) -> dict:
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。",
+                "next_action": "这是状态，不是能力限制：调用 fm_library_start 新开一篇，或调 fm_library_continue_previous 恢复上一篇；不要告诉用户系统做不到。"}
     mode = db.execute(
         "SELECT requested_difficulty,requested_length,requested_genre FROM library_session_modes WHERE session_id=?",
         (row["session_id"],),
@@ -1913,7 +1918,8 @@ def continue_same_library_session(db: sqlite3.Connection, payload: dict) -> dict
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。",
+                "next_action": "这是状态，不是能力限制：调用 fm_library_start 新开一篇，或调 fm_library_continue_previous 恢复上一篇；不要告诉用户系统做不到。"}
     content = normalize_library_content(row["content"])
     start = int(row["next_offset"])
     mode = db.execute(
@@ -2135,14 +2141,16 @@ def start_single_session(db: sqlite3.Connection, payload: dict) -> dict:
         (name,),
     ).fetchone()
     if not row:
-        return {"status": "not_found", "message": f"单字库《{name}》还没装好。"}
+        return {"status": "not_found", "message": f"单字库《{name}》还没装好。",
+                "next_action": "换一个单字库名字再试，或先列出可用的单字库。"}
     sequence = re.sub(r"\s+", "", row["content"])
     if order_name == "乱":
         characters = list(sequence)
         random.shuffle(characters)
         sequence = "".join(characters)
     if not sequence:
-        return {"status": "not_found", "message": f"单字库《{name}》没有可发送内容。"}
+        return {"status": "not_found", "message": f"单字库《{name}》没有可发送内容。",
+                "next_action": "换一个单字库再试一次。"}
     end = min(length, len(sequence))
     now = time.time()
     session = {
@@ -2189,7 +2197,8 @@ def continue_single_session(db: sqlite3.Connection, payload: dict) -> dict:
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的单字练习。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的单字练习。",
+                "next_action": "这是状态，不是能力限制：调用 fm_library_start 或对应的单字练习工具新开一轮，不要告诉用户系统做不到。"}
     start = int(row["next_offset"])
     sequence = str(row["sequence"])
     if start >= len(sequence):
@@ -2237,7 +2246,8 @@ def stop_library_session(db: sqlite3.Connection, payload: dict) -> dict:
             if row:
                 candidates.append((row, table))
     if not candidates:
-        return {"status": "idle", "message": "当前会话没有正在进行的发文。"}
+        return {"status": "idle", "message": "当前会话没有正在进行的发文。",
+                "next_action": "这是状态，不是能力限制：调用 fm_library_start 新开一篇，不要告诉用户系统做不到。"}
     row, table = max(candidates, key=lambda item: float(item[0]["updated_at"]))
     db.execute(
         f"UPDATE {table} SET status='stopped',updated_at=? WHERE session_id=?",
