@@ -230,14 +230,18 @@ selectToolsForMessage context tools =
       name `elem` alwaysVisible domain
         || name `elem` domainTools domain
 
+    -- Delivering a message into another chat is not domain-specific: the owner
+    -- may ask for it in any conversation, so it must survive every subset.
     alwaysVisible Image =
       [ "datetime"
       , "current_message_info"
+      , "fm_tell_member"
       ]
     alwaysVisible _ =
       [ toolEnableName
       , "datetime"
       , "current_message_info"
+      , "fm_tell_member"
       ]
 
     domainTools = \case
