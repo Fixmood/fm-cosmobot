@@ -101,7 +101,7 @@ fmLibraryPickTool =
 fmLibraryStartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLibraryStartTool =
   allowWhen hasExplicitLibraryIntent
-  . withDescription "Start a persistent FM typing-practice article session in the current chat and send its first segment. Use only when the current message explicitly asks FM to send an article, 文来, 发文, 来一篇, or a difficulty command. A topic mentioned in ordinary conversation is not a request to search or send an article. For fm 淼/水/易/普/难/虐, pass that exact character in difficulty and leave query empty; each mode randomly selects only from its strict difficulty interval. The selected mode persists after typing scores. The tool sends the article itself; do not repeat the article body in the final response."
+  . withDescription "Open a NEW typing-practice article session in the current chat and send its first segment. THIS is the tool to use whenever the current message asks FM to send an article in any phrasing -- 来一篇、来篇、来点文、发一篇、开一篇、文来、发文、文章、练习文, or a difficulty word such as 水文/水档/来篇水文 -- and also whenever no session is in progress yet. Passing difficulty (淼/水/易/普/难/虐) picks strictly inside that interval; leave query empty then. The selected mode persists after typing scores. A topic mentioned in ordinary conversation is not a request to send an article. If a session is already running and the user asks for another article, use fm_library_continue instead. The tool sends the article itself; do not repeat the article body in the final response."
   $ tool "fm_library_start"
       ( optionalText "query" "Optional title, topic, style, or content keyword. Leave empty for 文来 and difficulty commands."
       , optionalText "difficulty" "Optional strict difficulty mode: 淼、水、易、普、难、虐. Empty means random 文来."
@@ -116,7 +116,7 @@ fmLibraryStartTool =
 
 fmLibraryContinueTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLibraryContinueTool =
-  withDescription "Continue the current FM typing-practice mode by selecting and sending a new article. Random mode selects another random article; a requested difficulty selects another article strictly inside that same difficulty interval. This is the default continuation after a typing score."
+  withDescription "Continue an ALREADY RUNNING typing-practice session by selecting and sending the next article. Requires a session that is currently in progress in this chat for this person; it fails with an error when there is none, so never use it to open the first article -- use fm_library_start for that. Typically used right after a typing score is submitted. A requested difficulty selects another article strictly inside that same interval."
   $ tool "fm_library_continue" noArguments do
       context <- askToolContext
       withCapability context "library" do
