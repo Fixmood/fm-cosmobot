@@ -2705,14 +2705,11 @@ def bot_guard_check(db: sqlite3.Connection, payload: dict) -> dict:
                 (group_id, sender_id, now),
             )
             db.commit()
-    replies = [
-        "你先停一下，FM 不接机器人互聊，免得群里绕成循环。",
-        "这轮不跟机器人对话，再接下去就要开始无限套话了。",
-        "识别到机器人消息了，FM 到这里收手，不陪你自动循环。",
-        "机器人互聊先打住，这句我不往下接。",
-    ]
-    index = sum(ord(char) for char in f"{group_id}:{sender_id}") % len(replies)
-    return {"blocked": blocked, "reply": replies[index] if should_reply else "", "enabled": enabled}
+    # Silent by design: blocking another bot is housekeeping, not something the
+    # group needs narrated. The caller posts a reply only when it is non-empty
+    # (Bot/Handler/FM.hs: `unless (Text.null reply) $ void (Chat.replyTo ...)`), so
+    # returning nothing stops FM answering without announcing that it stopped.
+    return {"blocked": blocked, "reply": "", "enabled": enabled}
 
 
 def update_bot_guard_account(db: sqlite3.Connection, payload: dict) -> dict:
