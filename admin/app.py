@@ -650,6 +650,74 @@ def fetch_rpc(method: str, params: dict | None = None) -> dict:
         return result
 
 
+# ── RPC 转发白名单 ────────────────────────────────────────────────────────
+# 管理面板可用的机器人 RPC 方法。面板本身已鉴权，这里是纵深防御：
+# 一个被窃取的会话 cookie 不应该等于机器人的完全控制权。
+RPC_ALLOW = {
+    # 会话（读）
+    "chat.list_sessions", "chat.get_session", "chat.history",
+    # 会话（写）
+    "chat.open_session", "chat.send", "chat.rename_session", "chat.delete_session",
+    "chat.fork", "chat.upload_attachment",
+    # 媒体
+    "media.stats", "media.get", "media.delete", "media.gc", "media.resolve_source",
+    # 资源
+    "resource.list", "resource.detail", "resource.rename", "resource.keep_alive",
+    "resource.make_permanent", "resource.destroy", "resource.destroy_associated",
+    # 并发与任务
+    "concurrency.list", "concurrency.lookup", "concurrency.await", "concurrency.cancel",
+    # 直发消息（机器人自有扩展方法）
+    "send_direct_message",
+}
+
+# 只读的遥测类方法按前缀放行
+# P3-a: 前缀白名单负责「这个方法能不能转发」，动作级策略负责「这个动作能不能做」。
+#
+# 踩过的坑：第一版把 config.model / config.image_model 从 RPC_ALLOW_PREFIX 里删掉，
+# 想靠「不放行整个方法」来挡住危险的 add/edit。结果连内部读路径一起挡了——
+# 设置页的「模型」表走的是 runtime_config_result("model") -> config.model，
+# 于是页面上的模型列表变成 403。前缀该留着，拦截交给下面的动作策略。
+RPC_ALLOW_PREFIX = ("audit.", "config.snapshot", "config.model", "config.image_model",
+                    "config.persona", "config.trigger")
+
+
+# P3-a: 配置类方法的动作级白名单。
+# None = 该方法名下所有动作都不允许（表里没写的按允许处理）。
+# 集合 = 只有列出的动作放行。
+#
+# 为什么需要这个：config.model / config.image_model 的 add / edit 要传
+# base_url + api_key（机器人侧 RuntimeConfig.hs:120-131、142-149），
+# 属于「能改基础设施」的操作，不该由面板的通用转发口暴露。
+# 读状态（status）要留着，因为「设置」页要显示当前模型与密钥是否已配置。
+RPC_ACTION_POLICY = {
+    "config.model": {"status", "get", "list"},
+    "config.image_model": {"status", "get", "list"},
+    "config.persona": {"status", "get", "list", "set", "clear"},
+    "config.trigger": {"status", "get", "list", "set", "clear"},
+}
+
+
+def rpc_action_allowed(method: str, params: object) -> bool:
+    """配置类方法还要看动作。不在策略表里的方法不受此限。"""
+    allowed = RPC_ACTION_POLICY.get(method)
+    if allowed is None:
+        return True
+    action = ""
+    if isinstance(params, dict):
+        action = str(params.get("action") or "").strip().lower()
+    if not action:
+        # 不带 action 的调用按读处理（机器人侧默认也是 status 语义）
+        return True
+    return action in allowed
+
+
+def rpc_method_allowed(method: str) -> bool:
+    """管理面板允许转发的 RPC 方法。"""
+    if method in RPC_ALLOW:
+        return True
+    return any(method.startswith(prefix) for prefix in RPC_ALLOW_PREFIX)
+
+
 def query_value(query: dict, name: str, default: str = "") -> str:
     values = query.get(name, [])
     return str(values[-1]).strip() if values else default
@@ -716,6 +784,97 @@ def config_sync_status(snapshot_result: dict) -> dict:
     return status
 
 
+# ── P2: 把并发条目分成「常驻服务 / 底层噪声 / 真正的活」 ──────────────────
+# 机器人把 scheduler.worker、qq.connection 这类常驻服务也注册进并发表，
+# 它们永远不写 finishedAt，所以「未结束」不等于「在运行」。
+SERVICE_LABEL = re.compile(
+    r"^(main\.|rpc|scheduler|message\.|qq|stream\.|media\.gc|resource\.expiry"
+    r"|db\.|http|metrics|health|watchdog)",
+    re.IGNORECASE,
+)
+NOISE_LABEL = re.compile(
+    r"^(command|stdout|stderr|shell|exec|pty|spawn|pipe|log|trace|debug|flush)",
+    re.IGNORECASE,
+)
+STUCK_AFTER_SECONDS = 5 * 60
+# 只把最近这么多条带出中控；统计仍基于全量。
+TASK_ENTRIES_LIMIT = 100
+WORK_WINDOW_SECONDS = 24 * 3600
+
+
+def parse_task_time(value) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def classify_task_entries(entries: list) -> dict:
+    """Return honest counts. "Unfinished" is not the same as "running"."""
+    services, noise, work = [], [], []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "")
+        if SERVICE_LABEL.match(label):
+            services.append(item)
+        elif NOISE_LABEL.match(label):
+            noise.append(item)
+        else:
+            work.append(item)
+
+    now = time.time()
+    busy = [item for item in work if not item.get("finishedAt")]
+    stuck = [
+        item for item in busy
+        if (started := parse_task_time(item.get("startedAt")))
+        and now - started > STUCK_AFTER_SECONDS
+    ]
+    recent = [
+        item for item in work
+        if (started := parse_task_time(item.get("startedAt")))
+        and now - started <= WORK_WINDOW_SECONDS
+    ]
+    return {
+        "total": len(entries),
+        "services": len(services),
+        "noise": len(noise),
+        "running": len(busy),
+        "stuck": len(stuck),
+        "done_recent": len([item for item in recent if item.get("finishedAt")]),
+        "failed_recent": len([item for item in recent if item.get("error")]),
+    }
+
+
+def config_state_from_snapshot(snapshot, domain_stats) -> dict:
+    """Counts that actually mean something.
+
+    Was: len(read_state()[name]) for name in COLLECTIONS — that counted the admin
+    panel's own local collections, which are empty by default, so the dashboard
+    always showed 群 0 / 人格 0 / 模型 0.
+    """
+    data = snapshot.get("data") if isinstance(snapshot, dict) else None
+    data = data if isinstance(data, dict) else {}
+
+    def size(key):
+        value = data.get(key)
+        return len(value) if isinstance(value, list) else 0
+
+    groups = 0
+    stats = domain_stats.get("data") if isinstance(domain_stats, dict) else None
+    if isinstance(stats, dict):
+        groups = int(stats.get("groups") or 0)
+    personas = size("group_personas") + size("private_personas") + size("member_styles")
+    return {
+        "groups": groups,
+        "personas": personas,
+        "models": size("models") + size("image_models"),
+        "triggers": size("triggers"),
+    }
+
+
 def observability_overview(query: dict) -> dict:
     """Collect independent component states; one outage must not abort the overview."""
     jobs = {
@@ -748,10 +907,25 @@ def observability_overview(query: dict) -> dict:
         "rpc": {"ok": rpc_snapshot["ok"] and rpc_tasks["ok"], "reason": None if rpc_snapshot["ok"] and rpc_tasks["ok"] else (rpc_snapshot.get("error") or rpc_tasks.get("error"))},
         "domain": {"ok": domain_health["ok"] and domain_stats["ok"], "reason": None if domain_health["ok"] and domain_stats["ok"] else (domain_health.get("error") or domain_stats.get("error"))},
         "domain_stats": domain_stats,
-        "tasks": {"ok": rpc_tasks["ok"], "running": len(entries), "entries": entries[:100], "reason": None if rpc_tasks["ok"] else rpc_tasks.get("error")},
+        # P2: running 以前是 len(entries)——那是全部条目数（实测 2343），
+        # 而真正在跑的只有个位数。现在按标签分类后再统计。
+        "tasks": {
+            "ok": rpc_tasks["ok"],
+            # 统计在全量上算，但只带出最近若干条。
+            # 机器人这张表是只增不减的流水（实测每小时 +59 条），
+            # 全量转发会让这个接口的响应随时间无限膨胀（现在已 567 KB）。
+            **classify_task_entries(entries),
+            "entries": entries[-TASK_ENTRIES_LIMIT:],
+            "entries_total": len(entries),
+            "reason": None if rpc_tasks["ok"] else rpc_tasks.get("error"),
+        },
         "recent_errors": errors,
         "audit": filtered_audit(query),
-        "state": {name: len(read_state()[name]) for name in COLLECTIONS},
+        # P2: 以前这里是中控自己 state 文件的条目数，跟机器人和 domain 都无关，
+        # 所以永远显示全零。改成从机器人配置快照与 domain 统计里算。
+        "state": config_state_from_snapshot(rpc_snapshot, domain_stats),
+        # P2: rpc_snapshot 本来就取到了，只是没放进返回。前端靠它显示真实的人格/模型。
+        "snapshot": (rpc_snapshot.get("data") if rpc_snapshot.get("ok") else None),
     }
 
 
@@ -761,18 +935,41 @@ def health_score() -> dict:
     recent = [x for x in errors if time.time() - float(x.get("at", 0) or 0) <= 3600]
     domain_ok = bool(overview.get("domain", {}).get("ok"))
     rpc_ok = bool(overview.get("rpc", {}).get("ok"))
-    score = (30 if domain_ok else 0) + (25 if len(recent) <= 2 else 15 if len(recent) <= 10 else 0) + (20 if rpc_ok else 0) + (15 if overview.get("config_sync", {}).get("saved") else 8) + (10 if overview.get("tasks", {}).get("ok") else 0)
+    sync = overview.get("config_sync", {})
+    # P2: 以前只看 saved —— 只要存过版本就给满分，哪怕 applied 是假的。
+    # 「后台显示的配置」与「机器人实际在跑的配置」不一致时不能算健康。
+    config_points = 15 if (sync.get("saved") and sync.get("applied")) else 8 if sync.get("saved") else 0
+    tasks_ok = overview.get("tasks", {}).get("ok")
+    tasks_stuck = int(overview.get("tasks", {}).get("stuck") or 0)
+    score = (30 if domain_ok else 0) + (25 if len(recent) <= 2 else 15 if len(recent) <= 10 else 0) + (20 if rpc_ok else 0) + config_points + (10 if tasks_ok else 0)
     issues = []
     if not domain_ok: issues.append({"issue":"FM Domain 离线","suggestion":"检查 Domain 容器和数据库连接。"})
     if not rpc_ok: issues.append({"issue":"Cosmobot RPC 不可用","suggestion":"检查 RPC 服务和令牌配置。"})
     if len(recent) > 2: issues.append({"issue":f"最近 1 小时有 {len(recent)} 条错误","suggestion":"查看运行状态和审计日志定位失败请求。"})
-    return {"ok": True, "score": score, "issues": issues, "dimensions":{"service":30 if domain_ok else 0,"errors":25 if len(recent)<=2 else 15 if len(recent)<=10 else 0,"rpc":20 if rpc_ok else 0,"config":15 if overview.get("config_sync",{}).get("saved") else 8,"processing":10 if overview.get("tasks",{}).get("ok") else 0}}
+    if sync.get("saved") and not sync.get("applied"):
+        issues.append({
+            "issue": "后台保存的配置与机器人当前配置不一致",
+            "suggestion": "到「设置 → 配置版本」比对，确认改动是否真的生效，必要时回滚。",
+        })
+    if tasks_stuck:
+        issues.append({
+            "issue": f"有 {tasks_stuck} 个任务卡住超过 5 分钟",
+            "suggestion": "到仪表盘「机器人状态」查看并取消。",
+        })
+    return {"ok": True, "score": score, "issues": issues, "dimensions":{"service":30 if domain_ok else 0,"errors":25 if len(recent)<=2 else 15 if len(recent)<=10 else 0,"rpc":20 if rpc_ok else 0,"config":config_points,"processing":10 if tasks_ok else 0}}
 
 
 def runtime_config_result(kind: str, payload: dict | None = None) -> dict:
     if kind not in {"persona", "trigger", "model", "image_model"}:
         return {"ok": False, "error": "运行时配置类型不存在。"}
-    return fetch_rpc(f"config.{kind}", payload or {"action": "status"})
+    method = f"config.{kind}"
+    params = payload or {"action": "status"}
+    # P3-a: 这里以前直接 fetch_rpc()，把白名单整个绕过去了。
+    # PUT/DELETE /api/runtime/config/{kind} 走的就是这个函数，所以
+    # 「白名单里没放 config.persona」并不妨碍用它改人设。
+    if not rpc_method_allowed(method) or not rpc_action_allowed(method, params):
+        return {"ok": False, "error": f"该配置操作未被允许：{method}"}
+    return fetch_rpc(method, params)
 
 
 def safe_payload(payload: object) -> object:
@@ -1065,6 +1262,37 @@ class Api(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
             return None
 
+    def handle_rpc_proxy(self) -> None:
+        """转发白名单内的 RPC 方法给机器人，供管理面板使用。"""
+        payload = self.read_json()
+        if not isinstance(payload, dict):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "请求体必须是 JSON 对象。")
+            return
+        method = str(payload.get("method", "")).strip()
+        params = payload.get("params")
+        if not method:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "缺少 method。")
+            return
+        if not isinstance(params, dict):
+            params = {}
+        if not rpc_method_allowed(method):
+            record_audit("rpc-blocked", "rpc", method, "admin")
+            self.send_error_json(HTTPStatus.FORBIDDEN, "方法未在允许列表中：" + method)
+            return
+        # P3-a: 配置类方法还要看动作。config.model / config.image_model 的
+        # add / edit 需要传 base_url + api_key，属于改基础设施，不放行。
+        if not rpc_action_allowed(method, params):
+            action = str(params.get("action") or "")
+            record_audit("rpc-blocked", "rpc", f"{method}:{action}", "admin")
+            self.send_error_json(
+                HTTPStatus.FORBIDDEN,
+                f"该动作未被允许：{method} action={action or '(空)'}",
+            )
+            return
+        result = fetch_rpc(method, params)
+        record_audit("rpc", "rpc", method, "admin")
+        self.send_json(HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY, result)
+
     def do_GET(self) -> None:
         request = urlparse(self.path)
         if request.path == "/login":
@@ -1098,7 +1326,12 @@ class Api(BaseHTTPRequestHandler):
                 "domain": fetch_domain("/health"),
                 "stats": fetch_domain("/stats"),
                 "archive": fetch_domain("/archive/status"),
-                "state": {name: len(read_state()[name]) for name in COLLECTIONS},
+                # P2: 同上，改成从机器人快照与 domain 统计算，而不是中控本地集合。
+                # 这个分支里没有 stats / rpc_snapshot 变量，所以自己取一次。
+                "state": config_state_from_snapshot(
+                    fetch_rpc("config.snapshot"),
+                    fetch_domain("/stats"),
+                ),
             })
         elif request.path == "/api/observability/overview":
             self.send_json(HTTPStatus.OK, observability_overview(parse_qs(request.query)))
@@ -1235,6 +1468,11 @@ class Api(BaseHTTPRequestHandler):
             if not self.require_admin():
                 return
             self.handle_password_change()
+            return
+        if request.path == "/api/rpc":
+            if not self.require_admin():
+                return
+            self.handle_rpc_proxy()
             return
         if not self.require_admin():
             return

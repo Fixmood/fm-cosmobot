@@ -1,70 +1,140 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>登录 - FM Control Center</title>
-  <link rel="stylesheet" href="/static/styles.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>登录 · FM Control Center</title>
+<link rel="stylesheet" href="/static/styles.css?v=4">
 </head>
-<body class="login-page">
-  <main class="login-card">
-    <div class="brand-mark login-mark">FM</div>
-    <h1>FM Control Center</h1>
-    <p class="muted">运营管理后台</p>
-    <div class="login-tabs">
-      <button class="login-tab active" data-login-type="admin">管理员登录</button>
-      <button class="login-tab" data-login-type="token">Token 登录</button>
+<body>
+<div class="gate">
+
+  <button class="icon-btn gate-theme" id="theme" type="button" aria-label="切换主题" title="切换深浅色">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 109 9 7 7 0 01-9-9z"/></svg>
+  </button>
+
+  <main class="gate-card">
+    <div class="gate-logo">FM</div>
+    <div class="gate-head">
+      <h1>Control Center</h1>
+      <p>FM 运营控制台</p>
     </div>
-    <form id="login-form">
-      <div id="admin-fields">
-        <label class="field"><span>用户名</span><input id="login-username" autocomplete="username" required></label>
-        <label class="field"><span>密码</span><input id="login-password" type="password" autocomplete="current-password" required></label>
+
+    <div class="tabs" id="gate-tabs" role="tablist"
+         style="display:grid;grid-template-columns:1fr 1fr;margin-bottom:20px">
+      <button id="pick-admin" type="button" role="tab" aria-selected="true">管理员登录</button>
+      <button id="pick-token" type="button" role="tab" aria-selected="false">令牌登录</button>
+    </div>
+
+    <form id="gate-form" novalidate>
+      <div id="box-admin">
+        <div class="field" style="margin-bottom:14px">
+          <label for="username">用户名</label>
+          <input class="in" id="username" name="username" autocomplete="username" autofocus required>
+        </div>
+        <div class="field" style="margin-bottom:14px">
+          <label for="password">密码</label>
+          <input class="in" id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
       </div>
-      <div id="token-fields" class="hidden">
-        <label class="field"><span>访问 Token</span><input id="login-token" autocomplete="off"></label>
+
+      <div id="box-token" hidden>
+        <div class="field" style="margin-bottom:14px">
+          <label for="token">访问令牌</label>
+          <input class="in" id="token" name="token" autocomplete="off" spellcheck="false">
+          <small>在「设置 → 访问令牌」生成，适合脚本调用。</small>
+        </div>
       </div>
-      <p id="login-error" class="form-error hidden"></p>
-      <button class="button primary login-submit" type="submit">登录</button>
+
+      <div class="alert" id="gate-error" data-kind="bad" hidden style="margin-bottom:14px"></div>
+
+      <button class="btn" id="gate-submit" data-kind="solid" type="submit"
+              style="width:100%;height:36px">登录</button>
     </form>
+
+    <p class="gate-foot">
+      会话保存在服务器内存中，后台重启后需要重新登录。
+    </p>
   </main>
-  <script>
-    (() => {
-      let type = 'admin';
-      const form = document.getElementById('login-form');
-      const error = document.getElementById('login-error');
-      const tabs = document.querySelectorAll('[data-login-type]');
-      function setType(next) {
-        type = next;
-        tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.loginType === next));
-        document.getElementById('admin-fields').classList.toggle('hidden', next !== 'admin');
-        document.getElementById('token-fields').classList.toggle('hidden', next !== 'token');
-        document.getElementById('login-username').required = next === 'admin';
-        document.getElementById('login-password').required = next === 'admin';
-        document.getElementById('login-token').required = next === 'token';
-        error.classList.add('hidden');
-      }
-      tabs.forEach(tab => tab.addEventListener('click', () => setType(tab.dataset.loginType)));
-      form.addEventListener('submit', async event => {
-        event.preventDefault();
-        const button = form.querySelector('button[type="submit"]');
-        button.disabled = true;
-        error.classList.add('hidden');
-        const payload = type === 'admin'
-          ? {type, username: document.getElementById('login-username').value, password: document.getElementById('login-password').value}
-          : {type, token: document.getElementById('login-token').value};
-        try {
-          const response = await fetch('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || '登录失败');
-          location.href = '/';
-        } catch (err) {
-          error.textContent = err.message;
-          error.classList.remove('hidden');
-        } finally {
-          button.disabled = false;
-        }
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const THEME_KEY = 'fm-admin-theme';
+  const paint = (t) => {
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem(THEME_KEY, t); } catch (_) { /* 隐私模式 */ }
+  };
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (_) { /* ignore */ }
+  paint(saved || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+  document.getElementById('theme').addEventListener('click', () =>
+    paint(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+
+  const form = document.getElementById('gate-form');
+  const errorBox = document.getElementById('gate-error');
+  const submit = document.getElementById('gate-submit');
+  const boxAdmin = document.getElementById('box-admin');
+  const boxToken = document.getElementById('box-token');
+  const pickAdmin = document.getElementById('pick-admin');
+  const pickToken = document.getElementById('pick-token');
+  let mode = 'admin';
+
+  function setMode(next) {
+    mode = next;
+    const isAdmin = next === 'admin';
+    pickAdmin.setAttribute('aria-selected', String(isAdmin));
+    pickToken.setAttribute('aria-selected', String(!isAdmin));
+    boxAdmin.hidden = !isAdmin;
+    boxToken.hidden = isAdmin;
+    errorBox.hidden = true;
+    (isAdmin ? document.getElementById('username') : document.getElementById('token')).focus();
+  }
+  pickAdmin.addEventListener('click', () => setMode('admin'));
+  pickToken.addEventListener('click', () => setMode('token'));
+
+  const fail = (msg) => { errorBox.textContent = msg; errorBox.hidden = false; };
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    errorBox.hidden = true;
+
+    /* 后端要求显式 type：admin 走用户名密码，token 走令牌 */
+    const payload = mode === 'admin'
+      ? { type: 'admin',
+          username: document.getElementById('username').value.trim(),
+          password: document.getElementById('password').value }
+      : { type: 'token',
+          token: document.getElementById('token').value.trim() };
+
+    if (mode === 'admin' && (!payload.username || !payload.password)) return fail('请输入用户名和密码。');
+    if (mode === 'token' && !payload.token) return fail('请输入访问令牌。');
+
+    submit.disabled = true;
+    submit.textContent = '登录中…';
+
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(payload),
       });
-    })();
-  </script>
+      let data = null;
+      try { data = await res.json(); } catch (_) { /* 非 JSON */ }
+      if (!res.ok || (data && data.ok === false)) {
+        throw new Error((data && (data.error || data.message)) || `登录失败（HTTP ${res.status}）`);
+      }
+      location.replace('/');
+    } catch (err) {
+      fail(err.message || '登录失败');
+      submit.disabled = false;
+      submit.textContent = '登录';
+    }
+  });
+})();
+</script>
 </body>
 </html>
