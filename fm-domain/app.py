@@ -4600,7 +4600,22 @@ class Api(BaseHTTPRequestHandler):
                 return self.json({"ok": True})
             if request.path == "/groups":
                 rows = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id ORDER BY g.display_name,g.group_id").fetchall()
-                return self.json([dict(row) for row in rows])
+                # groups.updated_at 只在 observe_group() 里写，群消息进来时不更新 ——
+                # 实测它停在 2026-08-28~09-02，比真实活跃度落后 20 多天。
+                # 前端「最后活动」那一列用的就是它，会显示成「21 天前」而实际刚有人说话。
+                # 所以这里从消息归档算一个真实的活跃时间附上（不依赖任何写入路径）。
+                last_active = {
+                    row["group_id"]: row["last_at"]
+                    for row in db.execute(
+                        "SELECT group_id, MAX(occurred_at) AS last_at FROM message_archive "
+                        "WHERE group_id IS NOT NULL GROUP BY group_id")
+                }
+                payload = []
+                for row in rows:
+                    item = dict(row)
+                    item["last_active_at"] = last_active.get(row["group_id"])
+                    payload.append(item)
+                return self.json(payload)
             if request.path.startswith("/group/") and request.path.endswith("/detail"):
                 group_id = request.path.removeprefix("/group/").removesuffix("/detail").strip("/")
                 group = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id WHERE g.group_id=?", (group_id,)).fetchone()
@@ -4612,6 +4627,11 @@ class Api(BaseHTTPRequestHandler):
                 events = db.execute("SELECT occurred_at,sender_name,text FROM message_archive WHERE group_id=? ORDER BY occurred_at DESC LIMIT 20", (group_id,)).fetchall()
                 features = group_features(db, group_id)
                 result = dict(group)
+                # 同 /groups：给一个真实的最后活跃时间
+                last = db.execute(
+                    "SELECT MAX(occurred_at) AS last_at FROM message_archive WHERE group_id=?",
+                    (group_id,)).fetchone()
+                result["last_active_at"] = last["last_at"] if last else None
                 result["features"] = features
                 result["daily"] = [dict(x) for x in daily]
                 result["active_users"] = [dict(x) for x in users]

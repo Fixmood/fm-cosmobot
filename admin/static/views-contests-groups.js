@@ -211,7 +211,10 @@ export async function renderGroups() {
           ], [
             { k: '群号', v: st.group_id ?? group.group_id },
             { k: '在线', v: st.online ? '是' : '否' },
-            { k: '最后活动', v: ago(st.updated_at || group.updated_at) },
+            /* 用 last_active_at（后端从消息归档算的真实活跃时间）。
+               groups.updated_at 只在 observe_group() 里写，群消息进来时不更新，
+               实测停在 2026-08-28~09-02 —— 用它会把「21 天前」显示给一个刚有消息的群。 */
+            { k: '最后活动', v: group.last_active_at ? ago(group.last_active_at) : '（无消息）' },
           ])),
           card('复读跟随', repeatRaw?._err ? errorState(repeatRaw._err) : table([
             { label: '项', key: 'k' }, { label: '值', key: 'v' },
@@ -228,7 +231,7 @@ export async function renderGroups() {
         { label: '群名', wrap: true, render: (r) => r.display_name || '（未命名）' },
         { label: '状态', render: (r) => chip(r.status || '—', toneFor(r.status)) },
         { label: '暂停', render: (r) => (Number(r.paused) > 0 ? chip('已暂停', 'warn') : '—') },
-        { label: '最后活动', render: (r) => ago(r.updated_at) },
+        { label: '最后活动', render: (r) => (r.last_active_at ? ago(r.last_active_at) : '（无消息）') },
         { label: '', render: (r) => h('button', {
             class: 'btn', type: 'button',
             onclick: (e) => { e.stopPropagation(); showDetail(r); },
