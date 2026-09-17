@@ -707,9 +707,24 @@ class RetainedSnapshotImportTest(unittest.TestCase):
                     "group_id": "20001", "sender_id": "90001", "explicit": True, "occurred_at": 101,
                 })
                 self.assertTrue(blocked["blocked"])
-                self.assertTrue(blocked["reply"])
+                # 守卫现在**刻意保持静默**：拦下另一个机器人属于内务，没必要在群里播报。
+                # 调用方（Bot/Handler/FM.hs:309 的 `unless (Text.null reply) ...`）
+                # 拿到空字符串就不回话。
+                #
+                # 这里原本断言 reply 非空 —— 它配合的是那四句「不接机器人互聊」的文案。
+                # 文案在 1d1ef46 被去掉时忘了同步这个测试，CI 从那时起一直是红的。
+                # 核对过：静默是有意的，那几句在群里是噪声。
+                self.assertEqual(blocked["reply"], "")
                 self.assertTrue(quiet["blocked"])
-                self.assertFalse(quiet["reply"])
+                # 冷却表仍在维护（首次拦截记时间戳），为的是将来若要在某些群
+                # 重新开启播报，「该不该说」的依据还在。
+                row = db.execute(
+                    "SELECT replied_at FROM bot_refusal_cooldowns WHERE group_id=? AND sender_id=?",
+                    ("20001", "90001"),
+                ).fetchone()
+                self.assertIsNotNone(row, "首次拦截应当写入冷却时间戳")
+                self.assertEqual(float(row["replied_at"]), 100)
+                self.assertEqual(quiet["reply"], "")
             finally:
                 db.close()
 
