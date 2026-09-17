@@ -11,16 +11,22 @@ import {
 
 import { renderLibrary, renderScores } from './views-business.js';
 import { renderContests, renderGroups, renderMessages } from './views-contests-groups.js';
-import { renderDashboard, renderSessions, renderSettings } from './views-system.js';
+import { renderDashboard, renderSettings } from './views-system.js';
+import { renderBotTraffic } from './views-bot-traffic.js';
 
 /* ── 视图表 ───────────────────────────────────────────────────────────── */
-/* 原来的「媒体与资源 / 任务与并发 / 审计日志」已撤：
-   前两个的数据本身就不可靠或没有产出，第三个没人会翻。
-   它们当中真正有用的信号并进了仪表盘的「机器人状态 / 存储与增长 / 近期事件」。 */
+/* 变化记录：
+   原先的「媒体与资源 / 任务与并发 / 审计日志」已撤 —— 前两个的数据不可靠
+   或没有产出，第三个没人会翻；有用的信号并进了仪表盘。
+
+   「会话管理」也撤了：那是一套 ACP 会话，库里只有 15 行测试数据
+   （deployment-smoke / skill-check / probe-ok…），日志里零活动。
+   而机器人自己的回复存在 cosmobot.sqlite3 的 chat_log 里（3086 条），
+   后台此前完全没有入口。所以那个导航位置换成「机器人发言」。 */
 const VIEWS = {
   dashboard: { title: '仪表盘',     group: '概览', render: renderDashboard },
   messages:  { title: '消息与归档', group: '对话', render: renderMessages },
-  sessions:  { title: '会话管理',   group: '对话', render: renderSessions },
+  'bot-traffic': { title: '机器人发言', group: '对话', render: renderBotTraffic },
   library:   { title: '跟打文库',   group: '业务', render: renderLibrary },
   scores:    { title: '成绩中心',   group: '业务', render: renderScores },
   contests:  { title: '赛文赛事',   group: '业务', render: renderContests },

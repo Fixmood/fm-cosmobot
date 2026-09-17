@@ -2807,6 +2807,256 @@ def scores_player(db, query):
     }
 
 
+def media_refs(value) -> list:
+    """把 chat_log.image_urls 解析成媒体引用列表。
+
+    字段名叫 image_urls，但实测**不是 JSON**，而是逗号分隔的引用，
+    形如 'media:mf_-pBRNiAl92lqEUtOucGYeA'（129 条机器人消息带它）。
+
+    我第一版直接 json.loads 了它 —— 遇到非空值就抛异常、连接断开（踩过一次）。
+    这个库里「字段类型与预期不符」是有先例的（occurred_at 混类型、
+    recorded_at 是字符串、source_json 字段名新旧不一致），
+    所以凡是读出来要解析的地方都得兜底。
+    """
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value]
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+        except (TypeError, ValueError):
+            pass
+    return [piece for piece in re.split(r"[,\s]+", text) if piece]
+
+
+BOT_DB = "/botdata/cosmobot.sqlite3"
+
+
+def bot_db_connect():
+    """只读打开机器人的库。挂载本身就是 :ro，这里再加一层 mode=ro。"""
+    if not os.path.exists(BOT_DB):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{BOT_DB}?mode=ro", uri=True, timeout=10)
+        con.row_factory = sqlite3.Row
+        return con
+    except sqlite3.Error:
+        return None
+
+
+def bot_messages(query) -> dict:
+    """机器人最近的发言，以及它回复的那条消息。
+
+    chat_log.recorded_at 是**字符串**（形如 '2026-09-17 15:53:08.250294411+0000'），
+    不是 Unix 时间戳 —— 与 score_records.occurred_at 是同一个坑。
+    按 id 倒序拿最近的最可靠。
+    """
+    try:
+        limit = min(max(int(query.get("limit", ["50"])[0]), 1), 300)
+    except (TypeError, ValueError):
+        limit = 50
+    chat_id = (query.get("chat_id", [""])[0] or "").strip()
+    keyword = (query.get("q", [""])[0] or "").strip()
+
+    con = bot_db_connect()
+    if con is None:
+        return {"error": "读不到机器人的库（/botdata/cosmobot.sqlite3）", "available": False}
+
+    where = ["is_bot=1"]
+    args = []
+    if chat_id:
+        where.append("chat_id = ?")
+        args.append(chat_id)
+    if keyword:
+        where.append("body_text LIKE ?")
+        args.append(f"%{keyword}%")
+    clause = " AND ".join(where)
+
+    try:
+        rows = con.execute(f"""
+            SELECT id, chat_id, kind_key, message_id, reply_to_message_id,
+                   body_text, image_urls, recorded_at
+            FROM chat_log WHERE {clause}
+            ORDER BY id DESC LIMIT ?
+        """, (*args, limit)).fetchall()
+
+        out = []
+        for row in rows:
+            reply_text = None
+            if row["reply_to_message_id"]:
+                # 找到它回复的那条
+                parent = con.execute("""
+                    SELECT sender_username, body_text, is_bot FROM chat_log
+                    WHERE message_id = ? LIMIT 1
+                """, (row["reply_to_message_id"],)).fetchone()
+                if parent:
+                    reply_text = {
+                        "sender": parent["sender_username"],
+                        "text": (parent["body_text"] or "")[:400],
+                        "from_bot": bool(parent["is_bot"]),
+                    }
+            out.append({
+                "id": row["id"],
+                "chat_id": row["chat_id"],
+                "kind": row["kind_key"],
+                "message_id": row["message_id"],
+                "body": (row["body_text"] or "")[:1200],
+                # 统一成 Unix 时间戳（与 /scores 的 received_at 同口径），
+                # 不让前端去猜时区 —— 猜错过一次，少了 8 小时。
+                "at_unix": parse_bot_time(row["recorded_at"]),
+                "at_raw": row["recorded_at"],
+                "media_refs": media_refs(row["image_urls"]),
+                "reply_to": reply_text,
+            })
+        return {"available": True, "count": len(out), "messages": out}
+    except sqlite3.Error as err:
+        return {"error": f"查询失败：{err}", "available": False}
+    finally:
+        con.close()
+
+
+def bot_runs(query) -> dict:
+    """最近的 agent 运行：耗时、轮数、工具调用、token。
+
+    数据在 audit_log 的 event_json 里，按 event_kind 筛选。
+    agent_run_finished 里带 elapsed / turns；model_turn_finished 带 tokenUsage。
+    """
+    try:
+        limit = min(max(int(query.get("limit", ["50"])[0]), 1), 300)
+    except (TypeError, ValueError):
+        limit = 50
+
+    con = bot_db_connect()
+    if con is None:
+        return {"error": "读不到机器人的库", "available": False}
+
+    try:
+        fin = {}
+        # 旧->新的顺序处理，这样才能算「首尾时间差 = 耗时」
+        for row in con.execute("""
+            SELECT run_id, event_kind, event_json, occurred_at, linked_message_id, id
+            FROM audit_log
+            WHERE run_id IN (
+                SELECT run_id FROM audit_log
+                WHERE event_kind='agent_run_finished' ORDER BY id DESC LIMIT ?
+            )
+            ORDER BY id
+        """, (limit,)):
+            run_id = row["run_id"]
+            item = fin.setdefault(run_id, {
+                "run_id": run_id,
+                "first_at": row["occurred_at"],
+                "last_at": row["occurred_at"],
+                "at_raw": row["occurred_at"],
+                "linked_message_id": row["linked_message_id"],
+                "tool_calls": 0,
+                "turns": 0,
+                "tools": [],
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            })
+            item["last_at"] = row["occurred_at"]
+            if row["linked_message_id"]:
+                item["linked_message_id"] = row["linked_message_id"]
+
+            kind = row["event_kind"]
+            if kind not in ("agent_run_started", "agent_run_finished",
+                            "model_turn_finished", "tool_call_started"):
+                continue
+            try:
+                payload = json.loads(row["event_json"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+
+            if kind == "agent_run_started":
+                # exposedTools 是实际下发给模型的工具名单，直接反映工具开销
+                exposed = payload.get("exposedTools") or []
+                item["exposed_tools"] = len(exposed)
+            elif kind == "agent_run_finished":
+                item["turns"] = payload.get("turnsUsed") or payload.get("turns")
+                item["status"] = payload.get("status")
+                item["final_length"] = payload.get("finalLength")
+            elif kind == "tool_call_started":
+                item["tool_calls"] += 1
+                call = payload.get("toolCall")
+                if isinstance(call, dict) and call.get("name") and call["name"] not in item["tools"]:
+                    item["tools"].append(call["name"])
+            elif kind == "model_turn_finished":
+                usage = payload.get("tokenUsage") or {}
+                item["prompt_tokens"] += usage.get("prompt_tokens") or 0
+                item["completion_tokens"] += usage.get("completion_tokens") or 0
+
+        # 用 audit_log 的首尾时间戳算耗时（事件里没有这个字段）
+        runs = []
+        for item in fin.values():
+            start = parse_audit_time(item.pop("first_at", None))
+            end = parse_audit_time(item.pop("last_at", None))
+            item["elapsed_ms"] = round((end - start) * 1000) if (start and end and end >= start) else None
+            item["at_unix"] = parse_bot_time(item.pop("at_raw", None))
+            runs.append(item)
+        runs.sort(key=lambda r: r.get("elapsed_ms") is None)
+        runs.sort(key=lambda r: r["run_id"], reverse=True)
+        return {"available": True, "count": len(runs), "runs": runs[:limit]}
+    except sqlite3.Error as err:
+        return {"error": f"查询失败：{err}", "available": False}
+    finally:
+        con.close()
+
+
+def parse_bot_time(value):
+    """解析机器人库里的时间字符串 → Unix 秒。
+
+    实测形态：'2026-09-17 15:34:46.985508029+0000'
+      · 空格分隔（不是 ISO 的 T）
+      · 时区写成 +0000（fromisoformat 要 +00:00）
+      · 小数部分是 9 位纳秒（datetime 只吃 6 位微秒）
+
+    三个都不兼容，所以手工规整。返回 None 而不是抛异常 ——
+    这个库里字段形态不统一是有先例的，读不到时间不该让整个请求失败。
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # 时区补冒号
+    if len(text) >= 5 and text[-5] in "+-" and text[-3] != ":":
+        text = f"{text[:-2]}:{text[-2:]}"
+    # 空格换 T，小数截到 6 位
+    head, sep, rest = text.partition(" ")
+    if sep:
+        text = f"{head}T{rest}"
+    main, dot, frac = text.partition(".")
+    if dot:
+        digits = "".join(ch for ch in frac if ch.isdigit())[:6]
+        tail = ""
+        for marker in ("+", "-", "Z"):
+            idx = frac.find(marker)
+            if idx >= 0:
+                tail = frac[idx:]
+                break
+        if tail and len(tail) >= 5 and tail[-3] != ":":
+            tail = f"{tail[:-2]}:{tail[-2:]}"
+        elif tail == "Z":
+            tail = "Z"
+        text = f"{main}.{digits}{tail}" if digits else f"{main}{tail}"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_audit_time(value):
+    """audit_log.occurred_at 与 chat_log.recorded_at 是同一种形态，复用解析。"""
+    return parse_bot_time(value)
+
+
 def digest_row_to_dict(row) -> dict:
     try:
         topics = json.loads(row["topics_json"] or "[]")
@@ -4551,6 +4801,10 @@ class Api(BaseHTTPRequestHandler):
                 return self.json(scores_leaderboard(db, query))
             if request.path == "/scores/player":
                 return self.json(scores_player(db, query))
+            if request.path == "/bot/messages":
+                return self.json(bot_messages(query))
+            if request.path == "/bot/runs":
+                return self.json(bot_runs(query))
             if request.path == "/digests":
                 return self.json(digests_for_chat(db, query))
             if request.path == "/digests/overview":

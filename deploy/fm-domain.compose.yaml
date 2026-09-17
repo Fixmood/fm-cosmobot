@@ -24,6 +24,9 @@ services:
     volumes:
       - ${FM_DOMAIN_DATA_DIR:-/opt/fm-domain/data}:/data
       - ${FM_DOMAIN_ASSETS_DIR:-/opt/fm-domain/assets}:/assets:ro
+      # 机器人的库，只读。用来展示「机器人说过什么」——
+      # 它的回复只存在 cosmobot.sqlite3 的 chat_log 里，此前后台看不到。
+      - ${FM_COSMOBOT_DATA_DIR:-/opt/fm-cosmobot/runtime}:/botdata:ro
 
 networks:
   fm-runtime:
