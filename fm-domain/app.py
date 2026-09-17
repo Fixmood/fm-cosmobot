@@ -2,6 +2,8 @@
 """FM's retained domain data importer and read-only query service."""
 
 import argparse
+import functools
+import statistics
 import html
 import hashlib
 import io
@@ -121,6 +123,10 @@ CREATE TABLE IF NOT EXISTS score_records (
   source_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS score_group_idx ON score_records(group_id, occurred_at DESC);
+-- 聚合接口按 occurred_at 排序 + 按时间窗口过滤。只有 (group_id, occurred_at)
+-- 复合索引时，ORDER BY occurred_at 用不上它，每次都要对全表做 TEMP B-TREE
+-- 排序（实测 39651 行花 224 ms）。
+CREATE INDEX IF NOT EXISTS score_time_idx ON score_records(occurred_at);
 CREATE TABLE IF NOT EXISTS contest_texts (
   text_id TEXT PRIMARY KEY, title TEXT NOT NULL, source_group TEXT NOT NULL,
   competition_date TEXT NOT NULL, relative_path TEXT NOT NULL UNIQUE,
@@ -159,14 +165,8 @@ CREATE INDEX IF NOT EXISTS competition_score_user_idx ON competition_scores(user
 CREATE TABLE IF NOT EXISTS group_runtime (
   group_id TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS recent_messages (
-  platform TEXT NOT NULL, message_id TEXT NOT NULL, group_id TEXT NOT NULL,
-  group_name TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
-  text TEXT NOT NULL, occurred_at REAL NOT NULL, raw_json TEXT NOT NULL,
-  image_urls_json TEXT NOT NULL DEFAULT '[]',
-  PRIMARY KEY(platform, message_id)
-);
-CREATE INDEX IF NOT EXISTS recent_message_time_idx ON recent_messages(occurred_at DESC);
+/* P1-c: recent_messages 建表语句已移除 */
+/* P1-c: recent_message_time_idx 已移除 */
 CREATE TABLE IF NOT EXISTS message_archive (
   platform TEXT NOT NULL, message_id TEXT NOT NULL, group_id TEXT NOT NULL,
   group_name TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
@@ -744,10 +744,11 @@ def connect(path: str) -> sqlite3.Connection:
                 ensure_column(db, "library_previous_sessions", "requested_length", "INTEGER NOT NULL DEFAULT 0")
                 ensure_column(db, "library_previous_sessions", "requested_genre", "TEXT NOT NULL DEFAULT ''")
                 ensure_column(db, "recall_records", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
-                ensure_column(db, "recent_messages", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
-                db.execute(
-                    "INSERT OR IGNORE INTO message_archive SELECT platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json FROM recent_messages"
-                )
+                # P1-c: recent_messages 已删除，不再需要补列
+                # P1-c: 这里原本每次启动都把 recent_messages 整表 INSERT OR IGNORE
+                # 进 message_archive。主路径已经直接写 message_archive，
+                # 保留它只会白跑一次 9 万行的全表扫描。
+                pass
                 db.commit()
                 ranking_version = db.execute(
                     "SELECT value_json FROM settings WHERE key='library_ranking_version'"
@@ -2332,7 +2333,788 @@ def mark_library_messages_recalled(db: sqlite3.Connection, payload: dict) -> dic
     return {"status": "ok", "marked": changed}
 
 
+# ── P4: 成绩聚合 ─────────────────────────────────────────────────────────
+# 阈值来自实测分布：速度 p99=339.63，所以不能按 400 砍（那会切掉真实高手）。
+# 真正要滤的是「只打一两个字却报出几千字/分」这类，以及字数异常大的。
+SCORE_MIN_CHARS = 40         # 少于这个字数的记录不参与速度排名
+# 阈值依据（实测 39656 条按字数分桶后的中位速度）：
+#     0-8 字   151.4      20-40 字   82.6   ← 明显异常低
+#     8-20 字  142.5      80-150 字 165.0   ← 峰值
+# 中位数与段落长度不是单调关系，原因是计时里含固定开销：段落越短，
+# 那点开销占比越大，速度被压得越低。所以短段落的成绩不能和长段落
+# 放在一起比速度 —— 8 字的下限太松，20-40 字那一档会系统性拉低均值。
+# 定在 40 能排除这种失真，同时保留约 76% 的真实成绩。
+SCORE_MAX_SPEED = 400.0      # 字/分上限，实测 p999=495 但那些都是 chars=1 的记录
+SCORE_MAX_KEYSTROKE = 20.0   # 击键上限，实测 p999=16.67
+SCORE_MIN_ACCURACY = 0.0
+SCORE_MAX_ACCURACY = 100.0
+
+
+def score_number(value):
+    """source_json 里的数值有的是数字、有的是带 % 的字符串。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().rstrip("%")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def score_row(payload):
+    """把一条 score_records.source_json 规范化成统一的字段。
+
+    两批数据的字段名不一致，实测：
+      旧批（napcat_log_import）用 keystrokes，新批用 keystroke
+      旧批的 accuracy 是 '93.16%' 字符串，新批是数字
+    """
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "segment_id": str(payload.get("segment_id") or ""),
+        "speed": score_number(payload.get("speed")),
+        "keystroke": score_number(payload.get("keystroke", payload.get("keystrokes"))),
+        "accuracy": score_number(payload.get("accuracy")),
+        "characters": score_number(payload.get("characters")),
+        "sender_id": str(payload.get("sender_id") or ""),
+        "sender_name": str(payload.get("sender_name") or ""),
+        "group_id": str(payload.get("group_id") or ""),
+        "group_name": str(payload.get("group_name") or ""),
+        "source": str(payload.get("source") or ""),
+        "method": str(payload.get("method") or ""),
+        "certificate": str(payload.get("certificate") or ""),
+        "duration": str(payload.get("duration") or ""),
+    }
+
+
+def score_reasons(row):
+    """返回这条记录的问题列表；空列表表示可用。"""
+    reasons = []
+    chars = row.get("characters")
+    if chars is not None and chars < SCORE_MIN_CHARS:
+        reasons.append("字数过少")
+    speed = row.get("speed")
+    if speed is not None and (speed < 0 or speed > SCORE_MAX_SPEED):
+        reasons.append("速度异常")
+    keystroke = row.get("keystroke")
+    if keystroke is not None and (keystroke < 0 or keystroke > SCORE_MAX_KEYSTROKE):
+        reasons.append("击键异常")
+    accuracy = row.get("accuracy")
+    if accuracy is not None and not (SCORE_MIN_ACCURACY <= accuracy <= SCORE_MAX_ACCURACY):
+        reasons.append("准确率异常")
+    return reasons
+
+
+def score_thresholds(query):
+    """从查询参数里读质量阈值，没给就用模块默认（默认值来自实测分布）。"""
+
+    def number(name, fallback):
+        raw = (query.get(name, [""])[0] or "").strip()
+        if not raw:
+            return fallback
+        try:
+            return float(raw)
+        except ValueError:
+            return fallback
+
+    return {
+        "min_chars": number("min_chars", SCORE_MIN_CHARS),
+        "max_speed": number("max_speed", SCORE_MAX_SPEED),
+        "max_keystroke": number("max_keystroke", SCORE_MAX_KEYSTROKE),
+    }
+
+
+def score_quality_ok(row, min_chars=SCORE_MIN_CHARS, max_speed=SCORE_MAX_SPEED,
+                     max_keystroke=SCORE_MAX_KEYSTROKE):
+    chars = row.get("characters")
+    if chars is not None and chars < min_chars:
+        return False
+    speed = row.get("speed")
+    if speed is not None and (speed < 0 or speed > max_speed):
+        return False
+    keystroke = row.get("keystroke")
+    if keystroke is not None and (keystroke < 0 or keystroke > max_keystroke):
+        return False
+    accuracy = row.get("accuracy")
+    if accuracy is not None and not (SCORE_MIN_ACCURACY <= accuracy <= SCORE_MAX_ACCURACY):
+        return False
+    return True
+
+
+def load_scores(db, since=None, until=None, thresholds=None):
+    """读出并规范化成绩，按时间升序。同时返回被过滤掉的条数。"""
+    limits = thresholds or {}
+    where, args = [], []
+    if since is not None:
+        where.append("occurred_at >= ?")
+        args.append(since)
+    if until is not None:
+        where.append("occurred_at <= ?")
+        args.append(until)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = (
+        "SELECT record_id, occurred_at, group_id, sender_id, source_json "
+        "FROM score_records" + clause + " ORDER BY occurred_at"
+    )
+    rows, dropped, unreadable = [], 0, 0
+    for record in db.execute(sql, args):
+        try:
+            payload = json.loads(record["source_json"])
+        except (TypeError, ValueError):
+            unreadable += 1
+            continue
+        row = score_row(payload)
+        if row is None:
+            unreadable += 1
+            continue
+        row["occurred_at"] = record["occurred_at"]
+        row["record_id"] = record["record_id"]
+        if not row["group_id"]:
+            row["group_id"] = str(record["group_id"] or "")
+        if not row["sender_id"]:
+            row["sender_id"] = str(record["sender_id"] or "")
+        if not score_quality_ok(
+            row,
+            limits.get("min_chars", SCORE_MIN_CHARS),
+            limits.get("max_speed", SCORE_MAX_SPEED),
+            limits.get("max_keystroke", SCORE_MAX_KEYSTROKE),
+        ):
+            dropped += 1
+            continue
+        rows.append(row)
+    return rows, dropped, unreadable
+
+
+def score_day(ts):
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+SCORE_AGG_CACHE = {}
+SCORE_AGG_CACHE_LOCK = threading.Lock()
+SCORE_AGG_CACHE_TTL = 30.0
+
+
+def score_agg_cache(func):
+    """给成绩聚合接口加短 TTL 缓存。
+
+    三个聚合接口每次都要解析 2 万条 JSON 再聚合（各 320~380 ms），
+    而成绩是每分钟几条的频率，30 秒缓存足够。
+    写路径（record_message_event 落成绩时）会调 score_agg_invalidate() 主动失效。
+    """
+
+    @functools.wraps(func)
+    def wrapper(db, query):
+        key = (func.__name__, json.dumps(sorted(query.items()), ensure_ascii=False, default=str))
+        now = time.time()
+        with SCORE_AGG_CACHE_LOCK:
+            hit = SCORE_AGG_CACHE.get(key)
+            if hit and now - hit[0] < SCORE_AGG_CACHE_TTL:
+                result = dict(hit[1])
+                result["cached"] = True
+                return result
+        value = func(db, query)
+        with SCORE_AGG_CACHE_LOCK:
+            SCORE_AGG_CACHE[key] = (time.time(), value)
+            # 顺手清掉过期的，避免参数组合多起来之后无限增长
+            for stale in [k for k, v in SCORE_AGG_CACHE.items() if now - v[0] >= SCORE_AGG_CACHE_TTL]:
+                SCORE_AGG_CACHE.pop(stale, None)
+        return value
+
+    return wrapper
+
+
+def score_agg_invalidate():
+    """写成绩时调用。宁可下次多算一次，也不要让人看到过期数据。"""
+    with SCORE_AGG_CACHE_LOCK:
+        SCORE_AGG_CACHE.clear()
+
+
+# /stats/advanced 的缓存。key 里带 part，所以两个部分互不影响。
+STATS_ADVANCED_CACHE = {}
+STATS_ADVANCED_TTL = 60.0
+
+
+# ── 统计类接口的短 TTL 缓存 ──────────────────────────────────────────────
+# 这几个接口每次打开仪表盘都要调，但数字晚几十秒不影响任何判断。
+# 与成绩聚合缓存分开：数据源与失效点不同。
+STATS_CACHE = {}
+STATS_CACHE_LOCK = threading.Lock()
+STATS_CACHE_TTL = 45.0
+
+
+def stats_cache(key, builder):
+    now = time.time()
+    with STATS_CACHE_LOCK:
+        hit = STATS_CACHE.get(key)
+        if hit and now - hit[0] < STATS_CACHE_TTL:
+            return hit[1]
+    value = builder()
+    with STATS_CACHE_LOCK:
+        STATS_CACHE[key] = (time.time(), value)
+        for stale in [k for k, v in STATS_CACHE.items() if now - v[0] >= STATS_CACHE_TTL]:
+            STATS_CACHE.pop(stale, None)
+    return value
+
+
+def stats_cache_invalidate(*keys):
+    """不传就全清。"""
+    with STATS_CACHE_LOCK:
+        if not keys:
+            STATS_CACHE.clear()
+        else:
+            for key in keys:
+                STATS_CACHE.pop(key, None)
+
+
+def stats_advanced_cached(part, builder):
+    """part='heat' 或 'speed'。两者数据源不同、更新时间也不同，分开缓存。"""
+    now = time.time()
+    hit = STATS_ADVANCED_CACHE.get(part)
+    if hit and now - hit[0] < STATS_ADVANCED_TTL:
+        return hit[1]
+    value = builder()
+    STATS_ADVANCED_CACHE[part] = (time.time(), value)
+    return value
+
+
+def stats_advanced_invalidate(part=None):
+    """消息归档变化时清 heat，成绩变化时清 speed；不传就全清。"""
+    if part is None:
+        STATS_ADVANCED_CACHE.clear()
+    else:
+        STATS_ADVANCED_CACHE.pop(part, None)
+
+
+@score_agg_cache
+def scores_leaderboard(db, query):
+    """按人聚合的排行榜。"""
+    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
+    metric = (query.get("metric", ["speed"])[0] or "speed").strip().lower()
+    limit = max(1, min(200, int(query.get("limit", ["30"])[0] or 30)))
+    min_attempts = max(1, int(query.get("min_attempts", ["3"])[0] or 3))
+    include_all = query.get("all", [""])[0].lower() in {"1", "true", "yes"}
+
+    since = None if include_all else time.time() - days * 86400
+    limits = score_thresholds(query)
+    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
+
+    people = {}
+    for row in rows:
+        key = row["sender_id"] or row["sender_name"]
+        if not key:
+            continue
+        bucket = people.setdefault(key, {
+            "sender_id": row["sender_id"],
+            "sender_name": row["sender_name"],
+            "group_name": row["group_name"],
+            "attempts": 0,
+            "speeds": [],
+            "keystrokes": [],
+            "accuracies": [],
+            "best_speed": None,
+            "best_keystroke": None,
+            "best_accuracy": None,
+            "chars": 0,
+            "segments": set(),
+            "first_at": row["occurred_at"],
+            "last_at": row["occurred_at"],
+        })
+        bucket["attempts"] += 1
+        if row["speed"] is not None:
+            bucket["speeds"].append(row["speed"])
+            if bucket["best_speed"] is None or row["speed"] > bucket["best_speed"]:
+                bucket["best_speed"] = row["speed"]
+        if row["keystroke"] is not None:
+            bucket["keystrokes"].append(row["keystroke"])
+            if bucket["best_keystroke"] is None or row["keystroke"] > bucket["best_keystroke"]:
+                bucket["best_keystroke"] = row["keystroke"]
+        if row["accuracy"] is not None:
+            bucket["accuracies"].append(row["accuracy"])
+            if bucket["best_accuracy"] is None or row["accuracy"] > bucket["best_accuracy"]:
+                bucket["best_accuracy"] = row["accuracy"]
+        if row["characters"]:
+            bucket["chars"] += int(row["characters"])
+        if row["segment_id"]:
+            bucket["segments"].add(row["segment_id"])
+        bucket["last_at"] = max(bucket["last_at"], row["occurred_at"])
+        bucket["first_at"] = min(bucket["first_at"], row["occurred_at"])
+        if row["sender_name"]:
+            bucket["sender_name"] = row["sender_name"]
+
+    def avg(values):
+        return round(sum(values) / len(values), 2) if values else None
+
+    ranked = []
+    for bucket in people.values():
+        if bucket["attempts"] < min_attempts:
+            continue
+        ranked.append({
+            "sender_id": bucket["sender_id"],
+            "sender_name": bucket["sender_name"],
+            "group_name": bucket["group_name"],
+            "attempts": bucket["attempts"],
+            "best_speed": round(bucket["best_speed"], 2) if bucket["best_speed"] is not None else None,
+            "avg_speed": avg(bucket["speeds"]),
+            "best_keystroke": round(bucket["best_keystroke"], 2) if bucket["best_keystroke"] is not None else None,
+            "avg_keystroke": avg(bucket["keystrokes"]),
+            "best_accuracy": round(bucket["best_accuracy"], 2) if bucket["best_accuracy"] is not None else None,
+            "avg_accuracy": avg(bucket["accuracies"]),
+            "characters": bucket["chars"],
+            "segments": len(bucket["segments"]),
+            "first_at": bucket["first_at"],
+            "last_at": bucket["last_at"],
+        })
+
+    keymap = {
+        "speed": lambda r: (r["best_speed"] is None, -(r["best_speed"] or 0)),
+        "avg_speed": lambda r: (r["avg_speed"] is None, -(r["avg_speed"] or 0)),
+        "keystroke": lambda r: (r["best_keystroke"] is None, -(r["best_keystroke"] or 0)),
+        "accuracy": lambda r: (r["best_accuracy"] is None, -(r["best_accuracy"] or 0)),
+        "volume": lambda r: (-r["attempts"],),
+        "characters": lambda r: (-r["characters"],),
+    }
+    ranked.sort(key=keymap.get(metric, keymap["speed"]))
+    for index, item in enumerate(ranked, start=1):
+        item["rank"] = index
+
+    total = len(rows)
+    return {
+        "days": days,
+        "include_all": include_all,
+        "metric": metric,
+        "min_attempts": min_attempts,
+        "total_records": total,
+        "dropped": dropped,
+        "unreadable": unreadable,
+        "applied": limits,
+        "people": len(ranked),
+        "rows": ranked[:limit],
+    }
+
+
+@score_agg_cache
+def scores_player(db, query):
+    """个人档案：总览 + 每日曲线 + 最近记录 + 拿手段落。"""
+    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
+    user_id = (query.get("user_id", [""])[0] or "").strip()
+    name = (query.get("name", [""])[0] or "").strip()
+    if not user_id and not name:
+        return {"error": "user_id 或 name 至少给一个"}
+
+    since = time.time() - days * 86400
+    limits = score_thresholds(query)
+    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
+    mine = [
+        row for row in rows
+        if (user_id and row["sender_id"] == user_id) or (name and row["sender_name"] == name)
+    ]
+    if not mine:
+        return {
+            "user_id": user_id, "name": name, "days": days,
+            "found": False, "attempts": 0, "daily": [], "recent": [], "segments": [],
+        }
+
+    daily = {}
+    for row in mine:
+        day = score_day(row["occurred_at"])
+        bucket = daily.setdefault(day, {"date": day, "attempts": 0, "speeds": [], "best": None, "chars": 0})
+        bucket["attempts"] += 1
+        if row["speed"] is not None:
+            bucket["speeds"].append(row["speed"])
+            if bucket["best"] is None or row["speed"] > bucket["best"]:
+                bucket["best"] = row["speed"]
+        if row["characters"]:
+            bucket["chars"] += int(row["characters"])
+
+    curve = []
+    for day in sorted(daily):
+        bucket = daily[day]
+        curve.append({
+            "date": day,
+            "attempts": bucket["attempts"],
+            "best_speed": round(bucket["best"], 2) if bucket["best"] is not None else None,
+            "avg_speed": round(sum(bucket["speeds"]) / len(bucket["speeds"]), 2) if bucket["speeds"] else None,
+            "characters": bucket["chars"],
+        })
+
+    seg_best = {}
+    for row in mine:
+        if not row["segment_id"] or row["speed"] is None:
+            continue
+        current = seg_best.get(row["segment_id"])
+        if current is None or row["speed"] > current["best_speed"]:
+            seg_best[row["segment_id"]] = {
+                "segment_id": row["segment_id"],
+                "best_speed": row["speed"],
+                "best_keystroke": row["keystroke"],
+                "best_accuracy": row["accuracy"],
+                "attempts": (current["attempts"] + 1) if current else 1,
+            }
+        else:
+            seg_best[row["segment_id"]]["attempts"] = current["attempts"] + 1
+
+    speeds = [r["speed"] for r in mine if r["speed"] is not None]
+    keystrokes = [r["keystroke"] for r in mine if r["keystroke"] is not None]
+    accuracies = [r["accuracy"] for r in mine if r["accuracy"] is not None]
+
+    # 首打认证：数据里的 certificate 字段只在部分记录出现，这里按「第一次打出某段落」算
+    first_seen = {}
+    for row in sorted(mine, key=lambda r: r["occurred_at"]):
+        if row["segment_id"] and row["segment_id"] not in first_seen:
+            first_seen[row["segment_id"]] = row["occurred_at"]
+
+    latest = sorted(mine, key=lambda r: r["occurred_at"], reverse=True)[:30]
+    return {
+        "user_id": mine[0]["sender_id"],
+        "name": mine[0]["sender_name"],
+        "days": days,
+        "found": True,
+        "attempts": len(mine),
+        "best_speed": round(max(speeds), 2) if speeds else None,
+        "avg_speed": round(sum(speeds) / len(speeds), 2) if speeds else None,
+        "best_keystroke": round(max(keystrokes), 2) if keystrokes else None,
+        "avg_keystroke": round(sum(keystrokes) / len(keystrokes), 2) if keystrokes else None,
+        "best_accuracy": round(max(accuracies), 2) if accuracies else None,
+        "avg_accuracy": round(sum(accuracies) / len(accuracies), 2) if accuracies else None,
+        "characters": sum(int(r["characters"]) for r in mine if r["characters"]),
+        "new_segments": len(first_seen),
+        "active_days": len(daily),
+        "first_at": min(r["occurred_at"] for r in mine),
+        "last_at": max(r["occurred_at"] for r in mine),
+        "dropped": dropped,
+        "unreadable": unreadable,
+        "applied": limits,
+        "daily": curve,
+        "segments": sorted(
+            seg_best.values(), key=lambda s: -(s["best_speed"] or 0))[:20],
+        "recent": [
+            {
+                "segment_id": r["segment_id"],
+                "speed": r["speed"],
+                "keystroke": r["keystroke"],
+                "accuracy": r["accuracy"],
+                "characters": r["characters"],
+                "occurred_at": r["occurred_at"],
+                "source": r["source"],
+                "group_name": r["group_name"],
+            }
+            for r in latest
+        ],
+    }
+
+
+def digest_row_to_dict(row) -> dict:
+    try:
+        topics = json.loads(row["topics_json"] or "[]")
+    except (TypeError, ValueError):
+        topics = []
+    try:
+        decisions = json.loads(row["decisions_json"] or "[]")
+    except (TypeError, ValueError):
+        decisions = []
+    try:
+        people = json.loads(row["people_json"] or "[]")
+    except (TypeError, ValueError):
+        people = []
+    try:
+        pending = json.loads(row["pending_json"] or "[]")
+    except (TypeError, ValueError):
+        pending = []
+    try:
+        unverified = json.loads(row["unverified_ids"] or "[]")
+    except (TypeError, ValueError):
+        unverified = []
+    return {
+        "day": row["day"],
+        "summary": row["summary"],
+        "topics": topics,
+        "decisions": decisions,
+        "people": people,
+        "pending": pending,
+        "msg_count": row["msg_count"],
+        "verified": bool(row["verified"]),
+        "unverified_ids": unverified,
+    }
+
+
+def digests_for_chat(db, query) -> dict:
+    """某个群最近几天的摘要。默认只给通过机器校验的。"""
+    platform = (query.get("platform", ["qq"])[0] or "qq").strip().lower()
+    group_id = (query.get("group_id", [""])[0] or "").strip()
+    if not group_id:
+        return {"error": "group_id 必填"}
+    try:
+        days = min(max(int(query.get("days", ["3"])[0]), 1), 90)
+    except (TypeError, ValueError):
+        days = 3
+    try:
+        limit = min(max(int(query.get("limit", ["7"])[0]), 1), 60)
+    except (TypeError, ValueError):
+        limit = 7
+    include_unverified = (query.get("all", ["0"])[0] or "0").strip().lower() in {"1", "true", "yes"}
+
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+    sql = ("SELECT * FROM group_digests WHERE platform=? AND group_id=? AND day>=? "
+           + ("" if include_unverified else "AND verified=1 ")
+           + "ORDER BY day DESC LIMIT ?")
+    rows = db.execute(sql, (platform, group_id, since, limit)).fetchall()
+    return {
+        "platform": platform,
+        "group_id": group_id,
+        "group_name": rows[0]["group_name"] if rows else "",
+        "days": days,
+        "include_unverified": include_unverified,
+        "count": len(rows),
+        "digests": [digest_row_to_dict(row) for row in rows],
+    }
+
+
+def digests_overview(db, query) -> dict:
+    """所有群的摘要概览。"""
+    try:
+        days = min(max(int(query.get("days", ["7"])[0]), 1), 90)
+    except (TypeError, ValueError):
+        days = 7
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+    rows = db.execute("""
+        SELECT platform, group_id, MAX(group_name) AS group_name,
+               COUNT(*) AS digests,
+               SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified_digests,
+               MAX(day) AS latest_day,
+               SUM(msg_count) AS msg_count
+        FROM group_digests WHERE day >= ?
+        GROUP BY platform, group_id ORDER BY msg_count DESC
+    """, (since,)).fetchall()
+    return {
+        "days": days,
+        "since": since,
+        "groups": [
+            {
+                "platform": r["platform"],
+                "group_id": r["group_id"],
+                "group_name": r["group_name"] or r["group_id"],
+                "digests": r["digests"],
+                "verified_digests": r["verified_digests"],
+                "latest_day": r["latest_day"],
+                "msg_count": r["msg_count"],
+            }
+            for r in rows
+        ],
+    }
+
+
+@score_agg_cache
+def scores_duel(db, query):
+    """两个人的对比：逐项并排 + 共同段落对决 + 每日走势。"""
+    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
+    a = (query.get("a", [""])[0] or "").strip()
+    b = (query.get("b", [""])[0] or "").strip()
+    by = (query.get("by", [""])[0] or "").strip().lower()
+    if not a or not b:
+        return {"error": "a 和 b 都要给"}
+
+    since = time.time() - days * 86400
+    limits = score_thresholds(query)
+    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
+
+    def pick(who):
+        """优先按 sender_id 精确匹配；没命中再按名字匹配。"""
+        if by == "name":
+            return [r for r in rows if r["sender_name"] == who]
+        exact = [r for r in rows if r["sender_id"] == who]
+        if exact:
+            return exact
+        return [r for r in rows if r["sender_name"] == who]
+
+    left, right = pick(a), pick(b)
+    if not left or not right:
+        return {
+            "days": days, "a": a, "b": b, "found": False,
+            "missing": [x for x, rows_ in ((a, left), (b, right)) if not rows_],
+            "applied": limits,
+        }
+
+    def profile(side):
+        speeds = [r["speed"] for r in side if r["speed"] is not None]
+        keys = [r["keystroke"] for r in side if r["keystroke"] is not None]
+        accs = [r["accuracy"] for r in side if r["accuracy"] is not None]
+        chars = sum(int(r["characters"]) for r in side if r["characters"])
+        dayset = {score_day(r["occurred_at"]) for r in side}
+        segs = {r["segment_id"] for r in side if r["segment_id"]}
+        groups = {}
+        for r in side:
+            key = r["group_id"] or r["group_name"]
+            if key:
+                groups[key] = r["group_name"] or key
+        avg = lambda xs: round(sum(xs) / len(xs), 2) if xs else None
+        return {
+            "sender_id": side[0]["sender_id"],
+            "sender_name": side[0]["sender_name"],
+            "group_names": sorted(set(groups.values())),
+            "attempts": len(side),
+            "active_days": len(dayset),
+            "segments": len(segs),
+            "characters": chars,
+            "best_speed": round(max(speeds), 2) if speeds else None,
+            "avg_speed": avg(speeds),
+            "median_speed": round(statistics.median(speeds), 2) if speeds else None,
+            "p90_speed": round(sorted(speeds)[int(len(speeds) * 0.9)], 2) if len(speeds) >= 10 else (round(max(speeds), 2) if speeds else None),
+            "best_keystroke": round(max(keys), 2) if keys else None,
+            "avg_keystroke": avg(keys),
+            "best_accuracy": round(max(accs), 2) if accs else None,
+            "avg_accuracy": avg(accs),
+            "first_at": min(r["occurred_at"] for r in side),
+            "last_at": max(r["occurred_at"] for r in side),
+        }
+
+    pa, pb = profile(left), profile(right)
+
+    # 共同打过的段落：各自的最好成绩对比
+    def best_by_segment(side):
+        out = {}
+        for row in side:
+            if not row["segment_id"] or row["speed"] is None:
+                continue
+            cur = out.get(row["segment_id"])
+            if cur is None or row["speed"] > cur["speed"]:
+                out[row["segment_id"]] = {
+                    "speed": row["speed"],
+                    "keystroke": row["keystroke"],
+                    "accuracy": row["accuracy"],
+                }
+        return out
+
+    sa, sb = best_by_segment(left), best_by_segment(right)
+    shared = sorted(set(sa) & set(sb))
+    duels = []
+    win_a = win_b = 0
+    for seg in shared:
+        mine, theirs = sa[seg]["speed"], sb[seg]["speed"]
+        if mine > theirs:
+            win_a += 1
+        elif theirs > mine:
+            win_b += 1
+        duels.append({
+            "segment_id": seg,
+            "a_speed": round(mine, 2),
+            "b_speed": round(theirs, 2),
+            "diff": round(mine - theirs, 2),
+            "winner": "a" if mine > theirs else ("b" if theirs > mine else "tie"),
+        })
+    duels.sort(key=lambda d: -abs(d["diff"]))
+
+    # 每日走势：两人每天的均速，按日期对齐
+    def daily(side):
+        bucket = {}
+        for row in side:
+            if row["speed"] is None:
+                continue
+            day = score_day(row["occurred_at"])
+            bucket.setdefault(day, []).append(row["speed"])
+        return {d: round(sum(v) / len(v), 2) for d, v in bucket.items()}
+
+    da, db_ = daily(left), daily(right)
+    dates = sorted(set(da) | set(db_))
+    trend = [
+        {"date": d, "a": da.get(d), "b": db_.get(d)}
+        for d in dates
+    ]
+
+    return {
+        "days": days,
+        "found": True,
+        "applied": limits,
+        "dropped": dropped,
+        "a": pa,
+        "b": pb,
+        "duel": {
+            "shared_segments": len(shared),
+            "a_wins": win_a,
+            "b_wins": win_b,
+            "ties": len(shared) - win_a - win_b,
+            "rows": duels[:30],
+        },
+        "trend": trend,
+    }
+
+
+@score_agg_cache
+def scores_group_compare(db, query):
+    """群对比：人均速度、活跃人数、日均条数。"""
+    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
+    since = time.time() - days * 86400
+    limits = score_thresholds(query)
+    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
+
+    groups = {}
+    for row in rows:
+        key = row["group_id"] or row["group_name"] or "(未知)"
+        bucket = groups.setdefault(key, {
+            "group_id": row["group_id"],
+            "group_name": row["group_name"] or "(未知群)",
+            "attempts": 0,
+            "speeds": [],
+            "keystrokes": [],
+            "accuracies": [],
+            "people": set(),
+            "days": set(),
+            "best": None,
+            "best_who": "",
+        })
+        bucket["attempts"] += 1
+        if row["group_name"]:
+            bucket["group_name"] = row["group_name"]
+        if row["sender_id"]:
+            bucket["people"].add(row["sender_id"])
+        bucket["days"].add(score_day(row["occurred_at"]))
+        if row["speed"] is not None:
+            bucket["speeds"].append(row["speed"])
+            if bucket["best"] is None or row["speed"] > bucket["best"]:
+                bucket["best"] = row["speed"]
+                bucket["best_who"] = row["sender_name"]
+        if row["keystroke"] is not None:
+            bucket["keystrokes"].append(row["keystroke"])
+        if row["accuracy"] is not None:
+            bucket["accuracies"].append(row["accuracy"])
+
+    def avg(values):
+        return round(sum(values) / len(values), 2) if values else None
+
+    out = []
+    for bucket in groups.values():
+        day_count = max(len(bucket["days"]), 1)
+        out.append({
+            "group_id": bucket["group_id"],
+            "group_name": bucket["group_name"],
+            "attempts": bucket["attempts"],
+            "people": len(bucket["people"]),
+            "active_days": len(bucket["days"]),
+            "per_day": round(bucket["attempts"] / day_count, 1),
+            "avg_speed": avg(bucket["speeds"]),
+            "best_speed": round(bucket["best"], 2) if bucket["best"] is not None else None,
+            "best_who": bucket["best_who"],
+            "avg_keystroke": avg(bucket["keystrokes"]),
+            "avg_accuracy": avg(bucket["accuracies"]),
+            "per_person": round(bucket["attempts"] / max(len(bucket["people"]), 1), 1),
+        })
+    out.sort(key=lambda g: -(g["avg_speed"] or 0))
+    return {
+        "days": days,
+        "total_records": len(rows),
+        "dropped": dropped,
+        "unreadable": unreadable,
+        "applied": limits,
+        "groups": out,
+    }
+
+
 def library_stats(db: sqlite3.Connection) -> dict:
+    # 先把全库闲置的会话收掉，否则下面的 active 计数是累积出来的假数字
+    sweep_idle_library_sessions(db)
     categories = {
         row["category"]: row["count"]
         for row in db.execute("SELECT category,COUNT(*) AS count FROM library_texts GROUP BY category")
@@ -2391,6 +3173,33 @@ def expire_idle_library_sessions(db: sqlite3.Connection, platform: str,
             (time.time(), platform, chat_id, requester_id, cutoff),
         )
         stopped += len(rows)
+    if stopped:
+        db.commit()
+    return stopped
+
+
+def sweep_idle_library_sessions(db: sqlite3.Connection) -> int:
+    """Stop every active session that has been idle past the cutoff.
+
+    Unlike expire_idle_library_sessions(), this is not scoped to one
+    platform/chat/person: it looks at the whole table. That matters because the
+    scoped version only runs when the *same* person asks for status again —
+    someone who abandons a session never triggers it, so the session sits at
+    status='active' forever and inflates the admin panel's active count.
+
+    Cheap enough to call from read paths: it is one UPDATE that normally
+    matches zero rows thanks to the (platform, chat_id, status, updated_at)
+    index.
+    """
+    cutoff = time.time() - LIBRARY_SESSION_IDLE_SECONDS
+    stopped = 0
+    for table in ("library_sessions", "single_sessions"):
+        cursor = db.execute(
+            f"UPDATE {table} SET status='stopped', updated_at=? "
+            f"WHERE status='active' AND updated_at < ?",
+            (time.time(), cutoff),
+        )
+        stopped += cursor.rowcount or 0
     if stopped:
         db.commit()
     return stopped
@@ -3707,7 +4516,9 @@ class Api(BaseHTTPRequestHandler):
                 db.commit()
                 return self.json(random.choice(candidates) if candidates else None)
             if request.path == "/library/stats":
-                return self.json(library_stats(db))
+                # 这个函数内部会顺手收僵尸会话（写操作），包缓存之后
+                # 从「每次请求都扫」变成「每 45 秒一次」，实际更合适。
+                return self.json(stats_cache("library:stats", lambda: library_stats(db)))
             if request.path == "/library/session-status":
                 return self.json(library_session_status(db, {
                     "platform": query.get("platform", ["qq"])[0],
@@ -3736,6 +4547,18 @@ class Api(BaseHTTPRequestHandler):
                         item["image_urls"] = []
                     result.append(item)
                 return self.json(result)
+            if request.path == "/scores/leaderboard":
+                return self.json(scores_leaderboard(db, query))
+            if request.path == "/scores/player":
+                return self.json(scores_player(db, query))
+            if request.path == "/digests":
+                return self.json(digests_for_chat(db, query))
+            if request.path == "/digests/overview":
+                return self.json(digests_overview(db, query))
+            if request.path == "/scores/duel":
+                return self.json(scores_duel(db, query))
+            if request.path == "/scores/group-compare":
+                return self.json(scores_group_compare(db, query))
             if request.path == "/scores":
                 group_id = query.get("group_id", [""])[0]
                 sender_id = query.get("sender_id", [""])[0]
@@ -3941,51 +4764,90 @@ class Api(BaseHTTPRequestHandler):
                     days = min(max(int(query.get("days", ["7"])[0]), 1), 31)
                 except (TypeError, ValueError):
                     days = 7
-                now = time.time()
-                start = now - days * 86400
-                day_rows = db.execute(
-                    "SELECT date(datetime(occurred_at, 'unixepoch', 'localtime')) AS date, COUNT(*) AS count "
-                    "FROM message_archive WHERE occurred_at >= ? GROUP BY date ORDER BY date",
-                    (start,),
-                ).fetchall()
-                group_rows = db.execute(
-                    "SELECT group_id, MAX(group_name) AS group_name, COUNT(*) AS count "
-                    "FROM message_archive WHERE occurred_at >= ? GROUP BY group_id "
-                    "ORDER BY count DESC LIMIT 10",
-                    (start,),
-                ).fetchall()
-                local_today = datetime.now().date()
-                today_start = datetime.combine(local_today, datetime.min.time()).timestamp()
-                yesterday_start = today_start - 86400
-                today_count = db.execute(
-                    "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ?", (today_start,)
-                ).fetchone()[0]
-                yesterday_count = db.execute(
-                    "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ? AND occurred_at < ?",
-                    (yesterday_start, today_start),
-                ).fetchone()[0]
-                return self.json({
-                    "days": [dict(row) for row in day_rows],
-                    "groups": [dict(row) for row in group_rows],
-                    "today": today_count,
-                    "yesterday": yesterday_count,
-                })
+
+                def build_daily():
+                    now = time.time()
+                    start = now - days * 86400
+                    day_rows = db.execute(
+                        "SELECT date(datetime(occurred_at, 'unixepoch', 'localtime')) AS date, COUNT(*) AS count "
+                        "FROM message_archive WHERE occurred_at >= ? GROUP BY date ORDER BY date",
+                        (start,),
+                    ).fetchall()
+                    group_rows = db.execute(
+                        "SELECT group_id, MAX(group_name) AS group_name, COUNT(*) AS count "
+                        "FROM message_archive WHERE occurred_at >= ? GROUP BY group_id "
+                        "ORDER BY count DESC LIMIT 10",
+                        (start,),
+                    ).fetchall()
+                    local_today = datetime.now().date()
+                    today_start = datetime.combine(local_today, datetime.min.time()).timestamp()
+                    yesterday_start = today_start - 86400
+                    today_count = db.execute(
+                        "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ?", (today_start,)
+                    ).fetchone()[0]
+                    yesterday_count = db.execute(
+                        "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ? AND occurred_at < ?",
+                        (yesterday_start, today_start),
+                    ).fetchone()[0]
+                    return {
+                        "days": [dict(row) for row in day_rows],
+                        "groups": [dict(row) for row in group_rows],
+                        "today": today_count,
+                        "yesterday": yesterday_count,
+                    }
+
+                return self.json(stats_cache(f"daily:{days}", build_daily))
             if request.path == "/stats/advanced":
-                start = time.time() - 7 * 86400
-                heat_rows = db.execute("SELECT CAST(strftime('%w',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS weekday,CAST(strftime('%H',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS hour,COUNT(*) AS count FROM message_archive WHERE occurred_at>=? GROUP BY weekday,hour", (start,)).fetchall()
-                heat = [{"day": (int(x["weekday"])-1)%7, "hour": int(x["hour"]), "count": int(x["count"])} for x in heat_rows]
-                buckets = [(0,50),(50,80),(80,100),(100,120),(120,150),(150,None)]
-                speed = {"0-50":0,"50-80":0,"80-100":0,"100-120":0,"120-150":0,"150+":0}
-                for row in db.execute("SELECT source_json FROM score_records").fetchall():
-                    try:
-                        raw=json.loads(row["source_json"] or "{}")
-                        value=raw.get("speed",raw.get("速度",raw.get("wpm")))
-                        value=float(value)
-                    except (TypeError,ValueError,AttributeError,json.JSONDecodeError):
-                        continue
-                    for (low,high),key in zip(buckets,speed):
-                        if value>=low and (high is None or value<high): speed[key]+=1; break
-                return self.json({"heatmap":heat,"speed_distribution":[{"range":k,"count":v} for k,v in speed.items()]})
+                # part=heat 只算热力图，part=speed 只算速度分布；
+                # 不传则都算（向后兼容）。两部分各自缓存 60 秒。
+                # 为什么要分开：速度分布要全表扫 score_records 并逐条解析 JSON，
+                # 是这里唯一的耗时来源（实测总 525 ms 里 460 ms 在这）。
+                # 成绩页现在只用热力图，所以它会传 part=heat。
+                part = (query.get("part", [""])[0] or "").strip().lower()
+                result = {}
+
+                if part in ("", "heat", "all"):
+                    def build_heat():
+                        start = time.time() - 7 * 86400
+                        heat_rows = db.execute(
+                            "SELECT CAST(strftime('%w',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS weekday,"
+                            "CAST(strftime('%H',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS hour,"
+                            "COUNT(*) AS count FROM message_archive WHERE occurred_at>=? GROUP BY weekday,hour",
+                            (start,),
+                        ).fetchall()
+                        return [
+                            {"day": (int(x["weekday"]) - 1) % 7, "hour": int(x["hour"]),
+                             "count": int(x["count"])}
+                            for x in heat_rows
+                        ]
+
+                    result["heatmap"] = stats_advanced_cached("heat", build_heat)
+
+                if part in ("", "speed", "all"):
+                    def build_speed():
+                        buckets = [(0, 50), (50, 80), (80, 100), (100, 120), (120, 150), (150, None)]
+                        out = {"0-50": 0, "50-80": 0, "80-100": 0,
+                               "100-120": 0, "120-150": 0, "150+": 0}
+                        for row in db.execute("SELECT source_json FROM score_records").fetchall():
+                            try:
+                                payload = json.loads(row["source_json"])
+                            except (TypeError, ValueError):
+                                continue
+                            value = score_number(payload.get("speed")) if isinstance(payload, dict) else None
+                            if value is None:
+                                continue
+                            for low, high in buckets:
+                                if value >= low and (high is None or value < high):
+                                    key = f"{low}-{high}" if high is not None else f"{low}+"
+                                    out[key] = out.get(key, 0) + 1
+                                    break
+                        return [{"range": k, "count": v} for k, v in out.items()]
+
+                    result["speed_distribution"] = stats_advanced_cached("speed", build_speed)
+
+                if part and part not in ("heat", "speed", "all"):
+                    return self.json({"error": "part 只能是 heat / speed / all"}, HTTPStatus.BAD_REQUEST)
+                return self.json(result)
             if request.path == "/stats":
                 tables = [
                     "groups", "library_texts", "library_classifications", "contest_texts", "recall_records", "score_records",
@@ -3993,7 +4855,7 @@ class Api(BaseHTTPRequestHandler):
                 ]
                 return self.json({table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables})
             if request.path == "/archive/status":
-                return self.json(archive_status(db))
+                return self.json(stats_cache("archive:status", lambda: archive_status(db)))
             return self.json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         finally:
             db.close()
@@ -4199,16 +5061,23 @@ class Api(BaseHTTPRequestHandler):
         db = connect(self.db_path)
         try:
             message_values = (platform, message_id, group_id, group_name, sender_id, sender_name, text, occurred_at, raw_json, json.dumps(image_urls, ensure_ascii=False))
+            # P1-c: 主路径直接写 message_archive。
+            # 以前先写 recent_messages 再由 worker 转存，等于同一份数据在磁盘上留两份
+            # （实测两张表各 158 MB、内容零差异），而唯一读 recent_messages 的地方
+            # 只有 record_recall_event。见 app.py 顶部 P1-c 说明。
             db.execute(
-                "INSERT INTO recent_messages (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO message_archive (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(platform,message_id) DO UPDATE SET group_id=excluded.group_id,group_name=excluded.group_name,sender_id=excluded.sender_id,sender_name=excluded.sender_name,text=excluded.text,occurred_at=excluded.occurred_at,raw_json=excluded.raw_json,image_urls_json=excluded.image_urls_json",
-                (platform, message_id, group_id, group_name, sender_id, sender_name, text, occurred_at, raw_json, json.dumps(image_urls, ensure_ascii=False)),
+                message_values,
             )
             archived = False
             ai_contest_archived = False
             parsed = parse_typing_score(text)
             # Every recognized QQ typing score is part of the shared archive.
             # The old group allowlist made new or unlisted groups fail silently.
+            # 落了新成绩，聚合缓存与速度分布都作废
+            score_agg_invalidate()
+            stats_advanced_invalidate("speed")
             if parsed and platform == "qq":
                 record = {
                     **parsed,
@@ -4279,11 +5148,13 @@ class Api(BaseHTTPRequestHandler):
             return self.json({"error": "platform and message_id are required"}, HTTPStatus.BAD_REQUEST)
         db = connect(self.db_path)
         try:
+            # P1-c: 原文改从 message_archive 取。recent_messages 即将退场，
+            # 而这两张表内容完全一致，换过去不丢任何东西。
             original = db.execute(
-                "SELECT * FROM recent_messages WHERE platform=? AND message_id=?", (platform, message_id)
+                "SELECT * FROM message_archive WHERE platform=? AND message_id=?", (platform, message_id)
             ).fetchone()
             if not original:
-                return self.json({"captured": False, "reason": "original message not cached"})
+                return self.json({"captured": False, "reason": "original message not archived"})
             source = {"recall_event": payload, "original": dict(original)}
             try:
                 image_urls = json.loads(original["image_urls_json"] or "[]")
