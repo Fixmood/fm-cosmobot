@@ -882,13 +882,20 @@ fmSelfReviewTool =
           else do
             let defaultLimit = if wanted == "messages" then 40 else 20
                 lim = max 1 (min 200 (fromMaybe defaultLimit limitText))
-                target = if wanted == "messages" then "bot" /: "messages" else "bot" /: "runs"
-                params = case (wanted, chatFilter) of
-                  ("messages", Just chat) | not (Text.null (Text.strip chat)) ->
-                    "limit" =: lim <> "chat_id" =: Text.strip chat <> port 8077
-                  _ -> "limit" =: lim <> port 8077
-            response <- HTTP.runReq $
-              req GET (http "172.20.0.4" /: target) NoReqBody jsonResponse params
+                chatArg = Text.strip (fromMaybe "" chatFilter)
+                -- target 用 Url 直接构造：/: 产生的是 Url 而不是 Text，
+                -- 所以不能先算出路径名再拼（会类型不匹配）。
+                request
+                  | wanted == "messages" =
+                      req GET (http "172.20.0.4" /: "bot" /: "messages") NoReqBody jsonResponse
+                        ( if Text.null chatArg
+                            then "limit" =: lim <> port 8077
+                            else "limit" =: lim <> "chat_id" =: chatArg <> port 8077
+                        )
+                  | otherwise =
+                      req GET (http "172.20.0.4" /: "bot" /: "runs") NoReqBody jsonResponse
+                        ("limit" =: lim <> port 8077)
+            response <- HTTP.runReq request
             pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 hasExplicitLibraryIntent :: Context -> Bool
