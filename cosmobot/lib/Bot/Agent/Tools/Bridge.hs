@@ -137,34 +137,43 @@ fmBridgeTestTool =
                     detail = if null errors then "" else " 失败信息：" <> Text.intercalate "；" errors
                 pure (toolText (status <> detail))
 
+-- | Owner only.
+--
+-- There used to be a keyword gate here (explicitRelayRequest): the tool refused
+-- unless the triggering message contained one of 告诉 / 传话 / 转告 / 通知. It was
+-- removed because it judged the wrong thing. Whether the owner means "relay this"
+-- is an intent question, and the model has already answered it by the time it
+-- calls this tool. A word list can only re-ask that question worse: "私聊发给我"
+-- is the most natural phrasing there is, and it failed the gate, so FM told the
+-- owner to come back and say "转告我" instead of just doing the job.
+--
+-- What actually needs guarding is who may call it, and that is an identity
+-- question: allowWhen superuserOnly. Other members cannot reach this tool at all,
+-- so they cannot borrow FM's mouth to send private messages.
+--
+-- Judgement stays with the model. When it is unsure whether the owner really
+-- wants a private message, it asks in the conversation first -- that is stated in
+-- the description below rather than re-implemented in code.
 fmRelayToOwnerTool :: Chat.Chat :> es => Tool (Eff es)
 fmRelayToOwnerTool =
-  withDescription "Send a single private QQ message to the FM owner when a user explicitly asks FM to tell Fix哥 something. The message is delivered privately to the fixed owner account, not posted in the current group or Matrix room. Do not call for ordinary conversation or an implied request."
+  allowWhen superuserOnly
+  . withDescription "Send a single private QQ message to the FM owner (Fix哥) when the owner asks for it. The message is delivered privately to the fixed owner account, not posted in the current group or Matrix room. Only the owner may use this tool, so do not call it for another member's request. Do not call it for ordinary conversation or an implied request: if you are not sure the owner really wants a private message, ask him in the conversation first instead of guessing. Private delivery can fail because some groups forbid starting a private chat without a friend request; when that happens say plainly that the message did not go out and why, and put the content in the current conversation. Never tell the user which wording to use, and do not drop character to deliver that news."
   $ tool "fm_relay_to_owner"
       (requiredText "content" "The message to tell Fix哥, without adding interpretation.")
       \content -> do
         context <- askToolContext
-        if not (explicitRelayRequest context.message.text)
-          then pure (toolText "未发送：只有明确要求“告诉 Fix哥”“传话”或“转告”时，FM 才会发送私聊。")
+        let source = fromMaybe "未知用户" (context.message.senderUsername <|> context.message.senderId)
+            body = "😻" <> source <> "：" <> Text.strip content
+        sent <- Chat.replyTo (ownerPrivateTarget context.message) body
+        if any isRight sent
+          then pure (toolText "已通过 QQ 私聊转告 Fix哥。")
           else do
-            let source = fromMaybe "未知用户" (context.message.senderUsername <|> context.message.senderId)
-                body = "😻" <> source <> "：" <> Text.strip content
-            sent <- Chat.replyTo (ownerPrivateTarget context.message) body
-            if any isRight sent
-              then pure (toolText "已通过 QQ 私聊转告 Fix哥。")
-              else do
-                let err = Text.intercalate "；" (lefts sent)
-                pure (toolFailure Failure.Failure
-                  { category = Failure.ExternalServiceUnavailable
-                  , userMessage = "传话失败：QQ 私聊消息没有成功发送。"
-                  , detail = err
-                  })
-
-explicitRelayRequest :: Text -> Bool
-explicitRelayRequest value =
-  let normalized = Text.toCaseFold (Text.filter (not . (`elem` [' ', '\t', '\x3000'])) value)
-  in any (`Text.isInfixOf` normalized)
-      [ "告诉", "传话", "转告", "通知" ]
+            let err = Text.intercalate "；" (lefts sent)
+            pure (toolFailure Failure.Failure
+              { category = Failure.ExternalServiceUnavailable
+              , userMessage = "私聊没发出去。有些群不让未加好友就直接发起私聊，这一条就卡在这儿了。内容我贴在这儿，你直接看。"
+              , detail = err
+              })
 
 ownerPrivateTarget :: IncomingMessage -> IncomingMessage
 ownerPrivateTarget message =
@@ -192,34 +201,34 @@ ownerPrivateTarget message =
     , raw = Aeson.Null
     }
 
+-- | Owner only, same reasoning as fmRelayToOwnerTool: the keyword gate is gone
+-- because intent is the model's call, and the guard that matters is identity.
 fmRelayMessageTool :: Chat.Chat :> es => Tool (Eff es)
 fmRelayMessageTool =
-  withDescription "Send one private QQ message to another person when a user explicitly asks FM to tell, relay, or notify them. target may be a positive QQ number or a unique nickname/card in the current QQ group. Resolve nicknames from the current group only; if there are zero or multiple matches, do not send. Never post the relay in the current chat."
+  allowWhen superuserOnly
+  . withDescription "Send one private QQ message to another person when the owner asks FM to relay something to them. target may be a positive QQ number or a unique nickname/card in the current QQ group. Resolve nicknames from the current group only; if there are zero or multiple matches, do not send. Never post the relay in the current chat. Ordinarily the group does not need FM to private-message anyone, so only reach for this when the owner clearly wants a private message sent; when it is unclear -- a joke, an offhand remark, or no clear recipient -- ask the owner in the conversation first rather than guessing. Private delivery can fail because some groups forbid starting a private chat without a friend request; when that happens say plainly that it did not go out and why, and put the content in the current conversation. Never tell the user which wording to use, and do not drop character to deliver that news."
   $ tool "fm_relay_message"
       ( requiredText "target" "Positive QQ number, or a unique nickname/card in the current QQ group."
       , requiredText "content" "The exact message to relay, without adding interpretation."
       )
       \target content -> do
         context <- askToolContext
-        if not (explicitRelayRequest context.message.text)
-          then pure (toolText "未发送：只有明确要求告诉、传话或转告时，FM 才会发送私聊。")
-          else do
-            resolved <- resolveRelayTarget target context.message
-            case resolved of
-              Left reason -> pure (toolText reason)
-              Right userId -> do
-                let source = fromMaybe "未知用户" (context.message.senderUsername <|> context.message.senderId)
-                    body = "😻" <> source <> "：" <> Text.strip content
-                sent <- Chat.replyTo (qqPrivateTarget context.message userId) body
-                if any isRight sent
-                  then pure (toolText ("已通过 QQ 私聊转告 " <> target <> "。"))
-                  else do
-                    let err = Text.intercalate "；" (lefts sent)
-                    pure (toolFailure Failure.Failure
-                      { category = Failure.ExternalServiceUnavailable
-                      , userMessage = "传话失败：QQ 私聊消息没有成功发送给 " <> target <> "。"
-                      , detail = err
-                      })
+        resolved <- resolveRelayTarget target context.message
+        case resolved of
+          Left reason -> pure (toolText reason)
+          Right userId -> do
+            let source = fromMaybe "未知用户" (context.message.senderUsername <|> context.message.senderId)
+                body = "😻" <> source <> "：" <> Text.strip content
+            sent <- Chat.replyTo (qqPrivateTarget context.message userId) body
+            if any isRight sent
+              then pure (toolText ("已通过 QQ 私聊转告 " <> target <> "。"))
+              else do
+                let err = Text.intercalate "；" (lefts sent)
+                pure (toolFailure Failure.Failure
+                  { category = Failure.ExternalServiceUnavailable
+                  , userMessage = "私聊没发给 " <> target <> "。有些群不让未加好友就直接发起私聊，这一条就卡在这儿了。内容我贴在这儿。"
+                  , detail = err
+                  })
 
 resolveRelayTarget :: Chat.Chat :> es => Text -> IncomingMessage -> Eff es (Either Text Text)
 resolveRelayTarget rawTarget message =

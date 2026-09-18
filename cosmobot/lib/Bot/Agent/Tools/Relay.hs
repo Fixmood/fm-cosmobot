@@ -72,7 +72,7 @@ normalizedName =
 fmTellMemberTool :: Chat.Chat :> es => Tool (Eff es)
 fmTellMemberTool =
   allowWhen tellMemberGuard
-  . withDescription "Tell a person something in the QQ group they were talking in, when the owner asks for it from somewhere else such as a private chat. Use only when the owner explicitly asks FM to tell, relay, or notify that person. target is a nickname, group card, or QQ number. If the name matches several people, or one person in several groups, this reports the candidates and sends nothing, because delivering to the wrong person is worse than not delivering. Set dry_run to true to see exactly what would be sent, and where, without sending it."
+  . withDescription "Tell a person something in the QQ group they were talking in, when the owner asks for it from somewhere else such as a private chat. Only the owner may use this tool (and only from a private chat), so it cannot be reached on another member's behalf. target is a nickname, group card, or QQ number. If the name matches several people, or one person in several groups, this reports the candidates and sends nothing, because delivering to the wrong person is worse than not delivering. Set dry_run to true to see exactly what would be sent, and where, without sending it. When it is unclear whether the owner really wants this delivered, ask him first rather than guessing. Delivery can fail; when it does, say plainly that it did not go out and why, and never tell the user which wording to use."
   $ tool "fm_tell_member"
       ( requiredText "target" "Nickname, group card, or QQ number of the person to tell."
       , requiredText "content" "The exact message to deliver, without adding interpretation."
@@ -81,67 +81,62 @@ fmTellMemberTool =
       )
       \target content groupText dryRun -> do
         context <- askToolContext
-        if not (explicitTellRequest context.message.text)
-          then pure (toolText "未发送：只有你明确说要告诉、传话或转告某人时，FM 才会代你发话。")
-          else do
-            let hint = fmap (Text.strip) groupText
-            candidates <- resolveCandidates context target hint
-            case chooseCandidate candidates of
-              Left reason -> pure (toolText reason)
-              Right member -> do
-                let contentText = "Fix哥说：" <> Text.strip content
-                    preview = mentionBody member.memberUserId contentText
-                    destination =
-                      context.message
-                        { platform = PlatformQQ
-                        , kind = ChatGroup
-                        , chatId = Just member.memberGroup
-                        , chatAliases = []
-                        , digest =
-                            context.message.digest
-                              { chatIsAllowed = True
-                              , senderIsAllowed = True
-                              , mentionsBot = True
-                              }
-                        }
-                if dryRun
-                  then
+        let hint = fmap (Text.strip) groupText
+        candidates <- resolveCandidates context target hint
+        case chooseCandidate candidates of
+          Left reason -> pure (toolText reason)
+          Right member -> do
+            let contentText = "Fix哥说：" <> Text.strip content
+                preview = mentionBody member.memberUserId contentText
+                destination =
+                  context.message
+                    { platform = PlatformQQ
+                    , kind = ChatGroup
+                    , chatId = Just member.memberGroup
+                    , chatAliases = []
+                    , digest =
+                        context.message.digest
+                          { chatIsAllowed = True
+                          , senderIsAllowed = True
+                          , mentionsBot = True
+                          }
+                    }
+            if dryRun
+              then
+                pure . toolText $
+                  [i|干跑：本应发到 QQ群 #{member.memberGroup}，@#{member.memberUserId}（#{member.memberName}），内容：#{preview}|]
+              else do
+                -- Chat.mentionUser is the driver's own mention operation (Bot.Effect.Chat
+                -- re-exports the ChatDriver module). It builds a structured at-segment
+                -- and posts it with send_group_msg, so the mention is real. Sending
+                -- "[CQ:at,qq=...]" through replyTo instead delivers that text literally,
+                -- which is exactly what the group saw.
+                sent <- Chat.mentionUser destination (show member.memberUserId) contentText
+                case sent of
+                  Right _ ->
                     pure . toolText $
-                      [i|干跑：本应发到 QQ群 #{member.memberGroup}，@#{member.memberUserId}（#{member.memberName}），内容：#{preview}|]
-                  else do
-                    -- Chat.mentionUser is the driver's own mention operation (Bot.Effect.Chat
-                    -- re-exports the ChatDriver module). It builds a structured at-segment
-                    -- and posts it with send_group_msg, so the mention is real. Sending
-                    -- "[CQ:at,qq=...]" through replyTo instead delivers that text literally,
-                    -- which is exactly what the group saw.
-                    sent <- Chat.mentionUser destination (show member.memberUserId) contentText
-                    case sent of
-                      Right _ ->
-                        pure . toolText $
-                          [i|已发到 QQ群 #{member.memberGroup}：@#{member.memberUserId}，内容：#{contentText}|]
-                      Left err ->
-                        pure (toolFailure Failure.Failure
-                          { category = Failure.ExternalServiceUnavailable
-                          , userMessage = [i|发送失败：没能把话送到 QQ群 #{member.memberGroup}。|]
-                          , detail = err
-                          })
+                      [i|已发到 QQ群 #{member.memberGroup}：@#{member.memberUserId}，内容：#{contentText}|]
+                  Left err ->
+                    pure (toolFailure Failure.Failure
+                      { category = Failure.ExternalServiceUnavailable
+                      , userMessage = [i|没送到 QQ群 #{member.memberGroup}。这条卡住了，原因在下面。|]
+                      , detail = err
+                      })
 
 mentionBody :: Integer -> Text -> Text
 mentionBody userId body =
   "[CQ:at,qq=" <> show userId <> "] " <> body
 
 -- | Owner only, and only from outside a group chat.
+--
+-- This guard is the one that matters. It is why the old keyword gate
+-- (explicitTellRequest) could go: unreachable tools need no wording check, and
+-- the model's decision to call this tool already answers the intent question.
 tellMemberGuard :: Context -> Bool
 tellMemberGuard context =
   context.superuser
     && context.message.platform == PlatformQQ
     && context.message.kind == ChatPrivate
-
-explicitTellRequest :: Text -> Bool
-explicitTellRequest value =
-  let normalized = normalizedName (Text.toCaseFold value)
-  in any (`Text.isInfixOf` normalized)
-      [ "告诉", "传话", "转告", "通知", "说一声", "回复" ]
 
 resolveCandidates :: Chat.Chat :> es => Context -> Text -> Maybe Text -> Eff es [RelayMember]
 resolveCandidates context rawTarget hint =
