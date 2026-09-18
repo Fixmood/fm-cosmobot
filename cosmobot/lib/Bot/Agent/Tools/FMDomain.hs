@@ -29,6 +29,7 @@ module Bot.Agent.Tools.FMDomain
   , fmBotGuardAccountsTool
   , fmDomainStatsTool
   , fmAdminStatusTool
+  , fmSelfReviewTool
   ) where
 
 import Bot.Agent.Tool
@@ -849,6 +850,46 @@ fmAdminStatusTool =
         "当前 FM Control Center 后台地址：http://117.72.34.77:8090\n"
           <> "状态：已部署。\n"
           <> "说明：这是 FM 当前使用的管理后台；不要使用历史 score-analyzer 地址或 8787、8788、8790 端口。"
+
+-- | FM 查看「自己」。
+--
+-- 为什么需要这个工具：FM 手里有 30 个 fm_* 工具，但全都是关于外部世界的
+-- （查撤回、查成绩、查文库、查群状态）。**没有一个是关于它自己的。**
+--
+-- 后果是它无法回答「我上一条说了什么」「我哪句话被纠正了」「我最近哪些运行
+-- 慢或失败」这类问题。而这些都是改进的前提——没有观察就没有迭代，
+-- 它此前只能盲改（实测：8 分钟内把自己的人格改了 28 次，越改越抽象）。
+--
+-- 数据来自 fm-domain 的 /bot/messages 与 /bot/runs，那是为中控后台加的只读
+-- 接口，直接读机器人的 cosmobot.sqlite3。机器人本来就能访问到（同一个
+-- fm-runtime 网络、无鉴权），只是此前不知道有这两个入口。
+--
+-- Owner only：里面有它的运行细节（工具用量、token、失败原因），
+-- 不该让普通群成员拿它当探测窗口。
+fmSelfReviewTool :: HTTP.HTTP :> es => Tool (Eff es)
+fmSelfReviewTool =
+  allowWhen superuserOnly
+  . withDescription "Look at FM's own recent behaviour. action=messages returns what FM recently said, together with the message it was replying to and who sent it; action=runs returns FM's recent agent runs with elapsed time, turns, tool-call count, tokens and status. Use this when the owner asks how FM has been doing, why it replied strangely, what it said, or which of its own runs were slow or failed -- and use it to check FM's own behaviour before changing how it works. This is FM's own record, not the group's chat log; to read other people's messages use chat_log instead."
+  $ tool "fm_self_review"
+      ( requiredText "action" "messages (what FM said) or runs (FM's own runs with timing and status)."
+      , optionalInt "limit" "Maximum rows, from 1 to 200. Defaults to 40 for messages and 20 for runs."
+      , optionalText "chat_id" "For action=messages, restrict to one chat (group id or QQ number)."
+      )
+      \action limitText chatFilter -> do
+        let wanted = Text.toCaseFold (Text.strip action)
+        if wanted /= "messages" && wanted /= "runs"
+          then pure . toolText $ "action 只能是 messages 或 runs，收到的是「" <> action <> "」。"
+          else do
+            let defaultLimit = if wanted == "messages" then 40 else 20
+                lim = max 1 (min 200 (fromMaybe defaultLimit limitText))
+                target = if wanted == "messages" then "bot" /: "messages" else "bot" /: "runs"
+                params = case (wanted, chatFilter) of
+                  ("messages", Just chat) | not (Text.null (Text.strip chat)) ->
+                    "limit" =: lim <> "chat_id" =: Text.strip chat <> port 8077
+                  _ -> "limit" =: lim <> port 8077
+            response <- HTTP.runReq $
+              req GET (http "172.20.0.4" /: target) NoReqBody jsonResponse params
+            pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 hasExplicitLibraryIntent :: Context -> Bool
 hasExplicitLibraryIntent context =
