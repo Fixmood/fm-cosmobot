@@ -180,6 +180,7 @@ defaultToolsWith extraTools = tools
       , fmDomainStatsTool
       , fmAdminStatusTool
       , fmSelfReviewTool
+      , fmSelfNotesTool
       , readMediaTextTool
       , mediaToFileTool
       , viewImageTool

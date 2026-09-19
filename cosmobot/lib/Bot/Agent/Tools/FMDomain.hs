@@ -30,6 +30,7 @@ module Bot.Agent.Tools.FMDomain
   , fmDomainStatsTool
   , fmAdminStatusTool
   , fmSelfReviewTool
+  , fmSelfNotesTool
   ) where
 
 import Bot.Agent.Tool
@@ -59,7 +60,8 @@ import Bot.Prelude
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as AesonTypes
-import qualified Data.Text as Text
+import qualified Data.List as List
+import qualified System.Directory as Directory
 import Network.HTTP.Req
 
 fmGroupStatusTool :: HTTP.HTTP :> es => Tool (Eff es)
@@ -917,6 +919,43 @@ fmSelfReviewTool =
                         ("limit" =: lim <> port 8077)
             response <- HTTP.runReq request
             pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
+
+-- | 读自己的自省笔记。
+--
+-- 存在的理由：每日自省任务会把 FM 前一天的行为写成一篇笔记
+-- （/data/memory/self/notes/YYYY-MM-DD.md），但**笔记躺在磁盘上没人读**——
+-- 观察和调整之间是断的。这个工具补上那一段：让它能翻自己的旧账。
+--
+-- 用「按需读」而不是「每轮都塞进上下文」，是因为笔记有近千字，
+-- 常驻会占掉每一轮的 token；而它真正需要它们的时刻是
+-- 「准备改自己 / 复盘自己 / 被问到自己表现」这几种。
+fmSelfNotesTool :: IOE :> es => Tool (Eff es)
+fmSelfNotesTool =
+  allowWhen superuserOnly
+  . withDescription "Read FM's own daily self-reflection notes. These are written each night by a review pass that reads FM's own messages and runs, and they record what FM did well and what went wrong. Use this before changing any of FM's own behaviour (memory, persona, procedures), and when the owner asks how FM has been doing or whether something was fixed. Returns the most recent notes, newest first."
+  $ tool "fm_self_notes"
+      ( optionalInt "days" "How many recent daily notes to return, from 1 to 14. Defaults to 3."
+      )
+      \daysArg -> do
+        let want = max 1 (min 14 (fromMaybe 3 daysArg))
+        let dir = "/data/memory/self/notes"
+        exists <- liftIO (Directory.doesDirectoryExist dir)
+        if not exists
+          then pure (toolText "还没有自省笔记。")
+          else do
+            files <- liftIO (listDirectory dir)
+            let notes = reverse (List.sort [f | f <- files, ".md" `List.isSuffixOf` f])
+                chosen = take want notes
+            if null chosen
+              then pure (toolText "还没有自省笔记。")
+              else do
+                bodies <- liftIO $ mapM (\f -> (f,) <$> readFileUtf8 (dir <> "/" <> f)) chosen
+                pure . toolText $
+                  Text.intercalate "\n\n" [ "===== " <> Text.pack f <> " =====\n" <> body
+                                          | (f, body) <- bodies ]
+
+readFileUtf8 :: FilePath -> IO Text
+readFileUtf8 path = Text.pack <$> readFile path
 
 hasExplicitLibraryIntent :: Context -> Bool
 hasExplicitLibraryIntent context =
