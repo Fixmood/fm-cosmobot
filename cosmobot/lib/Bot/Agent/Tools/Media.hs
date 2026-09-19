@@ -19,6 +19,7 @@ import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.Media as Media
 import Bot.Prelude
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.ByteString as StrictByteString
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
@@ -164,27 +165,50 @@ mediaRef mediaId
   | "media:" `Text.isPrefixOf` mediaId = mediaId
   | otherwise = "media:" <> mediaId
 
+-- | 当提取不到文本时，补一句解释。
+--
+-- 为什么需要（实测）：模型读到 {"content":""} 会以为是自己参数不对，
+-- 于是换个 offset/size 再读一遍——同一个文件能连读 20 次，直到轮数耗尽。
+-- 09-14 那两次 tool_limit 就是这么来的（media_text ×20 和 ×14）。
+--
+-- 结果里的 total_chars / returned_chars 其实已经说明「没有文本」，
+-- 但模型不看那两个字段，只看 content 是不是空的。所以直接把话写出来。
+noTextNote :: Aeson.Value -> Aeson.Value
+noTextNote value = case value of
+  Aeson.Object o ->
+    case (KeyMap.lookup "total_chars" o, KeyMap.lookup "content" o) of
+      (Just (Aeson.Number total), Just (Aeson.String body))
+        | total == 0 || Text.null body ->
+            Aeson.Object (KeyMap.insert "note" (Aeson.String noteText) o)
+      _ -> value
+  other -> other
+  where
+    noteText =
+      "这个文件里没有可提取的文本——它多半是图片、音频或其它二进制内容。再换 offset / size 重读也不会有文本，不要重复读同一个文件。要看图片内容请用 view_image。"
+
 readMediaTextResult :: Media.MediaFileInfo -> StrictByteString.ByteString -> Text -> Text -> Int -> Int -> Aeson.Value
 readMediaTextResult info bytes text chunk offset size =
-  Aeson.object
-    [ "media_id" Aeson..= info.fileId
-    , "mime" Aeson..= info.mimeType
-    , "byte_size" Aeson..= StrictByteString.length bytes
-    , "total_chars" Aeson..= Text.length text
-    , "offset" Aeson..= offset
-    , "requested_size" Aeson..= size
-    , "returned_chars" Aeson..= Text.length chunk
-    , "content" Aeson..= chunk
-    ]
+  noTextNote $
+    Aeson.object
+      [ "media_id" Aeson..= info.fileId
+      , "mime" Aeson..= info.mimeType
+      , "byte_size" Aeson..= StrictByteString.length bytes
+      , "total_chars" Aeson..= Text.length text
+      , "offset" Aeson..= offset
+      , "requested_size" Aeson..= size
+      , "returned_chars" Aeson..= Text.length chunk
+      , "content" Aeson..= chunk
+      ]
 
 readMediaTextResultWithoutInfo :: Text -> StrictByteString.ByteString -> Text -> Text -> Int -> Int -> Aeson.Value
 readMediaTextResultWithoutInfo mediaId bytes text chunk offset size =
-  Aeson.object
-    [ "media_id" Aeson..= mediaId
-    , "byte_size" Aeson..= StrictByteString.length bytes
-    , "total_chars" Aeson..= Text.length text
-    , "offset" Aeson..= offset
-    , "requested_size" Aeson..= size
-    , "returned_chars" Aeson..= Text.length chunk
-    , "content" Aeson..= chunk
-    ]
+  noTextNote $
+    Aeson.object
+      [ "media_id" Aeson..= mediaId
+      , "byte_size" Aeson..= StrictByteString.length bytes
+      , "total_chars" Aeson..= Text.length text
+      , "offset" Aeson..= offset
+      , "requested_size" Aeson..= size
+      , "returned_chars" Aeson..= Text.length chunk
+      , "content" Aeson..= chunk
+      ]
