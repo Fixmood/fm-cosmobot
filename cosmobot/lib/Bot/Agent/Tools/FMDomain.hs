@@ -61,6 +61,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.List as List
+import qualified Data.Text as Text
 import qualified System.Directory as Directory
 import Network.HTTP.Req
 
@@ -943,7 +944,7 @@ fmSelfNotesTool =
         if not exists
           then pure (toolText "还没有自省笔记。")
           else do
-            files <- liftIO (listDirectory dir)
+            files <- liftIO (Directory.listDirectory dir)
             let notes = reverse (List.sort [f | f <- files, ".md" `List.isSuffixOf` f])
                 chosen = take want notes
             if null chosen
