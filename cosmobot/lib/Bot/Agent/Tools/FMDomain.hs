@@ -31,6 +31,7 @@ module Bot.Agent.Tools.FMDomain
   , fmAdminStatusTool
   , fmSelfReviewTool
   , fmSelfNotesTool
+  , fmSelfNoteTool
   ) where
 
 import Bot.Agent.Tool
@@ -957,6 +958,55 @@ fmSelfNotesTool =
 
 readFileUtf8 :: FilePath -> IO Text
 readFileUtf8 path = Text.pack <$> readFile path
+
+-- | FM 自己的工作记忆。
+--
+-- 为什么需要：它每次对话都是「刚醒来」。除了被回复的消息串（threads 表），
+-- 它不知道自己最近在琢磨什么、哪件事没做完。
+--
+-- 「工作记忆」和现有几种记忆不是一回事：
+--   · chat_memory / sender_memory  —— 关于**别人**的事实
+--   · 人格文件                      —— 它**是什么样**
+--   · growth.md / recurring.md     —— 它**过去经历 / 犯过什么**
+--   · 这个                          —— 它**现在手上有什么**
+--
+-- 刻意不放进 scratchpad_todos：那张表是用户面向的待办命令（!todo / !done），
+-- 按发送者分，是给群友记事用的，不是它自己的工作区。
+--
+-- 存放位置与 recurring.md 同级（memory/self/working.md），由人设引用，
+-- 所以每轮都注入上下文——不靠它自己想起来读。
+-- 写操作限定 superuser：这是它的自我认知，不该被别人改。
+fmSelfNoteTool :: IOE :> es => Tool (Eff es)
+fmSelfNoteTool =
+  withDescription "FM's own working note: what it is currently looking into, what is still unfinished, what to pick up next time. action=read shows it; action=set replaces it (owner only). Read it when a request seems to continue earlier work, or when unsure what you were doing. Set it after finishing or starting something that should carry across conversations. Keep it short -- a few lines. Do not put facts about other people here (use chat_memory or sender_memory), and do not put personality or style here (those live in the persona files)."
+    $ tool "fm_self_note"
+      ( requiredText "action" "read, or set (owner only)."
+      , optionalText "content" "For action=set: the new note, a few lines at most. Empty clears it."
+      )
+      \action contentArg -> do
+        context <- askToolContext
+        let wanted = Text.toCaseFold (Text.strip action)
+            path = "/data/memory/self/working.md"
+        case wanted of
+          "read" -> do
+            exists <- liftIO (Directory.doesFileExist path)
+            if not exists
+              then pure (toolText "还没有工作笔记。")
+              else do
+                body <- liftIO (readFileUtf8 path)
+                pure (toolText (if Text.null (Text.strip body) then "工作笔记是空的。" else body))
+          "set" ->
+            if not context.superuser
+              then pure (toolText "只有所有者能改工作笔记。")
+              else do
+                let capped = Text.take 1200 (Text.strip (fromMaybe "" contentArg))
+                liftIO (Directory.createDirectoryIfMissing True "/data/memory/self")
+                liftIO (writeFile path (Text.unpack capped))
+                pure . toolText $
+                  if Text.null capped
+                    then "工作笔记已清空。"
+                    else "工作笔记已更新（" <> Text.pack (show (Text.length capped)) <> " 字符）。"
+          _ -> pure (toolText "action 只能是 read 或 set。")
 
 hasExplicitLibraryIntent :: Context -> Bool
 hasExplicitLibraryIntent context =

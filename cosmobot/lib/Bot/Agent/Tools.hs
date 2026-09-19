@@ -181,6 +181,7 @@ defaultToolsWith extraTools = tools
       , fmAdminStatusTool
       , fmSelfReviewTool
       , fmSelfNotesTool
+      , fmSelfNoteTool
       , readMediaTextTool
       , mediaToFileTool
       , viewImageTool
