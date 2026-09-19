@@ -57,6 +57,7 @@ import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.HTTP as HTTP
 import Bot.Prelude
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.Text as Text
 import Network.HTTP.Req
@@ -312,7 +313,7 @@ standaloneLibraryMessage message =
 
 fmRecallQueryTool :: (HTTP.HTTP :> es, Chat.Chat :> es) => Tool (Eff es)
 fmRecallQueryTool =
-  withDescription "Query original QQ messages captured before recall. Use natural-language criteria; all users may query recall records."
+  withDescription "Query original QQ messages captured before recall. Use natural-language criteria; all users may query recall records. Returns the recalled messages' text, sender and time. If a recalled message carried images, the record says how many; the images themselves are not included and FM must not try to resend them."
     $ tool "fm_recall_query"
       ( optionalText "group_id" "Optional QQ group ID."
       , optionalText "query" "Optional text keyword."
@@ -327,16 +328,35 @@ fmRecallQueryTool =
                 <> port 8077
               )
           let records = responseBody response :: [Aeson.Value]
-              imageUrls = concatMap recallImageUrls records
-          when (not (null imageUrls)) $
-            void $ Chat.replyTo context.message
-              (Text.intercalate "\n" (map ReplyBody.imageDirective imageUrls))
-          pure . toolText . jsonText $ records
-
-recallImageUrls :: Aeson.Value -> [Text]
-recallImageUrls =
-  fromMaybe [] . AesonTypes.parseMaybe
-    (Aeson.withObject "FM recall record" (\o -> o Aeson..:? "image_urls" Aeson..!= []))
+          -- 这里原本有「把撤回消息里的图顺手再发一遍」的逻辑：
+          --
+          --     let imageUrls = concatMap recallImageUrls records
+          --     when (not (null imageUrls)) $ void $ Chat.replyTo context.message
+          --       (Text.intercalate "\n" (map ReplyBody.imageDirective imageUrls))
+          --
+          -- 已删除，两个原因：
+          --   1. 用户问「谁撤回了什么」时不会预期 FM 把撤回的图再贴一遍；
+          --      而且那是别人主动撤回的内容。工具说明里也从没提过会转发。
+          --   2. 更糟的是它把带 image_urls 的记录交给模型，模型会把里面的
+          --      media:mf_xxx 引用写进自己的回复体，再发一次。
+          --      实测 09-18 19:26 那两条空文本带图的群消息就是这么来的：
+          --      撤回记录里有那两张图，工具转发一次，模型又生成一次。
+          --
+          -- 现在改成：只给文字记录，图的数量用一句话交代，internal id 不外传。
+          let stripImages = map addImageNote
+          pure . toolText . jsonText $ Aeson.toJSON (stripImages records)
+  where
+    addImageNote record = case record of
+      Aeson.Object o ->
+        let n = case KeyMap.lookup "image_urls" o of
+                  Just (Aeson.Array arr) -> length arr
+                  _ -> 0
+            cleaned = KeyMap.delete "image_urls" o
+        in if n > 0
+             then Aeson.Object (KeyMap.insert "images" (Aeson.String
+                    (Text.pack (show n) <> " 张图片（未包含，不要尝试转发）")) cleaned)
+             else Aeson.Object cleaned
+      other -> other
 
 fmScoreQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmScoreQueryTool =
