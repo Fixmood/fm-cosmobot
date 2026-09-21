@@ -319,7 +319,7 @@ fmTakeoverManageTool =
               Just state -> do
                 announcementResults <- Chat.replyTo
                   (FMBridge.takeoverTargetMessage (FMBridge.takeoverSource state))
-                  "😻FM：这里已解除 Fix哥的接管。"
+                  "😻Fix走了"
                 liftIO (FMBridge.writeFMTakeoverState Nothing)
                 let announcement =
                       if any isRight announcementResults
@@ -340,7 +340,7 @@ fmTakeoverManageTool =
                     liftIO (FMBridge.writeFMTakeoverState (Just state))
                     announcementResults <- Chat.replyTo
                       (FMBridge.takeoverTargetMessage sourceTarget)
-                      "😻FM：这里已被 Fix哥接管。"
+                      "😻Fix来了"
                     let announcement =
                           if any isRight announcementResults
                             then "；已向目标发送接管提示。"

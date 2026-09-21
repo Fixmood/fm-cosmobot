@@ -260,6 +260,22 @@ CREATE TABLE IF NOT EXISTS single_sessions (
 );
 CREATE INDEX IF NOT EXISTS single_session_scope_idx
   ON single_sessions(platform, chat_id, status, updated_at DESC);
+
+-- 见过的所有人（含私聊）。自动登记，不区分平台。
+-- 时间用 Unix 秒：库里混着带不同偏移的时间字符串，是「时间对不上」的根源。
+CREATE TABLE IF NOT EXISTS known_senders (
+  platform       TEXT NOT NULL,
+  sender_id      TEXT NOT NULL,
+  display_name   TEXT NOT NULL DEFAULT '',
+  first_seen_at  REAL NOT NULL DEFAULT 0,
+  last_seen_at   REAL NOT NULL DEFAULT 0,
+  message_count  INTEGER NOT NULL DEFAULT 0,
+  first_group_id TEXT NOT NULL DEFAULT '',
+  last_group_id  TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (platform, sender_id)
+);
+CREATE INDEX IF NOT EXISTS known_sender_seen_idx
+  ON known_senders(last_seen_at DESC);
 """
 
 GROUP_CAPABILITIES = {
@@ -4572,6 +4588,84 @@ def render_public_competition_rank(result: dict, page=1, combined=False) -> byte
     return output.getvalue()
 
 
+# ── 自动登记新群 / 新好友 ────────────────────────────────────────────────
+#
+# 为什么需要：groups 表原本只有 set_group_capability() 和 import_snapshot()
+# 两条写入路径，都不是自动的 —— 机器人被拉进新群后表里没有它，
+# 中控「群与房间」看不到、也无法单独配置。
+#
+# 挂在这里（record_message_event）的理由：每条消息都过它，
+# 而且它已经拿到了 group_name 与 sender_name；群聊与私聊同一个入口。
+#
+# 时间一律用 Unix 秒（REAL）。字符串时间是「时间对不上」的根源之一：
+# 库里现在混着 UTC 的 '...+00:00'、北京的 '...+08:00'、
+# 以及不带时区的 'YYYY-MM-DD HH:MM:SS'，看格式分不出来。
+
+GROUP_REGISTER_FEATURES = {
+    # 照跟打群的配置给默认值。跟打相关的默认开，其余留给后台按需改。
+    "library": True,
+    "recall": True,
+    "scores": True,
+    "contest": True,
+    "ai_contest": True,
+    "score_archive": True,
+    "group_reply": "inherit",
+    "group_trigger_mode": "inherit",
+    "reply_style": "",
+    "active_hours": "",
+    "daily_archive": True,
+    "cross_group_visibility": "owner_private_only",
+    "private_context_access": False,
+}
+
+
+def ensure_group_registered(db, group_id: str, group_name: str) -> bool:
+    """群不存在就登记一条。返回 True 表示这次新建了。"""
+    group_id = str(group_id or "").strip()
+    if not group_id:
+        return False
+    row = db.execute("SELECT display_name FROM groups WHERE group_id=?", (group_id,)).fetchone()
+    if row:
+        if group_name and not (row["display_name"] or "").strip():
+            db.execute("UPDATE groups SET display_name=?, updated_at=? WHERE group_id=?",
+                       (group_name[:120], time.time(), group_id))
+        return False
+    db.execute(
+        "INSERT INTO groups VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(group_id) DO NOTHING",
+        (group_id, group_name[:120], "observed",
+         json.dumps(GROUP_REGISTER_FEATURES, ensure_ascii=False),
+         json.dumps({"registered_by": "auto", "first_seen": time.time()}, ensure_ascii=False),
+         time.time()),
+    )
+    return True
+
+
+def ensure_sender_known(db, platform: str, sender_id: str, sender_name: str,
+                        group_id: str = "") -> bool:
+    """人没见过就记一条。返回 True 表示这次新建了。"""
+    sender_id = str(sender_id or "").strip()
+    if not sender_id:
+        return False
+    now = time.time()
+    row = db.execute(
+        "SELECT display_name FROM known_senders WHERE platform=? AND sender_id=?",
+        (platform, sender_id)).fetchone()
+    if row:
+        db.execute(
+            "UPDATE known_senders SET message_count=message_count+1,"
+            " display_name=CASE WHEN ? <> '' THEN ? ELSE display_name END,"
+            " last_group_id=CASE WHEN ? <> '' THEN ? ELSE last_group_id END,"
+            " last_seen_at=? WHERE platform=? AND sender_id=?",
+            (sender_name, sender_name[:120], group_id, group_id, now, platform, sender_id))
+        return False
+    db.execute(
+        "INSERT INTO known_senders (platform, sender_id, display_name, first_seen_at,"
+        " last_seen_at, message_count, first_group_id, last_group_id)"
+        " VALUES (?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(platform, sender_id) DO NOTHING",
+        (platform, sender_id, sender_name[:120], now, now, group_id, group_id))
+    return True
+
+
 class Api(BaseHTTPRequestHandler):
     db_path = ""
 
@@ -5334,6 +5428,12 @@ class Api(BaseHTTPRequestHandler):
         raw_json = json.dumps(payload, ensure_ascii=False)
         db = connect(self.db_path)
         try:
+            # 自动登记：新群、新好友。以前这两件事都要手工补，
+            # 机器人被拉进新群后中控看不到它。
+            if ensure_group_registered(db, group_id, group_name):
+                print(f"[fm-domain][auto-register] 新群 {group_id} {group_name}", flush=True)
+            if ensure_sender_known(db, platform, sender_id, sender_name, group_id):
+                print(f"[fm-domain][auto-register] 新人 {sender_id} {sender_name}", flush=True)
             message_values = (platform, message_id, group_id, group_name, sender_id, sender_name, text, occurred_at, raw_json, json.dumps(image_urls, ensure_ascii=False))
             # P1-c: 主路径直接写 message_archive。
             # 以前先写 recent_messages 再由 worker 转存，等于同一份数据在磁盘上留两份
