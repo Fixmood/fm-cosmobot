@@ -24,7 +24,31 @@ main =
       , testCase "top exception is thrown into running tasks" testTopExceptionPropagates
       , testCase "cancel then await returns after task cleanup" testCancelThenAwait
       , testCase "awaitAny returns the first completion without cancelling others" testAwaitAny
+      , testCase "finished entries are pruned, so the registry cannot grow forever" testFinishedEntriesArePruned
       ]
+
+-- 回归：`runtimes` 以前只增不减（模块里一个 Map.delete 都没有），
+-- 而中控每刷新一次仪表盘就产生 4 条永久条目，进程一跑久了
+-- concurrency.list 的载荷会一直长（实测到过 2343 条 / 数百 KB）。
+-- 跑 2 倍上限的空任务，结束后池子必须被夹回上限以内。
+testFinishedEntriesArePruned :: Assertion
+testFinishedEntriesArePruned = do
+  result <- timeout 20_000_000 $ runManaged do
+    runConcurrencyManager do
+      mapM_
+        ( \_ -> do
+            worker <- Concurrency.fork "noop" (pure ())
+            Concurrency.await worker
+        )
+        [1 .. (maxFinishedEntries * 2 :: Int)]
+      snapshot <- Concurrency.list
+      pure (length snapshot.entries)
+  case result of
+    Nothing -> assertFailure "pruning test timed out"
+    Just kept ->
+      assertBool
+        ("finished entries were not pruned: kept " <> show kept <> ", cap " <> show maxFinishedEntries)
+        (kept <= maxFinishedEntries)
 
 testNormalExitCancelsAndAwaits :: Assertion
 testNormalExitCancelsAndAwaits = do

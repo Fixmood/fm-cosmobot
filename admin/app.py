@@ -787,9 +787,23 @@ def config_sync_status(snapshot_result: dict) -> dict:
 # ── P2: 把并发条目分成「常驻服务 / 底层噪声 / 真正的活」 ──────────────────
 # 机器人把 scheduler.worker、qq.connection 这类常驻服务也注册进并发表，
 # 它们永远不写 finishedAt，所以「未结束」不等于「在运行」。
+# ⚠️ 机器人常驻 worker 的标签分隔符**不统一**：多数是点号（media.gc / qq.connection），
+# 但 Bot/Resource.hs 里那个回收 worker 登记的是 "resource expiry" —— **空格**。
+# 这里以前写死 resource\.expiry，于是它永远落不进 services：它没有 finishedAt，
+# 启动满 5 分钟后就被算成「疑似卡住」，并且混进 running。
+# 后果是仪表盘长期红字「疑似卡住 1 · 超过 5 分钟未结束」，健康分 issues 里
+# 也多一条假的「有 1 个任务卡住超过 5 分钟」——错的数字看着精确，最危险。
+#
+# 常驻 worker 的完整名单（机器人源码里 withWorker 的字面量，共 5 处）：
+#   qq.connection        media.gc        scheduler.worker
+#   discord.gateway      resource expiry  ← 空格，就是上面那个
+# 加新常驻服务前，重新数一遍，别只改这一处：
+#   grep -rn 'withWorker' /opt/fm-cosmobot/source/cosmobot/lib/
+# 这里 resource 用 [.\s] 两种分隔符都认；discord 也一并放进来
+# （Discord 现在没配置、标签不会出现，但配了就同样是「永远不结束」的 worker）。
 SERVICE_LABEL = re.compile(
-    r"^(main\.|rpc|scheduler|message\.|qq|stream\.|media\.gc|resource\.expiry"
-    r"|db\.|http|metrics|health|watchdog)",
+    r"^(main\.|rpc|scheduler|message\.|qq|stream\.|media\.gc|resource[.\s]expiry"
+    r"|discord\.|db\.|http|metrics|health|watchdog)",
     re.IGNORECASE,
 )
 NOISE_LABEL = re.compile(

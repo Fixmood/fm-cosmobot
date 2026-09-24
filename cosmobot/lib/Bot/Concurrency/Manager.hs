@@ -6,6 +6,7 @@ Stability   : experimental
 
 module Bot.Concurrency.Manager
   ( runConcurrencyManager
+  , maxFinishedEntries
   )
 where
 
@@ -232,7 +233,35 @@ finishEntry managerState handleId status = do
                     , finishedAt = Just finishedAt
                     }
                 }
-    in (Map.adjust update handleId runtimes, ())
+    in (pruneFinished (Map.adjust update handleId runtimes), ())
+
+-- 已结束的条目最多留这么多，多出来的从最老的开始丢。
+--
+-- 为什么需要：`runtimes` 只增不减（这个模块里原本一个 Map.delete 都没有）。
+--   每条 `rpc.client.N.reader/writer` 都是**永久**条目，而中控每刷新一次仪表盘
+--   就要开两条 RPC 连接（config.snapshot + concurrency.list）= 4 条；
+--   每个 agent 回合还会 fork 一条 `agent.typing`，每条 shell 命令最多 3 条。
+--   实测（2026-09-25）：6 次 /api/observability/overview → +26 条；外推
+--   1000 次刷新 = +4333 条、concurrency.list 载荷 +672KB；同一进程历史上到过 2343 条。
+--   这是进程级只增不减，也解释了「仪表盘总览 567KB」那次性能问题的根因。
+--
+-- 只丢「已结束」的：Running 的一条都不能丢（cancel / await 还要按 handle 找它）。
+-- 丢掉已结束的条目在语义上安全，三条读路径都等价：
+--   awaitIn    找不到 → 立刻返回，等价于对一个已结束的 Async 调 waitCatch；
+--   awaitAnyIn 用 `Map.notMember` 判定「已结束」，被丢掉的条目同样 notMember → 结论一致；
+--   cancelIn   找不到 → 返回 False，等价于对已结束的条目返回 False。
+maxFinishedEntries :: Int
+maxFinishedEntries = 256
+
+-- Map 的键是单调自增的 Id，`Map.toAscList` 即「从最老到最新」，
+-- 所以 drop 掉开头 excess 条 = 丢最老的，留最新的一批。
+pruneFinished :: Map Id EntryRuntime -> Map Id EntryRuntime
+pruneFinished runtimes =
+  let (done, live) = Map.partition (\runtime -> finished runtime.info) runtimes
+      excess = Map.size done - maxFinishedEntries
+   in if excess <= 0
+        then runtimes
+        else live <> Map.fromDistinctAscList (drop excess (Map.toAscList done))
 
 cancelAndAwaitAll :: (IOE :> es, Prim :> es, Concurrent :> es) => ManagerState -> Eff es ()
 cancelAndAwaitAll managerState = do
