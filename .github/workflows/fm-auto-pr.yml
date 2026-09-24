@@ -25,9 +25,14 @@ jobs:
           fi
           TITLE="$(gh api "repos/$REPOSITORY/commits/$BRANCH" --jq '.commit.message' | head -n 1)"
           if [ -z "$TITLE" ]; then TITLE="FM changes from $BRANCH"; fi
+          # 2026-09-25: 这里以前写死 --base fm/main，但远端**没有** fm/main 这个分支
+          # （只有 main 和一堆 fm/pr-*），所以这个 job 每次都是 failure，PR 从来没开出来过。
+          # 改成问仓库自己的默认分支，换个分支名也不会再烂掉。
+          BASE="$(gh api "repos/$REPOSITORY" --jq '.default_branch')"
+          echo "base branch = $BASE"
           gh pr create \
             --repo "$REPOSITORY" \
-            --base fm/main \
+            --base "$BASE" \
             --head "$BRANCH" \
             --title "$TITLE" \
             --body "由 FM 提交。请在合并前完成代码审查和测试。"
