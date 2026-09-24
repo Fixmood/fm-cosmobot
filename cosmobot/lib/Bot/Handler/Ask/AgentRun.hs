@@ -48,6 +48,8 @@ import qualified Bot.Memory as MemoryStore
 import Bot.Prelude
 import Bot.Storage.Thread
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as TextEncoding
+import qualified Data.Text.Encoding.Error as TextEncodingError
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Builder as TextBuilder
 import qualified Data.Foldable as Foldable
@@ -57,6 +59,7 @@ import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import qualified Effectful.Prim.IORef as IORef
 import qualified Streaming.Prelude as S
 import Effectful.FileSystem
+import qualified Effectful.FileSystem.IO.ByteString as FileSystemByteString
 import Effectful.Process
 import Effectful.Timeout
 
@@ -272,7 +275,7 @@ agentContext toolCfg cfg message input systemPrompt =
     , toolConfig = toolCfg
     }
 
-askSystemPrompt :: (Memory.Memory :> es, Skills.Skills :> es) => AskHandlerConfig -> IncomingMessage -> Eff es Text
+askSystemPrompt :: (Memory.Memory :> es, Skills.Skills :> es, FileSystem :> es) => AskHandlerConfig -> IncomingMessage -> Eff es Text
 askSystemPrompt cfg message = do
   skillsPrompt <- Skills.skillsSystemPrompt
   senderMemory <- loadScopedMemory (MemoryStore.senderMemoryScope message)
@@ -280,14 +283,76 @@ askSystemPrompt cfg message = do
   privatePersona <- loadPrivatePersona message
   groupPersona <- loadGroupPersona message
   memberStyle <- loadMemberStyle message
+  selfMemory <- selfMemoryLayers
   pure . Text.intercalate "\n\n" $
     [ LLM.contextSystemPrompt cfg.systemPrompt skillsPrompt senderMemory chatMemory
     , fromMaybe "" privatePersona
     , fromMaybe "" groupPersona
     , fromMaybe "" memberStyle
+    , selfMemory
     , currentMessageSystemPrompt cfg message
     , privateAddressRule message
     ]
+
+-- ── 「手上」 + 「待办的时刻」：每轮注入 ────────────────────────────────────
+--
+-- 为什么需要（2026-09-25 实测）：人设里这两层分别写着
+-- 「`memory/self/working.md` 记着我手上有什么」和「每次对话开始看一眼 `notes/`」，
+-- 但 `askSystemPrompt` 以前**只注入人设文本，从来没读过这两个文件**
+-- （它读的是 `memory/qq/...` 下的私有人设/群人设/成员样式，不是 `memory/self/...`）。
+-- 于是那两句话等于指望模型自己想起来去调 `fm_self_notes` ——
+-- 而审计库里 8355 次真实工具调用中 `fm_self_notes` 被调用 **0 次**，
+-- 尽管它在 210 个 turn 里都暴露给了模型（同族的写入工具 `fm_self_note` 被调用了 17 次）。
+-- 结论：这两层此前是**空转**的 —— 写作「工作记忆」，读作「没人看」。
+--
+-- 这里换成机制上必然生效：组装 system prompt 时直接把文件读进来，不依赖模型自觉。
+-- 提醒只有两百来字符，每轮注入的成本可以忽略。
+--
+-- 为什么**不**把 growth.md / recurring.md / metrics.md 也塞进来：
+-- 那三层是「过去」，量比这大得多，而且只在真的要做类似的事时才需要看 ——
+-- 继续由 `fm_self_notes` 按需读更合适。这里只补上「现在」和「待办」。
+--
+-- 读不到就当没有：这条路径每个回合都要走，测试环境里这些路径本来也不存在，
+-- 不能因为某个记忆文件缺失就把整轮对话打断。（沿用 Bot.Memory.loadMemory 的写法：
+-- 先 doesFileExist 再读；解码用 lenient，这样半截写入/编码坏掉也只是内容变短，不会抛异常。）
+selfMemoryLayers :: FileSystem :> es => Eff es Text
+selfMemoryLayers = do
+  working <- loadLayerFile "/data/memory/self/working.md" id
+  due <- loadLayerFile "/data/memory/self/reminders.md" reminderEntries
+  pure . Text.intercalate "\n\n" $
+    [ title <> "\n" <> Text.strip body
+    | (title, body) <-
+        [ ("**手上（memory/self/working.md）**", working)
+        , ("**待办的时刻（到期提醒）**", due)
+        ]
+    , not (Text.null (Text.strip body))
+    ]
+
+loadLayerFile :: FileSystem :> es => FilePath -> (Text -> Text) -> Eff es Text
+loadLayerFile path shape = do
+  -- 注意：`Effectful.FileSystem` 在本文件里是**非限定**导入，
+  -- 所以要用裸 `doesFileExist`，写成 `FileSystem.doesFileExist` 会 Not in scope。
+  exists <- doesFileExist path
+  if exists
+    then shape . TextEncoding.decodeUtf8With TextEncodingError.lenientDecode <$> FileSystemByteString.readFile path
+    else pure ""
+
+-- 提醒文件开头是给人看的规则说明，机器要的是条目。
+-- **必须认 `## YYYY-MM-DD` 这种带日期的标题**：文件里的格式示例
+-- （```\n## YYYY-MM-DD · 一句话标题\n```）也以 `## ` 开头，
+-- 只按 `## ` 前缀找的话会把示例模板也塞进每一轮的 system prompt。
+-- 到期与否仍然由人设那一层判断（它拿得到 `now`），这里只负责把条目送进上下文。
+reminderEntries :: Text -> Text
+reminderEntries =
+  Text.unlines . dropWhile (not . isDatedHeading) . Text.lines
+  where
+    isDatedHeading line =
+      case Text.stripPrefix "## " line of
+        Nothing -> False
+        Just rest ->
+          let stamp = Text.takeWhile (/= ' ') rest
+           in Text.length stamp == 10
+                && Text.all (\c -> c == '-' || (c >= '0' && c <= '9')) stamp
 
 loadPrivatePersona :: Memory.Memory :> es => IncomingMessage -> Eff es (Maybe Text)
 loadPrivatePersona message
