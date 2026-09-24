@@ -289,26 +289,20 @@ classifyPolicy cfg threads msg = do
                 logInfo [i|FM reply lookup: source=sqlite_or_finished hit=True platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
                 pure (FinishedThread key transcript)
               Nothing -> do
-                -- 这里原本直接记 warning，但**那是误导**：实测 374 次查找里
-                -- 365 次（97.6%）走到这一支。
+                -- 这里原本记 warning（source=active_and_sqlite hit=False），
+                -- 但**那句话名不副实**：实测 374 次查找里 365 次（97.6%）走这支。
                 --
                 -- 原因是 lookupThreadTranscript 只查 ThreadStore（线程存储）。
                 -- 群里绝大多数回复是「回复一条 FM 从没参与过的普通消息」——
-                -- 那根本没有 thread，查不到是**常态**，不是异常。
+                -- 那种消息本来就没有 thread，查不到是**常态**，不是异常。
                 --
                 -- 而且原话不会丢：OtherReply 会走 startThreadFromReply，
                 -- 里面用 fetchReferencedMessage → Chat.getMessageContent
-                -- 直接向平台取那条消息，不依赖这个查询。
+                -- **直接向平台取那条消息**，不依赖这个查询。
                 --
-                -- 所以现在分两种情况：
-                --   消息在本地聊天记录里 → Info（没有线程，但有原话兜底）
-                --   两处都没有            → Warning（那才是真该看的）
-                onDisk <- ChatLog.lookupMessage msg key.messageId
-                case onDisk of
-                  Just _ ->
-                    logInfo [i|FM reply lookup: no_thread_but_message_present platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
-                  Nothing ->
-                    logWarning [i|FM reply lookup: source=active_sqlite_chat_log hit=False platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
+                -- 所以降级为 info 并改写：它只说明「这条回复没有对应的线程」，
+                -- 而那是正常情况。保留 warning 会让真问题淹没在假警告里。
+                logInfo [i|FM reply lookup: no_thread_for_this_reply platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
                 pure (OtherReply key.messageId)
   let triggered = case customTrigger of
         Nothing -> isAllowedPrivate msg || (isAllowedGroup msg && (msg.digest.mentionsBot || calledByName))
