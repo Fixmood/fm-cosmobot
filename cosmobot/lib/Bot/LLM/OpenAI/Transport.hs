@@ -215,7 +215,16 @@ askImageChatCompletionsOpenAIStreaming cfg@ImageProviderConfig{apiKey, model, re
       do
         lift $ logInfo ("LLM image chat streaming request: " <> llmRequestLogLine requestEndpoint request)
         lift $ logLLMRequestMessages request
-        answer <- streamChatCompletion False requestBaseUrl requestPath key (secondsToMicros requestTimeout) request
+        -- 总时限：这里以前只把 timeoutMicros 交给 HTTP 层，而那是连接/读超时，
+        -- **不是整个请求的截止时间** —— 对端挂着不回完就能无限期拖下去。
+        -- 音频那条路（askAudioOpenAIStreaming）一直有 runTimedEff 兜底，图片这条没有。
+        -- 后果实测于 2026-09-27：4 个 agent run 永远卡在 image_generate / image_edit 上
+        -- （最后事件停在 tool_call_started），run 不结束 → typing 的释放钩子永不执行 →
+        -- typing 在 Matrix 上连续亮了 2 天。
+        answer <-
+          lift $
+            runTimedEff "LLM image chat streaming request" requestTimeout $
+              S.effects (streamChatCompletion False requestBaseUrl requestPath key (secondsToMicros requestTimeout) request)
         lift $ logInfo ("LLM image chat streaming response: " <> llmStreamResponseLogLine requestEndpoint requestModel answer)
         let text = chatAnswerContent answer
         if Text.null (Text.strip text)
