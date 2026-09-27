@@ -901,11 +901,16 @@ class RetainedSnapshotImportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             db = connect(str(Path(root) / "fm.sqlite3"))
             try:
+                # 日期相对今天算，不要写死：这个 fixture 以前固定 2026-08-28，
+                # 而查询用 days=30（cutoff = 今天 - 29 天），于是 2026-09-26 那天
+                # 08-28 恰好是窗口第一天（CI 绿），到 09-27 就掉出窗口（CI 红）——
+                # 代码一个字节没动，CI 自己变红。改成相对日期后不再随日历腐烂。
+                legacy_day = (datetime.now(timezone.utc).date() - timedelta(days=10)).isoformat()
                 raw = {
                     "sender_id": "10001", "sender_name": "Fixmood",
                     "group_name": "虎码训练♂营", "speed": 123.4,
                     "accuracy": "96.5%", "keystrokes": 6.8,
-                    "received_at": "2026-08-28 12:00:00",
+                    "received_at": f"{legacy_day} 12:00:00",
                 }
                 db.execute(
                     "INSERT INTO score_records VALUES (?, ?, ?, ?, ?)",
@@ -915,7 +920,7 @@ class RetainedSnapshotImportTest(unittest.TestCase):
                 records = competition_score_history(db, name="Fixmood", source="虎杯", days=30)
                 self.assertEqual(len(records), 1)
                 self.assertEqual(records[0]["source_group"], "虎杯")
-                self.assertEqual(records[0]["competition_date"], "2026-08-28")
+                self.assertEqual(records[0]["competition_date"], legacy_day)
                 summary = competition_score_summary(db, name="Fixmood", source="虎杯")
                 self.assertEqual(summary["count"], 1)
                 self.assertEqual(summary["best_speed"], 123.4)
