@@ -41,6 +41,16 @@ humaDecodeTimeoutMicros = 10 * 1000000
 humaOwnerOnly :: Bool
 humaOwnerOnly = True
 
+-- | Send plain text, with no QQ quote attached.
+--
+-- The driver only builds a reply/quote payload when the target message carries
+-- an id -- 'Bot.Chat.Driver.QQ' picks between "textOnly" and "withReply" on
+-- @message.messageId@. That is also how @send_direct_message@ sends into a chat
+-- it has no message for. Dropping the id here therefore yields a bare message,
+-- which is what the owner asked for; nothing else about the routing changes.
+plainReply :: Chat.Chat :> es => IncomingMessage -> Text -> Eff es ()
+plainReply message = void . Chat.replyTo message{messageId = Nothing}
+
 -- | Answers "*fix <codes>" without waking the agent.
 --
 -- Why this exists: measured on run agent--hxbXEri1l1W8EFZPkLjZA, the agent path
@@ -48,9 +58,10 @@ humaOwnerOnly = True
 -- then the answer) and only 156ms was the decode. A code-table lookup is
 -- deterministic, so routing it here removes the model entirely.
 --
--- A second effect: this route replies through 'Chat.replyTo', so it never goes
--- through the Ask reply path that prepends the "😻 FM：" speaker prefix. The
--- answer is the sentence and nothing else, which is what the owner asked for.
+-- A second effect: this route answers through 'plainReply', so it never goes
+-- through the Ask reply path that prepends the "😻 FM：" speaker prefix, and it
+-- carries no QQ quote either. The answer is the sentence and nothing else,
+-- which is what the owner asked for.
 humaHandlers
   :: ( Chat.Chat :> es
      , Timeout :> es
@@ -75,7 +86,7 @@ humaFixRoute =
     (RouteHelp (humaFixPrefix <> " <虎码编码>") "把 *fix 后面的虎码编码解回句子（直接查码表，不经过模型）。")
     $ stopOn humaFixFilter \message codes ->
       if humaOwnerOnly && not message.digest.senderIsSuperuser
-        then void $ Chat.replyTo message "这条现在只对主人开放。"
+        then plainReply message "这条现在只对主人开放。"
         else runDecode message codes
 
 runDecode
@@ -90,24 +101,23 @@ runDecode
   -> Eff es ()
 runDecode message codes
   | Text.null codes =
-      void $ Chat.replyTo message ("用法：" <> humaFixPrefix <> " <虎码编码>")
+      plainReply message ("用法：" <> humaFixPrefix <> " <虎码编码>")
   | otherwise = do
       result <- Timeout.timeout humaDecodeTimeoutMicros $
         ProcessUtil.readProcessGroupWithExitCode "python3" [humaDecodeScript, Text.unpack codes]
       case result of
         Nothing ->
-          void $ Chat.replyTo message "解码超时了，稍后再试。"
+          plainReply message "解码超时了，稍后再试。"
         Just (exitCode, stdoutText, stderrText) ->
           let output = Text.strip stdoutText
               detail = Text.strip stderrText
            in case exitCode of
                 ExitSuccess
-                  | Text.null output -> void $ Chat.replyTo message "解码器没有输出。"
-                  | otherwise -> void $ Chat.replyTo message output
+                  | Text.null output -> plainReply message "解码器没有输出。"
+                  | otherwise -> plainReply message output
                 ExitFailure _ ->
-                  void $
-                    Chat.replyTo message $
-                      "解码失败：" <> if Text.null detail then "解码器返回了非零状态。" else detail
+                  plainReply message $
+                    "解码失败：" <> if Text.null detail then "解码器返回了非零状态。" else detail
 
 -- | Matches "*fix <codes>" and nothing else.
 --
