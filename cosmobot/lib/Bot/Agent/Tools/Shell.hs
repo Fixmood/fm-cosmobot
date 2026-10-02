@@ -159,7 +159,8 @@ forkCompletionReport access owner message commandId =
     -- report. Right Nothing: another watcher already claimed this command.
     case outcome of
       Right (Just status) -> do
-        void $ Chat.replyTo message (FMBridge.fmReplyBody (completionReportText commandId status))
+        when (FMBridge.backgroundChatterAllowed message) $
+          void $ Chat.replyTo message (FMBridge.fmReplyBody (completionReportText commandId status))
         void $ Resource.destroy access commandId
       _ -> pure ()
 

@@ -319,6 +319,7 @@ main =
       , testCase "load_skill loads only advertised skill instructions" testLoadSkillLoadsAdvertisedSkillInstructions
       , testCase "ask handler announces noisy tool calls without internal ids" testAskHandlerAnnouncesNoisyToolCallsWithoutInternalIds
       , testCase "ask handler announces each noisy tool type only once" testAskHandlerAnnouncesEachNoisyToolTypeOnlyOnce
+      , testCase "ask handler keeps progress lines out of groups" testAskHandlerKeepsProgressLinesOutOfGroups
       , testCase "ask handler hides streamed narration before tool calls" testAskHandlerHidesStreamedNarrationBeforeToolCalls
       , testCase "long final replies are replayed as Matrix edit chunks" testLongFinalRepliesUseMatrixEditChunks
       , testCase "short final replies remain a single chunk" testShortFinalRepliesRemainSingleChunk
@@ -3294,7 +3295,7 @@ testAskHandlerAnnouncesNoisyToolCallsWithoutInternalIds = do
   replies <- IORef.newIORef ([] :: [Text])
   _ <- runAgentWith answers (ChatMock (Just replies) (Just "45") Nothing) do
     threads <- newThreadStore
-    runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads askHandlerMessage
+    runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads askHandlerPrivateMessage
   sent <- IORef.readIORef replies
   case sent of
     progress : _ ->
@@ -3318,12 +3319,27 @@ testAskHandlerAnnouncesEachNoisyToolTypeOnlyOnce = do
       tools = [noisyProbe "noisy_a", noisyProbe "noisy_b"]
   _ <- runAgentWith answers (ChatMock (Just replies) (Just "45-dedup") Nothing) do
     threads <- newThreadStore
-    runAskHandlersWithToolsAndWait Agent.defaultToolConfig tools askHandlerConfig threads askHandlerMessage
+    runAskHandlersWithToolsAndWait Agent.defaultToolConfig tools askHandlerConfig threads askHandlerPrivateMessage
   IORef.readIORef replies >>= (@?=
     [ "😻 FM：正在调用 noisy_a 工具…"
     , "😻 FM：正在调用 noisy_b 工具…"
     , "😻 FM：done"
     ])
+
+-- | The owner's rule, 2026-09-30: background messages never go to a group.
+-- Progress lines are the loudest instance of that -- measured on the live bot,
+-- 61 of them in three days. The only thing a group may receive is the answer.
+testAskHandlerKeepsProgressLinesOutOfGroups :: IO ()
+testAskHandlerKeepsProgressLinesOutOfGroups = do
+  answers <- IORef.newIORef
+    [ chatAnswer "" [toolCall "call-1" "image_generate" (Aeson.object ["prompt" Aeson..= ("cat" :: Text)])]
+    , chatAnswer "done" []
+    ]
+  replies <- IORef.newIORef ([] :: [Text])
+  _ <- runAgentWith answers (ChatMock (Just replies) (Just "45-group") Nothing) do
+    threads <- newThreadStore
+    runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads askHandlerMessage
+  IORef.readIORef replies >>= (@?= ["😻 FM：done"])
 
 testAskHandlerHidesStreamedNarrationBeforeToolCalls :: IO ()
 testAskHandlerHidesStreamedNarrationBeforeToolCalls = do
@@ -5615,6 +5631,19 @@ askHandlerMessage =
     , files = []
     , text = "krkr 看下我的头像"
     , raw = Aeson.Null
+    }
+
+-- | The same fixture, as a QQ private chat.
+--
+-- Progress lines are still delivered in private: the owner's rule keeps
+-- background chatter out of *groups* only, and he asked for results in private.
+-- The announce-mechanism tests below use this so they exercise deduplication and
+-- id stripping rather than the group policy.
+askHandlerPrivateMessage :: IncomingMessage
+askHandlerPrivateMessage =
+  askHandlerMessage
+    { kind = ChatPrivate
+    , chatId = Just 295947730
     }
 
 jsonText :: Aeson.ToJSON a => a -> Text

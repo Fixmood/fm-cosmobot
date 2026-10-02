@@ -17,6 +17,7 @@ module Bot.Chat.Bridge.FM
   , fmReplyRelayBody
   , fmReplyRelayBodyForRequest
   , fmReplyRelayBodyForRequestWith
+  , backgroundChatterAllowed
   , registeredTriggerWords
   , fmMentionBody
   , requestedReplyOpening
@@ -626,6 +627,19 @@ fmMentionBody :: Text -> Text
 fmMentionBody body =
   let (_, unmarked) = stripBareReplyMarker body
   in stripReplyPrefix unmarked
+
+-- | Whether background chatter may be delivered visibly to this chat.
+--
+-- Background chatter means progress lines ("正在调用 X 工具…") and late command
+-- receipts ("刚才那条后台命令…跑完啦"). The owner's standing rule, 2026-09-30, is
+-- that these never go to a group: "探针结果、工具输出、run 状态、调试回执都不发群、
+-- 也不复述". It was written into FM's own memory and the lines kept arriving
+-- anyway -- a memory line cannot stop code from sending. So the rule lives here
+-- instead. Private chats still receive them: that is where the owner asked for
+-- results ("要出结果只走私聊给 Fix哥").
+backgroundChatterAllowed :: IncomingMessage -> Bool
+backgroundChatterAllowed message =
+  message.kind /= ChatGroup
 
 fmReplyBody :: Text -> Text
 fmReplyBody body =

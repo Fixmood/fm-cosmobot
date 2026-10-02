@@ -61,7 +61,7 @@ announceNoisyTool program call context =
           shouldAnnounce <-
             maybe (pure True) ToolRegistry.claimToolAnnouncement
               (find ((== call.name) . (.name)) program.runningTools)
-          when shouldAnnounce $
+          when (shouldAnnounce && FMBridge.backgroundChatterAllowed program.context.message) $
             void $ Chat.replyTo program.context.message (toolMessageText call context)
     _ ->
       pure ()
