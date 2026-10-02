@@ -738,7 +738,14 @@ testWebSocketServerAuthenticatesAndHandlesInitialize = do
             (forever do
               (clientSocket, _) <- liftIO (Socket.accept listenSocket)
               pending <- liftIO (WS.makePendingConnection clientSocket WS.defaultConnectionOptions)
-              ACPServer.acpServerApp cfg threads acpState pending)
+              -- 每个连接单独跑，跟生产一致。
+              --
+              -- 生产用的是 Warp（runSettings / websocketsOr），每个连接一个线程。
+              -- 这个测试手写的 accept 循环**一次只处理一个**：客户端连着开两个连接时，
+              -- 第二个的握手要等第一个处理完；第一个只要慢一拍，第二个就一路等到这里的
+              -- 10 秒超时。2026-10-02 批量跑时 acp-spec 偶发红灯就是这个 —— 单独跑 10/10 全过，
+              -- 批量跑才会撞上。所以修的是测试，不是生产。
+              void $ Async.async (ACPServer.acpServerApp cfg threads acpState pending))
             (liftIO (Socket.close listenSocket))
         client = do
           unauthorized <- try @WS.HandshakeException (liftIO (WS.runClient "127.0.0.1" port "/acp" \_ -> pure ()))
