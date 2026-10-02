@@ -15,6 +15,7 @@ module Bot.Handler.Ask.AgentRun
   , earlyFlushDue
   , earlyFlushMinChars
   , continuationReplyChunks
+  , reminderEntries
   )
 where
 
@@ -54,7 +55,18 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Builder as TextBuilder
 import qualified Data.Foldable as Foldable
 import qualified Data.Sequence as Seq
-import Data.Time (UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time
+  ( Day
+  , UTCTime
+  , addUTCTime
+  , diffDays
+  , diffUTCTime
+  , getCurrentTime
+  , getCurrentTimeZone
+  , localDay
+  , utcToLocalTime
+  )
+import Data.Time.Format (defaultTimeLocale, parseTimeM)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import qualified Effectful.Prim.IORef as IORef
 import qualified Streaming.Prelude as S
@@ -275,7 +287,7 @@ agentContext toolCfg cfg message input systemPrompt =
     , toolConfig = toolCfg
     }
 
-askSystemPrompt :: (Memory.Memory :> es, Skills.Skills :> es, FileSystem :> es) => AskHandlerConfig -> IncomingMessage -> Eff es Text
+askSystemPrompt :: (Memory.Memory :> es, Skills.Skills :> es, FileSystem :> es, IOE :> es) => AskHandlerConfig -> IncomingMessage -> Eff es Text
 askSystemPrompt cfg message = do
   skillsPrompt <- Skills.skillsSystemPrompt
   senderMemory <- loadScopedMemory (MemoryStore.senderMemoryScope message)
@@ -315,14 +327,29 @@ askSystemPrompt cfg message = do
 -- 读不到就当没有：这条路径每个回合都要走，测试环境里这些路径本来也不存在，
 -- 不能因为某个记忆文件缺失就把整轮对话打断。（沿用 Bot.Memory.loadMemory 的写法：
 -- 先 doesFileExist 再读；解码用 lenient，这样半截写入/编码坏掉也只是内容变短，不会抛异常。）
-selfMemoryLayers :: FileSystem :> es => Eff es Text
+selfMemoryLayers :: (FileSystem :> es, IOE :> es) => Eff es Text
 selfMemoryLayers = do
+  -- 日期必须是**算出来的**，不能指望模型知道今天几号。
+  --
+  -- 2026-10-02 的教训：提醒条目本来就已经注入（reminderEntries 认 `## YYYY-MM-DD`），
+  -- 但整个 system prompt 里没有任何「今天」，而人设要求模型判断
+  -- 「日期 <= 今天、距今不超过 3 天」。模型要做这个比较，却拿不到被比较的一方 ——
+  -- 只能去调 now 工具，而它经常不调：10-01 那次自检里一次都没调，
+  -- 然后凭上下文写了个「系统时钟 2026-09-28」，比真实日期早三天。
+  -- 结果是一条 09-29 的到期提醒放了三轮都没被提。
+  --
+  -- 所以这里把两件事都做掉：告诉它今天几号，并且**把「到期几天」直接标在条目上**，
+  -- 让它连减法都不用做。判断「这条是不是已经提过」仍然看 working.md（它会一起注入）。
+  now <- liftIO getCurrentTime
+  zone <- liftIO getCurrentTimeZone
+  let today = localDay (utcToLocalTime zone now)
   working <- loadLayerFile "/data/memory/self/working.md" id
-  due <- loadLayerFile "/data/memory/self/reminders.md" reminderEntries
+  due <- loadLayerFile "/data/memory/self/reminders.md" (reminderEntries today)
   pure . Text.intercalate "\n\n" $
     [ title <> "\n" <> Text.strip body
     | (title, body) <-
-        [ ("**手上（memory/self/working.md）**", working)
+        [ ("**日期**", "今天是 " <> Text.pack (show today) <> "（北京时间）。")
+        , ("**手上（memory/self/working.md）**", working)
         , ("**待办的时刻（到期提醒）**", due)
         ]
     , not (Text.null (Text.strip body))
@@ -342,17 +369,32 @@ loadLayerFile path shape = do
 -- （```\n## YYYY-MM-DD · 一句话标题\n```）也以 `## ` 开头，
 -- 只按 `## ` 前缀找的话会把示例模板也塞进每一轮的 system prompt。
 -- 到期与否仍然由人设那一层判断（它拿得到 `now`），这里只负责把条目送进上下文。
-reminderEntries :: Text -> Text
-reminderEntries =
-  Text.unlines . dropWhile (not . isDatedHeading) . Text.lines
+reminderEntries :: Day -> Text -> Text
+reminderEntries today =
+  Text.unlines . map annotate . dropWhile (not . isDatedHeading) . Text.lines
   where
-    isDatedHeading line =
-      case Text.stripPrefix "## " line of
-        Nothing -> False
-        Just rest ->
-          let stamp = Text.takeWhile (/= ' ') rest
-           in Text.length stamp == 10
-                && Text.all (\c -> c == '-' || (c >= '0' && c <= '9')) stamp
+    -- 「距今几天」由代码算，模型只读结论。它拿不到可靠的今天，
+    -- 让它自己减日期就是上次那条提醒放了三轮没人提的原因。
+    annotate line =
+      case datedStamp line >>= parseDay of
+        -- 注意参数顺序：实测（见 agent-spec 的 "reminder entries carry a computed due delta"）
+        -- 这个环境里 `diffDays a b` 得的是 `a - b`，所以「今天 - 条目日期」才是
+        -- 过期为正。反过来写会把过期项标成「还有 N 天」—— 比不标更糟。
+        Just day -> line <> "　← " <> dueLabel (diffDays today day)
+        Nothing -> line
+    dueLabel days
+      | days > 0 = [i|已到期 #{days} 天|]
+      | days == 0 = "今天到期"
+      | otherwise = [i|还有 #{negate days} 天|]
+    isDatedHeading = isJust . datedStamp
+    datedStamp line = do
+      rest <- Text.stripPrefix "## " line
+      let stamp = Text.takeWhile (/= ' ') rest
+      if Text.length stamp == 10
+        && Text.all (\c -> c == '-' || (c >= '0' && c <= '9')) stamp
+        then Just stamp
+        else Nothing
+    parseDay = parseTimeM True defaultTimeLocale "%Y-%m-%d" . Text.unpack
 
 loadPrivatePersona :: Memory.Memory :> es => IncomingMessage -> Eff es (Maybe Text)
 loadPrivatePersona message

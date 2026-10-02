@@ -320,6 +320,7 @@ main =
       , testCase "ask handler announces noisy tool calls without internal ids" testAskHandlerAnnouncesNoisyToolCallsWithoutInternalIds
       , testCase "ask handler announces each noisy tool type only once" testAskHandlerAnnouncesEachNoisyToolTypeOnlyOnce
       , testCase "ask handler keeps progress lines out of groups" testAskHandlerKeepsProgressLinesOutOfGroups
+      , testCase "reminder entries carry a computed due delta" testReminderEntriesAnnotateDueDates
       , testCase "ask handler hides streamed narration before tool calls" testAskHandlerHidesStreamedNarrationBeforeToolCalls
       , testCase "long final replies are replayed as Matrix edit chunks" testLongFinalRepliesUseMatrixEditChunks
       , testCase "short final replies remain a single chunk" testShortFinalRepliesRemainSingleChunk
@@ -3329,6 +3330,45 @@ testAskHandlerAnnouncesEachNoisyToolTypeOnlyOnce = do
 -- | The owner's rule, 2026-09-30: background messages never go to a group.
 -- Progress lines are the loudest instance of that -- measured on the live bot,
 -- 61 of them in three days. The only thing a group may receive is the answer.
+-- | The reminder layer must not leave date arithmetic to the model.
+--
+-- Measured failure, 2026-10-02: the entries were being injected all along, but
+-- nothing in the system prompt said what day it was, so a reminder dated
+-- 2026-09-29 sat unmentioned for three days while FM guessed the date from
+-- context (its self-check that day reported the system clock as 2026-09-28).
+-- The fix is to compute the delta here and print it on the line.
+testReminderEntriesAnnotateDueDates :: IO ()
+testReminderEntriesAnnotateDueDates = do
+  let today = fromGregorian 2026 10 2
+      raw =
+        Text.unlines
+          [ "# 到期提醒"
+          , ""
+          , "> 这是给人看的规则说明，不该进上下文"
+          , ""
+          , "```"
+          , "## YYYY-MM-DD · 一句话标题"
+          , "```"
+          , ""
+          , "---"
+          , ""
+          , "## 2026-09-29 · 检查 emoji 新规有没有落地"
+          , "要做的事"
+          , ""
+          , "## 2026-09-26 · 检查智能体改造的效果"
+          , "另一件要做的事"
+          , ""
+          , "## 2026-10-05 · 将来的事"
+          , "还没到期"
+          ]
+      out = AgentRun.reminderEntries today raw
+  assertBool "格式示例模板不该被注入" (not ("YYYY-MM-DD" `Text.isInfixOf` out))
+  assertBool "开头的说明文字不该被注入" (not ("规则说明" `Text.isInfixOf` out))
+  assertBool "09-29 应标成已到期 3 天" ("已到期 3 天" `Text.isInfixOf` out)
+  assertBool "09-26 应标成已到期 6 天" ("已到期 6 天" `Text.isInfixOf` out)
+  assertBool "10-05 应标成还有 3 天" ("还有 3 天" `Text.isInfixOf` out)
+  assertBool "条目正文要保留" ("要做的事" `Text.isInfixOf` out)
+
 testAskHandlerKeepsProgressLinesOutOfGroups :: IO ()
 testAskHandlerKeepsProgressLinesOutOfGroups = do
   answers <- IORef.newIORef
