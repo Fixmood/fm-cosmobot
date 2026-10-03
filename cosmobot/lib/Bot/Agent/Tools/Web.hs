@@ -31,62 +31,76 @@ import Network.HTTP.Req
 import System.IO.Error (userError)
 import qualified Text.URI as URI
 
-webSearchTool :: (HTTP.HTTP :> es, Chat.Chat :> es) => Tool (Eff es)
+-- | 一次运行里最多搜几次。和 fetch_url 的预算同一个道理：**撞到上限要能收尾**。
+--
+-- 2026-10-03 实测：最坏一次运行 24 次搜索/抓取里 **15 次是 search_web，而它当时完全没有上限**；
+-- 加上 fetch_url 被拒后模型仍继续调，一起烧了 90 秒，最后还是没找到。
+webSearchRunBudget :: Int
+webSearchRunBudget = 6
+
+webSearchTool :: (HTTP.HTTP :> es, Chat.Chat :> es, IOE :> es) => Tool (Eff es)
 webSearchTool =
   noisy
   . allowWhen (.toolConfig.webSearchEnable)
   . withDescription "Search the web for current information. Returns title, url, and snippet results plus image_urls when the provider finds usable image URLs. For an explicit image-search request, set include_images=true; this tool will immediately send the first returned image as an actual chat image."
-  $ tool "search_web"
+  $ toolWithRunState "search_web"
       ( requiredText "query" "Search query."
       , optionalInteger "max_results" "Maximum number of results to return. Defaults to 5 and is capped at 20."
       , optionalBoolean "include_images" "Whether to request image URLs from the search provider. Defaults to true; use true for photo or image requests."
       )
-      \rawQuery requestedMaxResults requestedImages -> do
-        context <- askToolContext
-        case webArguments "query" rawQuery "max_results" 20
-          (fromMaybe 5 context.toolConfig.webSearchMaxResults)
-          requestedMaxResults of
-          Left err ->
-            pure (argumentFailure err)
-          Right (query, maxResults) -> do
-            let searchConfig = context.toolConfig
-            (results, imageUrls) <- webSearch searchConfig query maxResults (fromMaybe True requestedImages)
-            if explicitImageSearchRequest context.input.text
-              then case imageUrls of
-                imageRef : _ -> do
-                  let body = FMBridge.fmReplyRelayBodyForRequest context.input.text (ReplyBody.imageDirective imageRef)
-                  sent <- Chat.replyTo context.message body
-                  case rights sent of
-                    _ : _ ->
+      (\context -> newUseLimiter (Just webSearchRunBudget))
+      \checkUseLimit rawQuery requestedMaxResults requestedImages -> do
+        -- 预算用尽时**必须告诉它下一步做什么**：只说 "limit reached" 是状态播报，
+        -- 实测模型会无视它继续调，光垒一道墙没有用。
+        raise checkUseLimit >>= \case
+          UseLimitReached currentUses ->
+            pure (toolText [i|search_web budget for this run is used up (#{currentUses} calls). Do not call search_web again: answer from what you already have, and if that is not enough, say plainly that you could not find it.|])
+          UseAllowed -> do
+            context <- askToolContext
+            case webArguments "query" rawQuery "max_results" 20
+              (fromMaybe 5 context.toolConfig.webSearchMaxResults)
+              requestedMaxResults of
+              Left err ->
+                pure (argumentFailure err)
+              Right (query, maxResults) -> do
+                let searchConfig = context.toolConfig
+                (results, imageUrls) <- webSearch searchConfig query maxResults (fromMaybe True requestedImages)
+                if explicitImageSearchRequest context.input.text
+                  then case imageUrls of
+                    imageRef : _ -> do
+                      let body = FMBridge.fmReplyRelayBodyForRequest context.input.text (ReplyBody.imageDirective imageRef)
+                      sent <- Chat.replyTo context.message body
+                      case rights sent of
+                        _ : _ ->
+                          pure (toolText (jsonText (Aeson.object
+                            [ "query" Aeson..= query
+                            , "source" Aeson..= webSearchSource searchConfig.webSearchApi
+                            , "result_count" Aeson..= length results
+                            , "image_sent" Aeson..= True
+                            , "instruction" Aeson..= ("The image was sent as an actual chat image. Do not repeat its URL." :: Text)
+                            ])))
+                        [] ->
+                          let err = Text.intercalate "\n" (lefts sent)
+                          in pure (toolFailure Failure
+                            { category = ExternalServiceUnavailable
+                            , userMessage = "搜索到了图片，但作为图片消息发送失败。"
+                            , detail = err
+                            })
+                    [] ->
                       pure (toolText (jsonText (Aeson.object
                         [ "query" Aeson..= query
                         , "source" Aeson..= webSearchSource searchConfig.webSearchApi
                         , "result_count" Aeson..= length results
-                        , "image_sent" Aeson..= True
-                        , "instruction" Aeson..= ("The image was sent as an actual chat image. Do not repeat its URL." :: Text)
+                        , "image_sent" Aeson..= False
+                        , "instruction" Aeson..= ("No usable image URL was returned. Tell the user the image could not be sent; do not paste ordinary page links." :: Text)
                         ])))
-                    [] ->
-                      let err = Text.intercalate "\n" (lefts sent)
-                      in pure (toolFailure Failure
-                        { category = ExternalServiceUnavailable
-                        , userMessage = "搜索到了图片，但作为图片消息发送失败。"
-                        , detail = err
-                        })
-                [] ->
-                  pure (toolText (jsonText (Aeson.object
-                    [ "query" Aeson..= query
-                    , "source" Aeson..= webSearchSource searchConfig.webSearchApi
-                    , "result_count" Aeson..= length results
-                    , "image_sent" Aeson..= False
-                    , "instruction" Aeson..= ("No usable image URL was returned. Tell the user the image could not be sent; do not paste ordinary page links." :: Text)
-                    ])))
-              else
-                pure (toolText (jsonText (Aeson.object
-                  [ "query" Aeson..= query
-                  , "source" Aeson..= webSearchSource searchConfig.webSearchApi
-                  , "results" Aeson..= results
-                  , "image_urls" Aeson..= imageUrls
-                  ])))
+                  else
+                    pure (toolText (jsonText (Aeson.object
+                      [ "query" Aeson..= query
+                      , "source" Aeson..= webSearchSource searchConfig.webSearchApi
+                      , "results" Aeson..= results
+                      , "image_urls" Aeson..= imageUrls
+                      ])))
 
 explicitImageSearchRequest :: Text -> Bool
 explicitImageSearchRequest raw =
