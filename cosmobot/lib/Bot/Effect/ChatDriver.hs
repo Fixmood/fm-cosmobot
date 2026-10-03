@@ -28,6 +28,7 @@ module Bot.Effect.ChatDriver
   , normalizeMediaRef
   , mentionUser
   , setMemberTitle
+  , pokeUser
   , setTyping
   , rememberRosterTriggers
   , incomingMessages
@@ -122,6 +123,10 @@ data ChatDriver :: Effect where
     -> Text
     -> Text
     -> ChatDriver m Bool
+  PokeUser
+    :: IncomingMessage
+    -> Text
+    -> ChatDriver m (Either Text ())
   SetTyping
     :: IncomingMessage
     -> Int
@@ -224,6 +229,11 @@ setMemberTitle :: ChatDriver :> es => IncomingMessage -> Text -> Text -> Eff es 
 setMemberTitle message userId title =
   send (SetMemberTitle message userId title)
 
+-- | 戳一下某个用户（QQ 的「戳一戳」）。平台不支持时返回 Left。
+pokeUser :: ChatDriver :> es => IncomingMessage -> Text -> Eff es (Either Text ())
+pokeUser message userId =
+  send (PokeUser message userId)
+
 setTyping :: ChatDriver :> es => IncomingMessage -> Int -> Eff es ()
 setTyping message timeout =
   send (SetTyping message timeout)
@@ -288,6 +298,8 @@ chatDriverEffectHandler driver _ = \case
     Driver.mentionUser driver message userId body
   SetMemberTitle message userId title ->
     Driver.setMemberTitle driver message userId title
+  PokeUser message userId ->
+    Driver.pokeUser driver message userId
   SetTyping message timeout ->
     Driver.setTyping driver message timeout
   RememberRosterTriggers message triggers ->

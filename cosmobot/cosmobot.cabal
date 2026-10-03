@@ -281,6 +281,7 @@ library
         Bot.Handler.Audit
         Bot.Handler.Help
         Bot.Handler.Huma
+        Bot.Handler.Poke
         Bot.Handler.FM
         Bot.Handler.Media
         Bot.Handler.Resource

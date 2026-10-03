@@ -152,6 +152,11 @@ instance ChatDriver driver => ChatDriver (NormalizingChatDriver driver) where
       normalizedBody <- normalizeOutgoingReplyBody driver body
       mentionUser driver message userId normalizedBody
 
+  pokeUser (NormalizingChatDriver driver) message userId =
+    -- 直接透传：withChatDriverEither 是给「带正文的回复」做归一化用的，
+    -- 戳一戳没有正文，套上去只会把返回类型从 Either Text () 拽成 Either Text MessageId。
+    pokeUser driver message userId
+
   setMemberTitle (NormalizingChatDriver driver) message userId title =
     fromMaybe False <$> withChatDriverMaybe message "set member title" do
       Just <$> setMemberTitle driver message userId title
@@ -387,6 +392,10 @@ instance ChatDriver ChatDrivers where
           mentionUser driver message userId (FMBridge.fmMentionBody body)
         recordRecentQQDeliveries drivers message body (maybeToList (rightToMaybe result))
         pure result
+
+  pokeUser drivers message userId =
+    withMessageDriver drivers message \driver ->
+      pokeUser driver message userId
 
   setMemberTitle drivers message userId title =
     withMessageDriver drivers message \driver ->

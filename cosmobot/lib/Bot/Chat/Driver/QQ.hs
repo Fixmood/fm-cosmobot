@@ -149,6 +149,51 @@ instance Driver.ChatDriver QQDriver where
   setMemberTitle =
     setGroupMemberTitleQQ
 
+  pokeUser =
+    pokeUserQQ
+
+pokeUserQQ
+  :: (IOE :> es, KatipE :> es, Timeout :> es, Concurrent :> es)
+  => QQDriver
+  -> IncomingMessage
+  -> Text
+  -> Eff es (Either Text ())
+pokeUserQQ driver message userId =
+  case (message.kind, message.chatId) of
+    (ChatGroup, Just groupId)
+      | Just numericUserId <- parseIntegerUserId userId -> do
+          response <- sendAction driver (Aeson.object
+            [ "action" Aeson..= Aeson.String "send_poke"
+            , "params" Aeson..= Aeson.object
+                [ "user_id" Aeson..= numericUserId
+                , "group_id" Aeson..= groupId
+                ]
+            ])
+          pokeActionResult "send_poke" response
+    (ChatPrivate, _)
+      | Just numericUserId <- parseIntegerUserId userId -> do
+          response <- sendAction driver (Aeson.object
+            [ "action" Aeson..= Aeson.String "send_poke"
+            , "params" Aeson..= Aeson.object
+                [ "user_id" Aeson..= numericUserId
+                ]
+            ])
+          pokeActionResult "send_poke" response
+    _ ->
+      pure (Left "只支持在 QQ 群聊或私聊里戳人。")
+
+-- | send_poke 的返回**没有 message_id**（data 是 null），所以不能套
+-- responseMessageId 那套 —— 只能看 retcode。0 才算成功；失败时把平台给的
+-- message 原样带出去，不要自己编一句「戳失败」（那会掩盖真实原因）。
+pokeActionResult :: (KatipE :> es) => Text -> ActionResponse -> Eff es (Either Text ())
+pokeActionResult actionName response
+  | response.retcode == Just 0 = pure (Right ())
+  | otherwise = do
+      -- 先算成 Text 再插值：直接在 quasiquote 里 show，结果类型会歧义（GHC-39999）。
+      let retcodeText = maybe "-" (Text.pack . show) (response.retcode :: Maybe Integer)
+      logWarning [i|QQ #{actionName} failed: retcode=#{retcodeText} data=#{qqResponseSummary response.data_}|]
+      pure (Left (fromMaybe "戳一戳失败。" response.message))
+
 qqStreamingMessageLimit :: Int
 qqStreamingMessageLimit = 4000
 

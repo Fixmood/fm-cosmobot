@@ -105,6 +105,11 @@ class ChatDriver driver where
     sendReplyMessage driver message body
 
   setMemberTitle :: ChatDriverEffects driver es => driver -> IncomingMessage -> Text -> Text -> Eff es Bool
+
+  -- | 戳一下某个用户（QQ 的「戳一戳」）。没有这个概念的平台保持默认实现。
+  pokeUser :: ChatDriverEffects driver es => driver -> IncomingMessage -> Text -> Eff es (Either Text ())
+  pokeUser _ _ _ =
+    pure (Left "这个平台不支持戳一戳。")
   setMemberTitle _ _ _ _ =
     pure False
 
