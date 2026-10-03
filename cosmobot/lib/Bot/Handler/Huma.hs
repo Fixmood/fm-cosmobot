@@ -106,8 +106,15 @@ humaUpdateTimeoutMicros :: Int
 humaUpdateTimeoutMicros = 120 * 1000000
 
 -- | 最近上传的有效期。QQ 里文件和文字是两条消息，所以指令到达时靠这个找文件。
+--
+-- 所有者 2026-10-03 定的：**3 分钟**（原来 10 分钟太长 —— 真实操作就是「传完马上说」，
+-- 窗口开太大反而容易捡到不该用的旧文件）。分钟数是唯一的真值来源，
+-- 提示语从这里推出来，免得两处写死之后不一致。
+humaUploadFreshMinutes :: Int
+humaUploadFreshMinutes = 3
+
 humaUploadFreshSeconds :: Double
-humaUploadFreshSeconds = 600
+humaUploadFreshSeconds = fromIntegral humaUploadFreshMinutes * 60
 
 -- | 主人发来带附件的消息时，把下载地址记下来。
 --
@@ -177,7 +184,7 @@ humaUpdateTableRoute =
                           <> (if Text.null out then "" else out <> "\n")
                           <> (if Text.null err then "" else err)
 
--- | 优先用本条消息自带的附件；否则用 10 分钟内、同聊天、同发送者记下的那一个。
+-- | 优先用本条消息自带的附件；否则用 humaUploadFreshMinutes 分钟内、同聊天、同发送者记下的那一个。
 resolveUpload
   :: (FileSystem :> es, IOE :> es, Media.Media :> es)
   => IncomingMessage
@@ -196,10 +203,10 @@ resolveUpload message inlineRef = do
           | senderId /= message.senderId ->
               Left "最近上传的文件不是你发的。"
           | realToFrac (utcTimeToPOSIXSeconds now) - at > humaUploadFreshSeconds ->
-              Left "最近上传的文件超过 10 分钟了，重新发一次再试。"
+              Left [i|最近上传的文件超过 #{humaUploadFreshMinutes} 分钟了，重新发一次再试。|]
           | otherwise -> Right ref
         Nothing ->
-          Left "没找到码表文件。先在群里传一个 txt，然后 10 分钟内发「更新码表」。"
+          Left [i|没找到码表文件。先在群里传一个 txt，然后 #{humaUploadFreshMinutes} 分钟内发「更新码表」。|]
   either (pure . Left) resolveRef candidate
 
 -- | 把 ref 变成脚本读得懂的东西：要么是 http(s) 链接，要么是本地路径。
