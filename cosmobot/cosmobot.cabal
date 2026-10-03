@@ -282,6 +282,7 @@ library
         Bot.Handler.Help
         Bot.Handler.Huma
         Bot.Handler.Poke
+        Bot.Handler.Status
         Bot.Handler.FM
         Bot.Handler.Media
         Bot.Handler.Resource

@@ -60,6 +60,7 @@ import Bot.Handler.Audit
 import Bot.Handler.Help
 import Bot.Handler.Huma
 import Bot.Handler.Poke
+import Bot.Handler.Status
 import Bot.Handler.FM
 import Bot.Handler.Media
 import Bot.Handler.Resource
@@ -171,6 +172,7 @@ routes cfg threads =
         <> scratchpadHandlers
         <> humaHandlers
         <> pokeHandlers
+        <> statusHandlers
         <> typingHandlers
         <> safebooruHandlers
         <> saucenaoHandlers cfg.saucenao
