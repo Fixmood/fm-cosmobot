@@ -14,6 +14,7 @@ import Bot.Core.Message
 import Bot.Core.Route
 import Bot.Prelude
 import qualified Bot.Effect.Chat as Chat
+import qualified Bot.Effect.Media as Media
 import qualified Bot.Util.Process as ProcessUtil
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as AesonTypes
@@ -73,6 +74,7 @@ plainReply message = void . Chat.replyTo message{messageId = Nothing}
 humaHandlers
   :: ( Chat.Chat :> es
      , FileSystem :> es
+     , Media.Media :> es
      , Timeout :> es
      , Concurrent :> es
      , IOE :> es
@@ -142,6 +144,7 @@ rememberUpload message = do
 humaUpdateTableRoute
   :: ( Chat.Chat :> es
      , FileSystem :> es
+     , Media.Media :> es
      , Timeout :> es
      , Concurrent :> es
      , IOE :> es
@@ -176,12 +179,12 @@ humaUpdateTableRoute =
 
 -- | 优先用本条消息自带的附件；否则用 10 分钟内、同聊天、同发送者记下的那一个。
 resolveUpload
-  :: (FileSystem :> es, IOE :> es)
+  :: (FileSystem :> es, IOE :> es, Media.Media :> es)
   => IncomingMessage
   -> Maybe Text
   -> Eff es (Either Text Text)
-resolveUpload message inlineRef =
-  case inlineRef <|> fmap (.ref) (listToMaybe message.files) of
+resolveUpload message inlineRef = do
+  candidate <- case inlineRef <|> fmap (.ref) (listToMaybe message.files) of
     Just ref -> pure (Right ref)
     Nothing -> do
       remembered <- readLastUpload
@@ -197,6 +200,24 @@ resolveUpload message inlineRef =
           | otherwise -> Right ref
         Nothing ->
           Left "没找到码表文件。先在群里传一个 txt，然后 10 分钟内发「更新码表」。"
+  either (pure . Left) resolveRef candidate
+
+-- | 把 ref 变成脚本读得懂的东西：要么是 http(s) 链接，要么是本地路径。
+--
+-- 入站文件会被导进媒体库，所以 ref 往往**不是**那个 https 下载链接，而是
+-- `media:mf_xxx`。第一版没处理这一步，直接把媒体 id 当路径传给了脚本，
+-- 结果 FileNotFoundError（2026-10-03 实机就是这么挂的）。
+-- 好在那次失败是干净的：脚本没读到文件，现有码表一个字都没动。
+resolveRef :: Media.Media :> es => Text -> Eff es (Either Text Text)
+resolveRef ref
+  | "media:" `Text.isPrefixOf` Text.strip ref = do
+      info <- Media.mediaFileInfoByRef ref
+      pure $ case info of
+        Just i
+          | i.exists -> Right (Text.pack i.path)
+          | otherwise -> Left "媒体库里那个文件已经不在了（可能被回收），重新传一次。"
+        Nothing -> Left "媒体库里找不到那个文件，重新传一次。"
+  | otherwise = pure (Right ref)
 
 readLastUpload :: (FileSystem :> es, IOE :> es) => Eff es (Maybe (Double, Maybe Integer, Maybe Text, Text))
 readLastUpload = do
