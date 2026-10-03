@@ -755,7 +755,7 @@ aiContestGenerationSystemPrompt now request
       , "- Random brief for this request: theme = " <> theme <> "; form = " <> form <> "; difficulty = " <> difficulty <> "."
       , "- Write 200-350 Chinese characters, including a short attractive title matching the form and theme."
       , "- For difficulty 难 or 虐, prefer uncommon characters, dense vocabulary, long words, and more complex sentence structures while remaining coherent and typeable."
-      , "- Difficulty 普 is intentionally occasional; never choose 淼, 水, or 易 unless the user explicitly requests one of them."
+      , "- Difficulty is 虐 by default; never choose 普, 淼, 水, or 易 unless the user explicitly requests one of them."
       , "- If the user explicitly specifies a theme, form, title style, or difficulty, follow that user request instead of the random brief."
       , "- Pass the selected title, body, and difficulty to fm_ai_contest_publish. Do not narrate this brief to the user."
       ]
@@ -763,7 +763,11 @@ aiContestGenerationSystemPrompt now request
     seed = floor (utcTimeToPOSIXSeconds now * 1000000) + fromIntegral (Text.length request * 31)
     theme = pick seed aiContestThemes
     form = pick (seed `div` 7 + 3) aiContestForms
-    difficulty = if seed `mod` 10 == 0 then "普" else if even seed then "难" else "虐"
+    -- 所有者 2026-10-03 定的：**一律「虐」**。
+    -- 原来是 seed 伪随机（10% 普 / 45% 难 / 45% 虐），但所有者实测「难」太简单、没有挑战性，
+    -- 「虐」才是要的手感。显式点名难度时不走这里 —— 下面那行 "If the user explicitly specifies
+    -- ... difficulty, follow that user request instead" 仍然有效。
+    difficulty = "虐"
 
 isAiContestGenerationRequest :: Text -> Bool
 isAiContestGenerationRequest raw =
