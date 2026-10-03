@@ -116,7 +116,11 @@ webFetchTool =
           Right (url, maxContentTokens) ->
             raise checkUseLimit >>= \case
               UseLimitReached currentUses ->
-                pure (toolText [i|fetch_url use limit reached for this agent run: #{currentUses}.|])
+                -- 这句话原来只是播报状态（"use limit reached: 5."），**模型会无视它继续调**
+                -- —— 2026-10-03 实测：一次 run 里 fetch_url 被拒后仍继续，配合当时
+                -- 完全没有预算的 search_web，一起烧了 24 次调用 / 90 秒，最后还是没找到。
+                -- 拒绝必须**同时告诉它下一步做什么**，否则只是把墙垒在那儿。
+                pure (toolText [i|fetch_url budget for this run is used up (#{currentUses} calls). Do not call fetch_url again: answer from what you already have, and if that is not enough, say plainly that you could not find it.|])
               UseAllowed -> do
                 page <- fetchWebPage url maxContentTokens
                 pure (toolText (jsonText page))
