@@ -15,7 +15,15 @@ import Bot.Core.Route
 import Bot.Prelude
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Util.Process as ProcessUtil
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as AesonTypes
+import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Text as Text
+import Data.Time (getCurrentTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import qualified Effectful.FileSystem.IO.ByteString as FileSystemByteString
+import Effectful.FileSystem (FileSystem, doesFileExist)
 import qualified Effectful.Process.Typed as TypedProcess
 import qualified Effectful.Timeout as Timeout
 import Effectful.Timeout (Timeout)
@@ -64,6 +72,7 @@ plainReply message = void . Chat.replyTo message{messageId = Nothing}
 -- which is what the owner asked for.
 humaHandlers
   :: ( Chat.Chat :> es
+     , FileSystem :> es
      , Timeout :> es
      , Concurrent :> es
      , IOE :> es
@@ -71,7 +80,150 @@ humaHandlers
      )
   => [RouteHandler es]
 humaHandlers =
-  [humaFixRoute]
+  [humaFixRoute, humaUploadWatch, humaUpdateTableRoute]
+
+-- ── 换码表：上传 -> 校验 -> 原子替换 ────────────────────────────────────
+--
+-- 固定指令，不走模型。理由不只是快（实测模型路径占 94.5% 的时间：3150ms 里
+-- 2978ms 是三轮 LLM），更因为这是**破坏性操作**：智能识别的模糊匹配有可能在
+-- 闲聊里被误触发（「那个码表更新了吗」），而一张坏表会让 *fix 整体失效、
+-- 甚至悄悄解出错字。同义写法多认几个，确定性不变。
+
+humaUpdateCommands :: [Text]
+humaUpdateCommands =
+  ["更新码表", "上传码表", "换码表", "码表更新", "更新一下码表"]
+
+humaUpdateScript :: FilePath
+humaUpdateScript = "/data/huma/update_table.py"
+
+humaLastUploadPath :: FilePath
+humaLastUploadPath = "/data/huma/last-upload.json"
+
+-- | 下载 + 校验 + 替换要跑好几秒（1.7MB 的表），给足但要封顶。
+humaUpdateTimeoutMicros :: Int
+humaUpdateTimeoutMicros = 120 * 1000000
+
+-- | 最近上传的有效期。QQ 里文件和文字是两条消息，所以指令到达时靠这个找文件。
+humaUploadFreshSeconds :: Double
+humaUploadFreshSeconds = 600
+
+-- | 主人发来带附件的消息时，把下载地址记下来。
+--
+-- 为什么必须记：实测那条文件消息 `text` 是**空的**（文件单独一条），所以
+-- 「先传文件、说指令」时指令那条消息身上没有附件。只认本条消息的附件会
+-- 让这个功能永远用不上。只记主人的文件，不碰群里其他人的。
+humaUploadWatch
+  :: (FileSystem :> es, IOE :> es)
+  => RouteHandler es
+humaUploadWatch =
+  Route
+    { help = Nothing
+    , helpVisible = const False
+    , decide = \message -> do
+        when (message.digest.senderIsSuperuser && not (null message.files)) $
+          rememberUpload message
+        pure Skip
+    }
+
+rememberUpload :: (FileSystem :> es, IOE :> es) => IncomingMessage -> Eff es ()
+rememberUpload message = do
+  now <- liftIO getCurrentTime
+  let record =
+        Aeson.object
+          [ "at" Aeson..= (realToFrac (utcTimeToPOSIXSeconds now) :: Double)
+          , "chat_id" Aeson..= message.chatId
+          , "sender_id" Aeson..= message.senderId
+          , "name" Aeson..= fmap (.name) (listToMaybe message.files)
+          , "ref" Aeson..= fmap (.ref) (listToMaybe message.files)
+          ]
+  FileSystemByteString.writeFile humaLastUploadPath (LazyByteString.toStrict (Aeson.encode record))
+
+-- | `更新码表`：取下载地址 -> 交给 update_table.py（校验不过它自己拒绝并说明）-> 回显。
+humaUpdateTableRoute
+  :: ( Chat.Chat :> es
+     , FileSystem :> es
+     , Timeout :> es
+     , Concurrent :> es
+     , IOE :> es
+     , TypedProcess.TypedProcess :> es
+     )
+  => RouteHandler es
+humaUpdateTableRoute =
+  withHelp
+    (RouteHelp (fromMaybe "更新码表" (listToMaybe humaUpdateCommands) <> " [文件]") "用 QQ 文件消息里的码表替换 *fix 的码表；校验不过就拒绝、不动现有表。")
+    $ stopOn humaUpdateFilter \message inlineRef ->
+      if humaOwnerOnly && not message.digest.senderIsSuperuser
+        then plainReply message "这条现在只对主人开放。"
+        else do
+          resolved <- resolveUpload message inlineRef
+          case resolved of
+            Left hint -> plainReply message hint
+            Right url -> do
+              result <- Timeout.timeout humaUpdateTimeoutMicros $
+                ProcessUtil.readProcessGroupWithExitCode "python3" [humaUpdateScript, Text.unpack url]
+              case result of
+                Nothing -> plainReply message "更新超时了（下载或校验太慢），现有码表没动。"
+                Just (exitCode, stdoutText, stderrText) -> do
+                  let out = Text.strip stdoutText
+                      err = Text.strip stderrText
+                  if exitCode == ExitSuccess
+                    then plainReply message (if Text.null out then "更新完成。" else out)
+                    else
+                      plainReply message $
+                        "没换成（现有码表没动）：\n"
+                          <> (if Text.null out then "" else out <> "\n")
+                          <> (if Text.null err then "" else err)
+
+-- | 优先用本条消息自带的附件；否则用 10 分钟内、同聊天、同发送者记下的那一个。
+resolveUpload
+  :: (FileSystem :> es, IOE :> es)
+  => IncomingMessage
+  -> Maybe Text
+  -> Eff es (Either Text Text)
+resolveUpload message inlineRef =
+  case inlineRef <|> fmap (.ref) (listToMaybe message.files) of
+    Just ref -> pure (Right ref)
+    Nothing -> do
+      remembered <- readLastUpload
+      now <- liftIO getCurrentTime
+      pure $ case remembered of
+        Just (at, chatId, senderId, ref)
+          | chatId /= message.chatId ->
+              Left "最近上传的文件不在这个聊天里。把码表发到当前聊天，或者带着附件发指令。"
+          | senderId /= message.senderId ->
+              Left "最近上传的文件不是你发的。"
+          | realToFrac (utcTimeToPOSIXSeconds now) - at > humaUploadFreshSeconds ->
+              Left "最近上传的文件超过 10 分钟了，重新发一次再试。"
+          | otherwise -> Right ref
+        Nothing ->
+          Left "没找到码表文件。先在群里传一个 txt，然后 10 分钟内发「更新码表」。"
+
+readLastUpload :: (FileSystem :> es, IOE :> es) => Eff es (Maybe (Double, Maybe Integer, Maybe Text, Text))
+readLastUpload = do
+  exists <- doesFileExist humaLastUploadPath
+  if not exists
+    then pure Nothing
+    else do
+      raw <- FileSystemByteString.readFile humaLastUploadPath
+      pure $ case Aeson.eitherDecodeStrict' raw of
+        Left _ -> Nothing
+        Right value -> AesonTypes.parseMaybe parseRecord value
+  where
+    parseRecord = Aeson.withObject "last upload" \o ->
+      (,,,)
+        <$> o Aeson..: "at"
+        <*> o Aeson..:? "chat_id"
+        <*> o Aeson..:? "sender_id"
+        <*> o Aeson..: "ref"
+
+-- | 匹配更新指令，允许前面带 `fm `（主人习惯这么打）。返回值 = 本条消息自带附件的 ref。
+humaUpdateFilter :: MessageFilter (Maybe Text)
+humaUpdateFilter =
+  MessageFilter \message -> do
+    let stripped = Text.strip message.text
+        withoutPrefix = Text.strip (fromMaybe stripped (Text.stripPrefix "fm" stripped))
+    guard (withoutPrefix `elem` humaUpdateCommands)
+    pure (fmap (.ref) (listToMaybe message.files))
 
 humaFixRoute
   :: ( Chat.Chat :> es
