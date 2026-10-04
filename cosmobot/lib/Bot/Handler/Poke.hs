@@ -113,11 +113,17 @@ likeMeRoute =
         when (isLikeMe message && message.digest.senderIsAllowed) do
           case message.senderId of
             Nothing -> pure ()
-            Just who -> do
-              allowed <- claimSlot ("like:" <> who) likeMeCooldownSeconds
-              when allowed do
-                -- 失败就算了：点赞是善意的小动作，冒一句「点赞失败」比不说更怪。
-                void (Chat.likeUser message who 1)
+            Just who ->
+              -- 所有者 2026-10-04：**不做每人冷却** —— QQ 对名片赞每天只有 10 个额度，
+              -- 与其用冷却去猜「他是不是点过了」，不如照点，**额度满了就如实说**。
+              -- （原来 6 小时冷却的写法会让一天最多 4 次/人，但全群只有 10 个总额度，
+              --   一个人就能把额度吃掉，反而更不公平。）
+              Chat.likeUser message who 1 >>= \case
+                -- 成功不出声：那句话交给模型说（本 route 返回 Skip）。
+                Right () -> pure ()
+                -- 失败**必须出声**：尤其是「今天额度用完了」—— 不说的话对方会以为点上了。
+                Left err ->
+                  void $ Chat.replyTo message{messageId = Nothing} [i|没点上：#{err}|]
         -- 不吞消息：那句话交给它自己说。
         pure Skip
     }
