@@ -29,6 +29,7 @@ module Bot.Effect.ChatDriver
   , mentionUser
   , setMemberTitle
   , pokeUser
+  , likeUser
   , setTyping
   , rememberRosterTriggers
   , incomingMessages
@@ -126,6 +127,11 @@ data ChatDriver :: Effect where
   PokeUser
     :: IncomingMessage
     -> Text
+    -> ChatDriver m (Either Text ())
+  LikeUser
+    :: IncomingMessage
+    -> Text
+    -> Int
     -> ChatDriver m (Either Text ())
   SetTyping
     :: IncomingMessage
@@ -234,6 +240,11 @@ pokeUser :: ChatDriver :> es => IncomingMessage -> Text -> Eff es (Either Text (
 pokeUser message userId =
   send (PokeUser message userId)
 
+-- | 给某个用户点赞（QQ 的名片赞）。平台不支持时返回 Left。
+likeUser :: ChatDriver :> es => IncomingMessage -> Text -> Int -> Eff es (Either Text ())
+likeUser message userId times =
+  send (LikeUser message userId times)
+
 setTyping :: ChatDriver :> es => IncomingMessage -> Int -> Eff es ()
 setTyping message timeout =
   send (SetTyping message timeout)
@@ -300,6 +311,8 @@ chatDriverEffectHandler driver _ = \case
     Driver.setMemberTitle driver message userId title
   PokeUser message userId ->
     Driver.pokeUser driver message userId
+  LikeUser message userId times ->
+    Driver.likeUser driver message userId times
   SetTyping message timeout ->
     Driver.setTyping driver message timeout
   RememberRosterTriggers message triggers ->

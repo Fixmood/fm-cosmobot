@@ -110,6 +110,11 @@ class ChatDriver driver where
   pokeUser :: ChatDriverEffects driver es => driver -> IncomingMessage -> Text -> Eff es (Either Text ())
   pokeUser _ _ _ =
     pure (Left "这个平台不支持戳一戳。")
+
+  -- | 给某个用户点赞（QQ 的名片赞）。没有这个概念的平台保持默认实现。
+  likeUser :: ChatDriverEffects driver es => driver -> IncomingMessage -> Text -> Int -> Eff es (Either Text ())
+  likeUser _ _ _ _ =
+    pure (Left "这个平台不支持点赞。")
   setMemberTitle _ _ _ _ =
     pure False
 

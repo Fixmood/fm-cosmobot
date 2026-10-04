@@ -152,6 +152,9 @@ instance Driver.ChatDriver QQDriver where
   pokeUser =
     pokeUserQQ
 
+  likeUser =
+    likeUserQQ
+
 pokeUserQQ
   :: (IOE :> es, KatipE :> es, Timeout :> es, Concurrent :> es)
   => QQDriver
@@ -193,6 +196,37 @@ pokeActionResult actionName response
       let retcodeText = maybe "-" (Text.pack . show) (response.retcode :: Maybe Integer)
       logWarning [i|QQ #{actionName} failed: retcode=#{retcodeText} data=#{qqResponseSummary response.data_}|]
       pure (Left (fromMaybe "戳一戳失败。" response.message))
+
+likeUserQQ
+  :: (IOE :> es, KatipE :> es, Timeout :> es, Concurrent :> es)
+  => QQDriver
+  -> IncomingMessage
+  -> Text
+  -> Int
+  -> Eff es (Either Text ())
+likeUserQQ driver _message userId times =
+  case parseIntegerUserId userId of
+    Just numericUserId -> do
+      response <- sendAction driver (Aeson.object
+        [ "action" Aeson..= Aeson.String "send_like"
+        , "params" Aeson..= Aeson.object
+            [ "user_id" Aeson..= numericUserId
+            -- 夹到 1..10：QQ 对点赞有单次与每日上限，不能指望调用方自觉。
+            , "times" Aeson..= max 1 (min 10 times)
+            ]
+        ])
+      likeActionResult "send_like" response
+    Nothing ->
+      pure (Left "点赞需要一个数字 QQ 号。")
+
+-- | send_like 和 send_poke 一样：返回里没有 message_id，只看 retcode。
+likeActionResult :: (KatipE :> es) => Text -> ActionResponse -> Eff es (Either Text ())
+likeActionResult actionName response
+  | response.retcode == Just 0 = pure (Right ())
+  | otherwise = do
+      let retcodeText = maybe "-" (Text.pack . show) (response.retcode :: Maybe Integer)
+      logWarning [i|QQ #{actionName} failed: retcode=#{retcodeText} data=#{qqResponseSummary response.data_}|]
+      pure (Left (fromMaybe "点赞失败。" response.message))
 
 qqStreamingMessageLimit :: Int
 qqStreamingMessageLimit = 4000

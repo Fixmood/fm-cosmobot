@@ -152,6 +152,9 @@ instance ChatDriver driver => ChatDriver (NormalizingChatDriver driver) where
       normalizedBody <- normalizeOutgoingReplyBody driver body
       mentionUser driver message userId normalizedBody
 
+  likeUser (NormalizingChatDriver driver) message userId times =
+    likeUser driver message userId times
+
   pokeUser (NormalizingChatDriver driver) message userId =
     -- 直接透传：withChatDriverEither 是给「带正文的回复」做归一化用的，
     -- 戳一戳没有正文，套上去只会把返回类型从 Either Text () 拽成 Either Text MessageId。
@@ -392,6 +395,10 @@ instance ChatDriver ChatDrivers where
           mentionUser driver message userId (FMBridge.fmMentionBody body)
         recordRecentQQDeliveries drivers message body (maybeToList (rightToMaybe result))
         pure result
+
+  likeUser drivers message userId times =
+    withMessageDriver drivers message \driver ->
+      likeUser driver message userId times
 
   pokeUser drivers message userId =
     withMessageDriver drivers message \driver ->

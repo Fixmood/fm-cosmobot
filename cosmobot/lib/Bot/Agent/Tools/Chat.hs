@@ -12,6 +12,7 @@ module Bot.Agent.Tools.Chat
   , sendFileTool
   , mentionUserTool
   , pokeUserTool
+  , likeUserTool
   , senderMemberInfoTool
   , memberInfoTool
   , userAvatarTool
@@ -230,6 +231,35 @@ pokeUserTool =
             pure (toolFailure Failure
               { category = ExternalServiceUnavailable
               , userMessage = [i|戳一戳失败：#{err}|]
+              , detail = err
+              })
+
+-- | 给某个用户点赞（QQ 的名片赞）。
+--
+-- **主人限定**（allowWhen superuserOnly），和 poke_user 同一道闸门：点赞比戳温和，
+-- 但它同样是「替 FM 对真人做一个动作」，谁有权触发这件事必须先定下来。
+--
+-- 次数夹在 1..10（QQ 有上限）；默认 1 下 —— 拉满容易被限，被点的人也会看到一串。
+likeUserTool :: Chat.Chat :> es => Tool (Eff es)
+likeUserTool =
+  tagged [chatTag]
+  . allowWhen superuserOnly
+  . noisy
+  . withDescription "Give a user a QQ profile like (名片赞). Use it only when the owner asks for it. Default is one like; QQ caps how many a user can receive, so do not ask for many. This is a kind gesture, not a notification the person reads -- your reply is what carries the words."
+  $ tool "like_user"
+      ( userIdArgument "Platform user id to like."
+      , optionalInteger "times" "How many likes to give. Defaults to 1; clamped to 1-10."
+      )
+      \userId requestedTimes -> do
+        context <- askToolContext
+        -- optionalInteger 给的是 Maybe Integer，驱动那层用 Int —— 显式转，别让它去猜。
+        Chat.likeUser context.message userId (fromIntegral (fromMaybe 1 requestedTimes)) >>= \case
+          Right () ->
+            pure (toolText "已点赞。点赞本身不带文字，你回复里说的话才是对方看到的内容。")
+          Left err ->
+            pure (toolFailure Failure
+              { category = ExternalServiceUnavailable
+              , userMessage = [i|点赞失败：#{err}|]
               , detail = err
               })
 
