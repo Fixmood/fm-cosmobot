@@ -11,6 +11,7 @@ module Bot.Agent.Tools.Chat
   , sendReplyTool
   , sendFileTool
   , mentionUserTool
+  , pokeUserTool
   , senderMemberInfoTool
   , memberInfoTool
   , userAvatarTool
@@ -202,6 +203,33 @@ mentionUserTool =
             pure (toolFailure Failure
               { category = ExternalServiceUnavailable
               , userMessage = [i|发送提及消息失败：#{err}|]
+              , detail = err
+              })
+
+-- | 戳一下某个用户（QQ 的「戳一戳」）。
+--
+-- **主人限定**（allowWhen superuserOnly）。戳一戳会打扰真人，「谁都能让 FM 去戳谁」
+-- 就是个骚扰工具 —— 这是所有者 2026-10-04 明确划的边界。
+--
+-- 戳本身**没有文字**，所以不用额外设计「戳 + 一句话」：模型调用这个工具时，
+-- 它自己那条回复就是对方看到的话。
+pokeUserTool :: Chat.Chat :> es => Tool (Eff es)
+pokeUserTool =
+  tagged [chatTag]
+  . allowWhen superuserOnly
+  . noisy
+  . withDescription "Poke a user in the current chat (QQ 戳一戳). A poke reaches a real person: use it only when the owner asks for it in so many words, and never repeatedly. The poke itself carries no words -- what you say in your reply is what the person reads."
+  $ tool "poke_user"
+      (userIdArgument "Platform user id to poke.")
+      \userId -> do
+        context <- askToolContext
+        Chat.pokeUser context.message userId >>= \case
+          Right () ->
+            pure (toolText "已戳。戳本身不带文字，你回复里说的话才是对方看到的内容。")
+          Left err ->
+            pure (toolFailure Failure
+              { category = ExternalServiceUnavailable
+              , userMessage = [i|戳一戳失败：#{err}|]
               , detail = err
               })
 

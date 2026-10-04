@@ -193,6 +193,7 @@ defaultToolsWith extraTools = tools
       , sendFileTool
       , sendMediaTool
       , mentionUserTool
+      , pokeUserTool
       , senderMemberInfoTool
       , memberInfoTool
       , userAvatarTool
