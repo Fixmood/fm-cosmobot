@@ -7,6 +7,7 @@ Stability   : experimental
 
 module Bot.Handler.Poke
   ( pokeHandlers
+  , likeMeHandlers
   )
 where
 
@@ -51,7 +52,7 @@ pokeHandlers
   :: (Chat.Chat :> es, FileSystem :> es, IOE :> es)
   => [RouteHandler es]
 pokeHandlers =
-  [pokeBackRoute]
+  [pokeBackRoute, likeMeRoute]
 
 pokeBackRoute
   :: (Chat.Chat :> es, FileSystem :> es, IOE :> es)
@@ -76,6 +77,55 @@ pokeBackRoute =
 --
 -- senderIsAllowed 这道闸门是必须的：日志里 12:06:44 那次来自 `sender_allowed=False`
 -- 的人，而**戳一戳是会打扰真人的动作** —— 不加闸门，任何陌生人都能让 FM 去戳别人。
+-- ── 「赞我」 ────────────────────────────────────────────────────────────
+--
+-- 有人说「赞我」→ 立刻给这个人点一个赞，然后**返回 Skip 把消息放走**，
+-- 由模型接一句符合当前语境的话。
+--
+-- 为什么点赞走 route、说话走模型：**点赞本身不带文字**，而「符合语境的那句话」
+-- 只有模型说得出。这和回戳是同一个分工（反射瞬时完成、说话交给它自己）。
+--
+-- 三道闸门，每一道都是今天踩出来的：
+--   1. **整句匹配** —— 「赞我」必须就是整条消息，群里闲聊不会误触。
+--   2. **senderIsAllowed** —— 戳那次漏了这条，结果陌生人都能让 FM 去戳真人。
+--   3. **冷却 6 小时/人** —— QQ 对名片赞有每日上限，被刷一次就废了。
+
+likeMePhrases :: [Text]
+likeMePhrases = ["赞我", "赞我一下", "给我点赞", "给我点个赞"]
+
+likeMeCooldownSeconds :: Double
+likeMeCooldownSeconds = 6 * 3600
+
+likeMeHandlers
+  :: (Chat.Chat :> es, FileSystem :> es, IOE :> es)
+  => [RouteHandler es]
+likeMeHandlers =
+  [likeMeRoute]
+
+likeMeRoute
+  :: (Chat.Chat :> es, FileSystem :> es, IOE :> es)
+  => RouteHandler es
+likeMeRoute =
+  Route
+    { help = Just (RouteHelp "赞我" "发一句「赞我」，就给你点一个赞，然后说一句。")
+    , helpVisible = const True
+    , decide = \message -> do
+        when (isLikeMe message && message.digest.senderIsAllowed) do
+          case message.senderId of
+            Nothing -> pure ()
+            Just who -> do
+              allowed <- claimSlot ("like:" <> who) likeMeCooldownSeconds
+              when allowed do
+                -- 失败就算了：点赞是善意的小动作，冒一句「点赞失败」比不说更怪。
+                void (Chat.likeUser message who 1)
+        -- 不吞消息：那句话交给它自己说。
+        pure Skip
+    }
+
+isLikeMe :: IncomingMessage -> Bool
+isLikeMe message =
+  Text.strip message.text `elem` likeMePhrases
+
 shouldPokeBack :: IncomingMessage -> Bool
 shouldPokeBack message =
   pokeEventPrefix `Text.isPrefixOf` Text.strip message.text
@@ -83,15 +133,20 @@ shouldPokeBack message =
 
 -- | 冷却：同一个聊天里，pokeCooldownSeconds 内只回戳一次。
 claimPokeSlot :: (FileSystem :> es, IOE :> es) => IncomingMessage -> Eff es Bool
-claimPokeSlot message = do
+claimPokeSlot message =
+  claimSlot (maybe "-" (Text.pack . show) message.chatId) pokeCooldownSeconds
+
+-- | 通用冷却：同一把钥匙在 windowSeconds 内只放行一次。
+-- 「赞我」用同一份状态文件，只是键带 "like:" 前缀（按人算，不是按聊天算）。
+claimSlot :: (FileSystem :> es, IOE :> es) => Text -> Double -> Eff es Bool
+claimSlot slotKey windowSeconds = do
   now <- liftIO getCurrentTime
   let nowSeconds = realToFrac (utcTimeToPOSIXSeconds now) :: Double
-      chatKey = maybe "-" (Text.pack . show) message.chatId
   existing <- readPokeState
-  case Map.lookup chatKey existing of
-    Just lastAt | nowSeconds - lastAt < pokeCooldownSeconds -> pure False
+  case Map.lookup slotKey existing of
+    Just lastAt | nowSeconds - lastAt < windowSeconds -> pure False
     _ -> do
-      let updated = Map.insert chatKey nowSeconds existing
+      let updated = Map.insert slotKey nowSeconds existing
       FileSystemByteString.writeFile pokeStatePath
         (LazyByteString.toStrict (Aeson.encode updated))
       pure True
