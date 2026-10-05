@@ -222,7 +222,12 @@ likeUserQQ driver _message userId times =
 -- | send_like 和 send_poke 一样：返回里没有 message_id，只看 retcode。
 likeActionResult :: (KatipE :> es) => Text -> ActionResponse -> Eff es (Either Text ())
 likeActionResult actionName response
-  | response.retcode == Just 0 = pure (Right ())
+  | response.retcode == Just 0 = do
+      -- **成功也要留痕**。原来只在失败时写日志，于是「到底调没调、成没成」
+      -- 在日志里无从分辨 —— 今天已经三次栽在「静默无痕」上（import json 被 except 吞、
+      -- 时长口径算错没人发现、liked 失败不写）。成功那行是唯一能一眼分清的办法。
+      logInfo [i|QQ #{actionName} ok: retcode=0|]
+      pure (Right ())
   | otherwise = do
       let retcodeText = maybe "-" (Text.pack . show) (response.retcode :: Maybe Integer)
       logWarning [i|QQ #{actionName} failed: retcode=#{retcodeText} data=#{qqResponseSummary response.data_}|]
