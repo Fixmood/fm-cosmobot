@@ -242,10 +242,14 @@ pokeUserTool =
 -- 次数夹在 1..10（QQ 有上限）；默认 1 下 —— 拉满容易被限，被点的人也会看到一串。
 likeUserTool :: Chat.Chat :> es => Tool (Eff es)
 likeUserTool =
+  -- 所有者 2026-10-04 决定：**对所有人开放**（原来和 poke_user 一样是主人限定）。
+  -- 点赞是善意动作，不像戳会打扰人，所以边界可以不同 —— 注意 **pokeUserTool 仍是主人限定**。
+  --
+  -- 代价写在明处：QQ 对名片赞每天只有约 10 个额度，放开之后几个人连着用就会见底。
+  -- 池子满了要说「没点上」，不许假装点上。
   tagged [chatTag]
-  . allowWhen superuserOnly
   . noisy
-  . withDescription "Give a user a QQ profile like (名片赞). Use it only when the owner asks for it. Default is one like; QQ caps how many a user can receive, so do not ask for many. This is a kind gesture, not a notification the person reads -- your reply is what carries the words."
+  . withDescription "Give a user a QQ profile like (名片赞). Anyone in the chat may ask for this, for themselves or for someone else, so use it when asked. Default is one like. QQ caps profile likes per account per day (about ten), so never ask for many, and when a like fails say so plainly instead of claiming success. A like is not a notification the person reads -- your reply is what carries the words."
   $ tool "like_user"
       ( userIdArgument "Platform user id to like."
       , optionalInteger "times" "How many likes to give. Defaults to 1; clamped to 1-10."
