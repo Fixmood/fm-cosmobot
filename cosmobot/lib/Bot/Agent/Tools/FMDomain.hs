@@ -792,7 +792,7 @@ fmChartTool =
       \userId name source requestedDays metric -> do
         context <- askToolContext
         withCapability context "scores" do
-          let days = max 1 (min 3650 (fromMaybe 30 requestedDays))
+          let days = max 1 (min 3650 (fromMaybe 3650 requestedDays))
               url = "http://172.20.0.4:8077/reports/score-chart.png?user_id="
                 <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name
                 <> "&source=" <> fromMaybe "" source <> "&days=" <> show days
