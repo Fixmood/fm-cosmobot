@@ -765,6 +765,9 @@ fmCompetitionScoreImageTool =
         withCapability context "scores" do
           let url = "http://172.20.0.4:8077/reports/competition-score.png?user_id="
                 <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name <> "&source=" <> fromMaybe "" source
+                -- cache-buster：URL 每次必须不同。2026-10-12 实测，URL 一样时
+                -- 修好之后所有者仍收到旧的空图（别人的 URL 没请求过所以正常）。
+                <> "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _ : _ -> pure (toolText "成绩图片已发送。")
@@ -793,7 +796,9 @@ fmChartTool =
               url = "http://172.20.0.4:8077/reports/score-chart.png?user_id="
                 <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name
                 <> "&source=" <> fromMaybe "" source <> "&days=" <> show days
+                <> "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
                 <> "&metric=" <> fromMaybe "speed" metric
+                <> "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _ : _ -> pure (toolText "成绩图表已发送。")
