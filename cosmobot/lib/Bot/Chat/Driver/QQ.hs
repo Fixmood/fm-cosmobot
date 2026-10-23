@@ -155,6 +155,37 @@ instance Driver.ChatDriver QQDriver where
   likeUser =
     likeUserQQ
 
+  setTyping =
+    setTypingQQ
+
+setTypingQQ
+  :: (IOE :> es, KatipE :> es, Timeout :> es, Concurrent :> es)
+  => QQDriver
+  -> IncomingMessage
+  -> Int
+  -> Eff es ()
+setTypingQQ driver message _timeoutMillis =
+  case (message.kind, message.senderId) of
+    -- QQ 的「正在输入」只能在私聊里显示：snowluma 的 set_input_status 只认 user_id。
+    -- 群里没有对应能力 —— 群里保持安静是有意的（所有者 2026-10-23：怕吵）。
+    (ChatPrivate, Just userId)
+      | Just numericUserId <- parseIntegerUserId userId -> do
+          response <- sendAction driver (Aeson.object
+            [ "action" Aeson..= Aeson.String "set_input_status"
+            , "params" Aeson..= Aeson.object
+                [ "user_id" Aeson..= numericUserId
+                , "event_type" Aeson..= (0 :: Int)
+                ]
+            ])
+          when (response.retcode /= Just 0) $ do
+            -- quasiquote 里不能写类型注解（#{show (x :: Maybe Integer)} 会炸），
+            -- 先算成 Text 再插值 —— 早上在 likeActionResult 那里踩过同一次。
+            let rc = maybe "-" (Text.pack . show) (response.retcode :: Maybe Integer)
+            logDebug [i|QQ set_input_status failed: retcode=#{rc}|]
+    _ ->
+      pure ()
+
+
 pokeUserQQ
   :: (IOE :> es, KatipE :> es, Timeout :> es, Concurrent :> es)
   => QQDriver
