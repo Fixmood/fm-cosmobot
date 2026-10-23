@@ -307,7 +307,12 @@ classifyPolicy cfg threads msg = do
   let triggered = case customTrigger of
         Nothing -> isAllowedPrivate msg || (isAllowedGroup msg && (msg.digest.mentionsBot || calledByName))
         Just config ->
-          (Trigger.triggerMatches (fromMaybe "FM" cfg.name) config msg
+          -- 私聊是一对一会话：对方说话就是冲着 FM 来的，不需要再喊名字。
+          -- 原来这里没有私聊这一档，而 triggerMatches 只认 prefix/mention/name/
+          -- keyword，于是出现倒挂：没配置的私聊能直接说话，配置过的主人反而
+          -- 必须发「fm 」（所有者 2026-10-23 提的）。群聊规则完全不动。
+          (isAllowedPrivate msg
+            || Trigger.triggerMatches (fromMaybe "FM" cfg.name) config msg
             || isTriggerManagementRequest cfg msg)
             && not (Trigger.triggerConfigHasMode Trigger.TriggerReply config && isOtherReply baseReplyTarget)
   replyTarget <-
