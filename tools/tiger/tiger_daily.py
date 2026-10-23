@@ -132,9 +132,10 @@ def build_record(day: str, entry: dict, name_to_qq: dict[str, str]) -> tuple | N
     if not username:
         return None
     speed = float(entry.get("speed") or 0)
-    if speed <= 0:
-        # 榜上偶尔有 0.01 这种没真正跑完的，和旧逻辑一致：速度<=0 不入库。
-        # 0.01 大于 0 所以仍会进；这里只挡掉真正的 0。
+    if speed < 5:
+        # 榜上有 0 / 0.001 / 0.01 这种「点进去没真打」的记录 ✗。
+        # 它们会把曲线拉出巨大的假下坠（2026-10-24 实拍：180 点里有 6 个这种坑）。
+        # 真实成绩都在 30 以上，卡 5 足够安全。
         return None
     source_json = {
         # 下游渲染读的是这几个键（和旧数据一致）
