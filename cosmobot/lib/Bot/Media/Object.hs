@@ -267,7 +267,10 @@ isTransportFailure err =
 
 isQQLogoRequest :: HTTP.Request -> Bool
 isQQLogoRequest request =
-  Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request)) == "q.qlogo.cn"
+  -- 不能只认精确的 q.qlogo.cn：QQ 下发的头像地址还有 q1. / q2. / q3.，
+  -- 那些原来落到通用路径（要求 EMS），握手死掉。2026-10-16 的 10,071 次
+  -- 下载失败全是 q1.qlogo.cn，一个都没走到这里。
+  Text.isSuffixOf ".qlogo.cn" (Text.toCaseFold (TextEncoding.decodeUtf8 (HTTP.host request)))
 
 qqMediaDownloadRequest :: HTTP.Request -> HTTP.Request
 qqMediaDownloadRequest request =
