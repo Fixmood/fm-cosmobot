@@ -403,8 +403,19 @@ currentSenderChatLogScopeError scope message
 hasExplicitChatLogIntent :: Context -> Bool
 hasExplicitChatLogIntent context =
   any (`Text.isInfixOf` normalized)
+    -- 2026-10-23：这层闸门原来只认「聊天记录/历史消息」这类字眼，于是
+    -- 「这个群今天谁最活跃」「今天聊了什么」这种**统计/回顾**请求拿不到工具，
+    -- FM 只能 run_bash 手写 SQL 查 chat_log —— 48 小时里 96 次，占一半的 shell 调用。
+    -- 闸门是为了防止无关话题被当成「查记录」，但统计和回顾本来就是在查记录。
     [ "聊天记录", "聊天日志", "历史消息", "刚才谁说", "查记录", "查一下记录", "看看记录"
-    , "聊天历史", "search my history", "chat history", "recent messages" ]
+    , "聊天历史", "search my history", "chat history", "recent messages"
+    -- 统计类
+    , "谁最活跃", "谁说得最多", "谁话最多", "谁发言最多", "最活跃"
+    , "说了多少", "多少条", "几条", "统计一下", "统计下", "发言数"
+    -- 回顾 / 总结类
+    , "聊了什么", "聊了啥", "聊些什么", "说了什么", "说了啥"
+    , "总结一下", "总结下", "概括一下", "回顾一下"
+    ]
   where
     normalized = Text.toLower context.input.text
 
