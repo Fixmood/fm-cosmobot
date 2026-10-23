@@ -336,7 +336,11 @@ takeoverIsControlMessage :: Text -> Bool
 takeoverIsControlMessage value =
   let normalized = Text.toLower (Text.filter (not . (`elem` [' ', '\t', '\x3000'])) value)
   in any (`Text.isInfixOf` normalized)
+      -- 2026-10-23 事故：所有者发「取消接管」被当成普通聊天转发走了，
+      -- 于是 stop 工具永远够不到 —— 接管开着，而关闭它的入口被它自己吃掉。
+      -- 逃生口必须宽：宁可多认几个说法，也不能让「关不掉」发生。
       [ "接管fm", "结束接管", "退出接管", "停止接管", "关闭接管"
+      , "取消接管", "取消fm接管", "别接管", "不用接管", "不要接管"
       , "接管状态", "接管情况", "查看接管", "接管信息"
       ]
 
