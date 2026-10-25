@@ -6,6 +6,7 @@ Stability   : experimental
 
 module Bot.Agent.Tools.Web
   ( webSearchTool
+  , searchQuotaTool
   , webFetchTool
   )
 where
@@ -162,6 +163,85 @@ instance Aeson.ToJSON TavilyKeyFile where
 
 tavilyKeyStatePath :: FilePath
 tavilyKeyStatePath = "/data/tavily-keys.json"
+
+-- | 所有轮换 key 的额度汇总。为什么需要它：单看 config 里那个 key 会报出
+-- 「已用完」，而轮换列表里可能还有一个全新的账号 —— 报总额才有意义。
+searchQuotaTool :: (HTTP.HTTP :> es, IOE :> es) => Tool (Eff es)
+searchQuotaTool =
+  withDescription
+    "Report Tavily search quota across every key in the rotation list: used, limit and remaining per account plus the total. Use this whenever the user asks how much search quota is left."
+    $ tool "search_quota" noArguments do
+      context <- askToolContext
+      file <- loadTavilyKeyFile
+      let keys = case file of
+            Just saved | not (null saved.keyList) -> saved.keyList
+            _ -> maybe [] pure context.toolConfig.tavilyApiKey
+          activeIndex = maybe 0 (.activeKey) file
+      if null keys
+        then pure (toolText "还没有配置任何 Tavily key。")
+        else do
+          usages <- traverse quotaOf keys
+          let rows = zip [1 :: Int ..] (zip keys usages)
+              totalUsed = sum [used | Just (used, _) <- usages]
+              totalLimit = sum [limit | Just (_, limit) <- usages]
+              renderRow :: (Int, (Text, Maybe (Int, Int))) -> Text
+              renderRow (index, (key, usage)) =
+                "  "
+                  <> Text.pack (show index)
+                  <> ". "
+                  <> maskKey key
+                  <> "  "
+                  <> renderUsage usage
+                  <> (if index - 1 == activeIndex then "   <<< 当前在用" else "")
+              body = Text.unlines (map renderRow rows)
+              summary =
+                "Tavily 搜索额度（"
+                  <> Text.pack (show (length keys))
+                  <> " 个账号）："
+                  <> "\n"
+                  <> body
+                  <> "\n"
+                  <> "合计：已用 "
+                  <> Text.pack (show totalUsed)
+                  <> " / "
+                  <> Text.pack (show totalLimit)
+                  <> "，剩余 "
+                  <> Text.pack (show (max 0 (totalLimit - totalUsed)))
+                  <> " 次"
+          pure (toolText summary)
+  where
+    maskKey :: Text -> Text
+    maskKey key = Text.pack (take 14 (Text.unpack key)) <> "..."
+    renderUsage :: Maybe (Int, Int) -> Text
+    renderUsage Nothing = "查询失败"
+    renderUsage (Just (used, limit)) =
+      "已用 " <> Text.pack (show used) <> " / " <> Text.pack (show limit)
+        <> "，剩余 " <> Text.pack (show (max 0 (limit - used)))
+
+-- | 单个 key 的 (已用, 额度)。Tavily /usage 的 account 段里给这两个数。
+quotaOf :: HTTP.HTTP :> es => Text -> Eff es (Maybe (Int, Int))
+quotaOf apiKey = do
+  outcome <-
+    try @SomeException $
+      HTTP.runReq $
+        req
+          GET
+          (https "api.tavily.com" /: "usage")
+          NoReqBody
+          jsonResponse
+          (header "Authorization" (ByteString.pack [i|Bearer #{apiKey}|]))
+  pure $ case outcome of
+    Left _ -> Nothing
+    Right response ->
+      AesonTypes.parseMaybe
+        ( Aeson.withObject "tavily usage" \object -> do
+            account <- object Aeson..: "account"
+            used <- account Aeson..: "plan_usage"
+            limit <- account Aeson..: "plan_limit"
+            pure (used, limit)
+        )
+        (responseBody response)
+
 
 loadTavilyKeyFile :: IOE :> es => Eff es (Maybe TavilyKeyFile)
 loadTavilyKeyFile = do

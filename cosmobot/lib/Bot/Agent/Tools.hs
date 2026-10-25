@@ -139,6 +139,7 @@ defaultToolsWith extraTools = tools
       , queryCurrentSenderChatLogTool
       , recallRecentSelfMessagesTool
       , webSearchTool
+      , searchQuotaTool
       , webFetchTool
       , datetimeTool
       , chatModelStatusTool
@@ -247,6 +248,9 @@ selectToolsForMessage context tools =
       , "datetime"
       , "current_message_info"
       , "fm_tell_member"
+      -- 额度/余额类问题会命中 Admin 子集，而搜索额度不属于任何一个域，
+      -- 不加进来就会被子集过滤掉（2026-10-25 实测：工具在二进制里但模型看不到）。
+      , "search_quota"
       ]
 
     domainTools = \case
