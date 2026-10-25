@@ -24,10 +24,12 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.ByteString.Char8 as ByteString
+import qualified Data.List as List
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
 import qualified Data.Text.Encoding.Error as TextEncoding
 import Network.HTTP.Req
+import System.Directory (doesFileExist)
 import System.IO.Error (userError)
 import qualified Text.URI as URI
 
@@ -139,13 +141,88 @@ webFetchTool =
                 page <- fetchWebPage url maxContentTokens
                 pure (toolText (jsonText page))
 
-webSearch :: HTTP.HTTP :> es => ToolConfig -> Text -> Int -> Bool -> Eff es ([Aeson.Value], [Text])
+-- | 可轮换的 Tavily key 文件。
+data TavilyKeyFile = TavilyKeyFile
+  { keyList :: ![Text]
+  , activeKey :: !Int
+  }
+
+instance Aeson.FromJSON TavilyKeyFile where
+  parseJSON = Aeson.withObject "tavily keys" \object ->
+    TavilyKeyFile
+      <$> object Aeson..: "keys"
+      <*> object Aeson..:? "active" Aeson..!= 0
+
+instance Aeson.ToJSON TavilyKeyFile where
+  toJSON file =
+    Aeson.object
+      [ "keys" Aeson..= file.keyList
+      , "active" Aeson..= file.activeKey
+      ]
+
+tavilyKeyStatePath :: FilePath
+tavilyKeyStatePath = "/data/tavily-keys.json"
+
+loadTavilyKeyFile :: IOE :> es => Eff es (Maybe TavilyKeyFile)
+loadTavilyKeyFile = do
+  -- 文件不存在是**正常情况**（没配轮换），不能让它抛异常 ——
+  -- 否则一次搜索会变成 "withBinaryFile: does not exist" 的堆栈报错给用户看。
+  exists <- liftIO (doesFileExist tavilyKeyStatePath)
+  if not exists
+    then pure Nothing
+    else liftIO (Aeson.decodeFileStrict' tavilyKeyStatePath)
+
+saveTavilyKeyFile :: IOE :> es => TavilyKeyFile -> Eff es ()
+saveTavilyKeyFile file = liftIO (Aeson.encodeFile tavilyKeyStatePath file)
+
+-- | 从当前 active 开始试，成功就记住，失败就换下一个。
+tavilySearchRotating
+  :: (HTTP.HTTP :> es, IOE :> es)
+  => ToolConfig
+  -> Text
+  -> Int
+  -> Bool
+  -> Eff es ([Aeson.Value], [Text])
+tavilySearchRotating cfg query maxResults includeImages = do
+  file <- loadTavilyKeyFile
+  let fromConfig = maybe [] pure cfg.tavilyApiKey
+      candidates = case file of
+        Just saved | not (null saved.keyList) -> saved.keyList
+        _ -> fromConfig
+      startAt = maybe 0 (.activeKey) file
+  case candidates of
+    [] ->
+      throwIO
+        ( userError
+            "Tavily search is not configured: set tool.web_search.tavily_api_key or add keys to /data/tavily-keys.json."
+        )
+    _ -> attempt candidates startAt (length candidates)
+  where
+    -- 从 active 开始，绕一圈把所有 key 都试一遍
+    attempt candidates index remaining
+      | remaining <= 0 =
+          throwIO
+            ( userError
+                [i|所有 Tavily key 的额度都用完了（#{length candidates} 个都试过）。请补新 key 到 /data/tavily-keys.json。|]
+            )
+      | otherwise = do
+          let key = candidates List.!! (index `mod` length candidates)
+          outcome <- try @SomeException (tavilySearch key query maxResults includeImages)
+          case outcome of
+            Right value -> do
+              -- 成功：记住这个位置，下次直接用它，不在死 key 上浪费请求
+              saveTavilyKeyFile TavilyKeyFile
+                { keyList = candidates
+                , activeKey = index `mod` length candidates
+                }
+              pure value
+            Left _ -> attempt candidates (index + 1) (remaining - 1)
+
+webSearch :: (HTTP.HTTP :> es, IOE :> es) => ToolConfig -> Text -> Int -> Bool -> Eff es ([Aeson.Value], [Text])
 webSearch cfg query maxResults includeImages =
   case cfg.webSearchApi of
     WebSearchTavily ->
-      case cfg.tavilyApiKey of
-        Nothing -> throwIO (userError "Tavily search is not configured: set tool.web_search.tavily_api_key.")
-        Just key -> tavilySearch key query maxResults includeImages
+      tavilySearchRotating cfg query maxResults includeImages
     WebSearchBrave ->
       case cfg.braveApiKey of
         Nothing -> throwIO (userError "Brave search is not configured: set tool.web_search.brave_api_key.")
