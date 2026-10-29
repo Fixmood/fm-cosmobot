@@ -1028,6 +1028,11 @@ hasExplicitLibraryIntent context =
       -- through the gate entirely and the tools were hidden from the model.
       , "淼文", "水文", "易文", "普文", "难文", "虐文"
       , "淼档", "水档", "易档", "普档", "难档", "虐档"
+      -- 2026-10-30：所有者问「能不能指定发哪篇文章」时，这句话里没有上面任何一个词，
+      -- 于是库文工具被闸门挡住，FM 只能回答「不能按篇名指定」—— 而能力其实一直是有的
+      -- （fm_library_start 的 query 参数就是标题/主题关键词）。把「指定」相关的说法收进来。
+      , "按篇名", "按标题", "指定篇", "指定文章", "指定那篇", "篇名", "标题是"
+      , "那篇文", "那篇文章", "这篇文", "发那篇", "发这篇"
       ]
     isDifficultyCommand input =
       any (`Text.isInfixOf` input)
