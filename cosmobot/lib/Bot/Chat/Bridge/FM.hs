@@ -64,7 +64,7 @@ module Bot.Chat.Bridge.FM
   , loadReplyPrefix
   , writeReplyPrefix
   , defaultReplyPrefix
-  , replyPrefix  ) where
+  , replyPrefixFor  ) where
 
 import Bot.Core.Message
 import qualified Bot.Core.ReplyBody as ReplyBody
@@ -241,8 +241,13 @@ writeReplyPrefix prefix = do
   IORef.writeIORef replyPrefixRef prefix
   TextIO.writeFile replyPrefixPath (if Text.null prefix then "<none>" else prefix)
 
-replyPrefix :: Text
-replyPrefix = unsafePerformIO (IORef.readIORef replyPrefixRef)
+-- 注意：这里**不能**写成 replyPrefix :: Text 的顶层纯值。
+-- 顶层纯值是 CAF，会被求值一次并永久缓存 —— 2026-10-29 实测：工具把前缀改成
+-- 空之后，文件确实变成了 <none>，但回复仍然带着旧前缀，就是这个原因。
+-- 加一个哑参数让它变成函数，每次调用都重新读 IORef。
+{-# NOINLINE replyPrefixFor #-}
+replyPrefixFor :: () -> Text
+replyPrefixFor () = unsafePerformIO (IORef.readIORef replyPrefixRef)
 
 takeoverStatePath :: FilePath
 takeoverStatePath = "/data/fm-takeover.json"
@@ -493,7 +498,7 @@ fmReplyRelayBodyForRequestWith triggers request body =
       prefixedText =
         if Text.null (Text.strip text)
           then ""
-          else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else replyPrefix <> constrainedText
+          else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else replyPrefixFor () <> constrainedText
   in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
 
 -- | First-word triggers recorded in a chat's memory, e.g. the roster line
@@ -691,7 +696,7 @@ fmReplyBody :: Text -> Text
 fmReplyBody body =
   let (markedBare, unmarkedBody) = stripBareReplyMarker body
       cleanBody = stripReplyPrefix unmarkedBody
-  in if isTypingPracticeBody cleanBody || markedBare then cleanBody else replyPrefix <> cleanBody
+  in if isTypingPracticeBody cleanBody || markedBare then cleanBody else replyPrefixFor () <> cleanBody
 
 isTypingPracticeBody :: Text -> Bool
 isTypingPracticeBody body =

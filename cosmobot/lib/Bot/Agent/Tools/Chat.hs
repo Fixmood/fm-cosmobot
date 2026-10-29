@@ -233,7 +233,7 @@ replyPrefixTool =
         \action requestedText -> do
           let normalized = Text.toLower (Text.strip action)
           case normalized of
-            "show" -> pure (toolText (describePrefix FMBridge.replyPrefix))
+            "show" -> pure (toolText (describePrefix (FMBridge.replyPrefixFor ())))
             "off" -> do
               liftIO (FMBridge.writeReplyPrefix "")
               pure (toolText "已关闭前缀：从现在起回复不带任何前缀。")
