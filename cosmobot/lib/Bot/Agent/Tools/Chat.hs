@@ -11,6 +11,7 @@ module Bot.Agent.Tools.Chat
   , sendReplyTool
   , sendFileTool
   , mentionUserTool
+  , replyPrefixTool
   , pokeUserTool
   , likeUserTool
   , senderMemberInfoTool
@@ -214,6 +215,44 @@ mentionUserTool =
 --
 -- 戳本身**没有文字**，所以不用额外设计「戳 + 一句话」：模型调用这个工具时，
 -- 它自己那条回复就是对方看到的话。
+-- | 控制回复前缀。所有者 2026-10-29：要自己决定带不带「😻 FM：」。
+--   改动立刻生效（IORef），同时写到 /data/reply-prefix.txt，重启后保持。
+replyPrefixTool :: IOE :> es => Tool (Eff es)
+replyPrefixTool =
+  tagged [chatTag]
+    . allowWhen superuserOnly
+    . withDescription
+      "Control the prefix FM puts in front of its replies (default: 😻 FM：). \
+      \Actions: show, set (needs text), off (no prefix at all), reset (default). \
+      \Changes take effect immediately. Use this when the owner asks to stop \
+      \using the prefix, to change it, or to bring it back."
+    $ tool "reply_prefix"
+        ( requiredText "action" "One of: show, set, off, reset."
+        , optionalText "text" "New prefix text; required when action=set."
+        )
+        \action requestedText -> do
+          let normalized = Text.toLower (Text.strip action)
+          case normalized of
+            "show" -> pure (toolText (describePrefix FMBridge.replyPrefix))
+            "off" -> do
+              liftIO (FMBridge.writeReplyPrefix "")
+              pure (toolText "已关闭前缀：从现在起回复不带任何前缀。")
+            "reset" -> do
+              liftIO (FMBridge.writeReplyPrefix FMBridge.defaultReplyPrefix)
+              pure (toolText ("已恢复默认前缀：" <> FMBridge.defaultReplyPrefix))
+            "set" ->
+              case Text.strip <$> requestedText of
+                Just value
+                  | not (Text.null value) -> do
+                      liftIO (FMBridge.writeReplyPrefix value)
+                      pure (toolText ("前缀已改为：" <> value))
+                _ -> pure (argumentFailure "action=set 需要 text 参数。")
+            _ -> pure (argumentFailure "action 只能是 show / set / off / reset。")
+  where
+    describePrefix prefix
+      | Text.null prefix = "当前不带前缀。"
+      | otherwise = "当前前缀：" <> prefix <> "（例：" <> prefix <> "今天群里谁最活跃）"
+
 pokeUserTool :: Chat.Chat :> es => Tool (Eff es)
 pokeUserTool =
   tagged [chatTag]

@@ -194,6 +194,7 @@ defaultToolsWith extraTools = tools
       , sendFileTool
       , sendMediaTool
       , mentionUserTool
+      , replyPrefixTool
       , pokeUserTool
       , likeUserTool
       , senderMemberInfoTool

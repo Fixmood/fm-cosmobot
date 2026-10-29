@@ -61,7 +61,10 @@ module Bot.Chat.Bridge.FM
   , qqRelayTarget
   , bridgeDeliveryMessageId
   , bridgeDeliveryTargets
-  ) where
+  , loadReplyPrefix
+  , writeReplyPrefix
+  , defaultReplyPrefix
+  , replyPrefix  ) where
 
 import Bot.Core.Message
 import qualified Bot.Core.ReplyBody as ReplyBody
@@ -73,7 +76,8 @@ import Data.Char (isSpace)
 import qualified Data.IORef as IORef
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
-import System.Directory (createDirectoryIfMissing, renameFile)
+import qualified Data.Text.IO as TextIO
+import System.Directory (createDirectoryIfMissing, doesFileExist, renameFile)
 import System.IO.Error (catchIOError)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -201,6 +205,44 @@ instance Aeson.FromJSON FMTakeoverState where
     <$> o Aeson..:? "enabled" Aeson..!= False
     <*> o Aeson..: "source"
     <*> o Aeson..: "destination"
+
+-- | 回复前缀。所有者 2026-10-29 要求「自己控制带不带前缀」。
+--   存成 IORef：工具改了立即生效，不用重启。
+--   启动时从 /data/reply-prefix.txt 读；文件写 "<none>" 或留空 = 不带前缀。
+--   为什么用 unsafePerformIO：前缀加在纯函数 fmReplyBody 里，它有 13 个调用点，
+--   把配置穿下去要改十几处；一个全局可变值把改动关在这几十行内。
+{-# NOINLINE replyPrefixRef #-}
+replyPrefixRef :: IORef.IORef Text
+-- 首次求值时就从 /data/reply-prefix.txt 读 —— 不需要在启动流程里加钩子。
+replyPrefixRef = unsafePerformIO (readReplyPrefix >>= IORef.newIORef)
+
+defaultReplyPrefix :: Text
+defaultReplyPrefix = "😻 FM："
+
+replyPrefixPath :: FilePath
+replyPrefixPath = "/data/reply-prefix.txt"
+
+readReplyPrefix :: IO Text
+readReplyPrefix = do
+  exists <- doesFileExist replyPrefixPath
+  if not exists
+    then pure defaultReplyPrefix
+    else do
+      raw <- TextIO.readFile replyPrefixPath
+      let cleaned = Text.strip raw
+      -- "<none>" 和空文件都表示不要前缀
+      pure (if cleaned == "<none>" || Text.null cleaned then "" else cleaned)
+
+loadReplyPrefix :: IO ()
+loadReplyPrefix = readReplyPrefix >>= IORef.writeIORef replyPrefixRef
+
+writeReplyPrefix :: Text -> IO ()
+writeReplyPrefix prefix = do
+  IORef.writeIORef replyPrefixRef prefix
+  TextIO.writeFile replyPrefixPath (if Text.null prefix then "<none>" else prefix)
+
+replyPrefix :: Text
+replyPrefix = unsafePerformIO (IORef.readIORef replyPrefixRef)
 
 takeoverStatePath :: FilePath
 takeoverStatePath = "/data/fm-takeover.json"
@@ -451,7 +493,7 @@ fmReplyRelayBodyForRequestWith triggers request body =
       prefixedText =
         if Text.null (Text.strip text)
           then ""
-          else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else "😻 FM：" <> constrainedText
+          else if isTypingPracticeBody constrainedText || suppressPrefix then constrainedText else replyPrefix <> constrainedText
   in ReplyBody.replyContentToBody ReplyBody.ReplyContent{text = prefixedText, images}
 
 -- | First-word triggers recorded in a chat's memory, e.g. the roster line
@@ -649,7 +691,7 @@ fmReplyBody :: Text -> Text
 fmReplyBody body =
   let (markedBare, unmarkedBody) = stripBareReplyMarker body
       cleanBody = stripReplyPrefix unmarkedBody
-  in if isTypingPracticeBody cleanBody || markedBare then cleanBody else "😻 FM：" <> cleanBody
+  in if isTypingPracticeBody cleanBody || markedBare then cleanBody else replyPrefix <> cleanBody
 
 isTypingPracticeBody :: Text -> Bool
 isTypingPracticeBody body =
