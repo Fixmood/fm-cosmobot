@@ -236,7 +236,9 @@ replyPrefixTool =
             "show" -> pure (toolText (describePrefix (FMBridge.replyPrefixFor ())))
             "off" -> do
               liftIO (FMBridge.writeReplyPrefix "")
-              pure (toolText "已关闭前缀：从现在起回复不带任何前缀。")
+              -- 诚实说明：写文件是可靠的，但纯函数里的全局状态会被 GHC 折叠，
+              -- 运行时改不进去（2026-10-29 验证过两次），所以必须重启才生效。
+              pure (toolText "已关闭前缀，已写入配置文件。注意：需要重启 FM 进程才真正生效（约 10 秒）。")
             "reset" -> do
               liftIO (FMBridge.writeReplyPrefix FMBridge.defaultReplyPrefix)
               pure (toolText ("已恢复默认前缀：" <> FMBridge.defaultReplyPrefix))
