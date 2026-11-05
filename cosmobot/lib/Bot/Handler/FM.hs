@@ -23,10 +23,12 @@ import qualified Data.Aeson.Key as AesonKey
 import qualified Data.Aeson.Types as AesonTypes
 import Data.Char (isDigit, isSpace)
 import qualified Data.Text as Text
+import qualified System.Directory as Directory
+import qualified Data.Text.IO as TextIO
 import Network.HTTP.Req
 
 fmHandlers
-  :: (HTTP.HTTP :> es, Chat.Chat :> es, LLM.LLM :> es)
+  :: (HTTP.HTTP :> es, Chat.Chat :> es, LLM.LLM :> es, IOE :> es)
   => [RouteHandler es]
 fmHandlers =
   [ modelRecoveryHandler
@@ -132,7 +134,7 @@ recallDirectHandler =
                 <> " 条撤回失败，可能已经超过 QQ 的两分钟撤回时限。"
 
 libraryStopHandler
-  :: (HTTP.HTTP :> es, Chat.Chat :> es)
+  :: (HTTP.HTTP :> es, Chat.Chat :> es, IOE :> es)
   => RouteHandler es
 libraryStopHandler =
   stopOn (matching isLibraryStop) \message _ -> do
@@ -161,11 +163,50 @@ libraryStopHandler =
         void $ postLibraryAction "session" "recalled" (directLibraryPayload message
           [ "message_ids" Aeson..= [messageId]
           ])
-    let finalReply = case recalled of
-          Just True -> "发文已停止，最近一段也已撤回。"
-          Just False -> "发文已停止，但最近一段撤回失败。"
-          Nothing -> reply
-    sendStandalone message finalReply
+    if status /= "stopped"
+      then do
+        -- 库文没有进行中的发文时再问番茄专区：所有者 2026-11-06 要求
+        -- 「fm 停」对番茄也要停掉并撤回最近一段，跟库文一个行为。
+        novelResponse <- postNovelStop (Aeson.object
+          [ "platform" Aeson..= chatPlatformKey message.platform
+          , "chat_id" Aeson..= maybe ("" :: Text) show message.chatId
+          , "requester_id" Aeson..= fromMaybe "" message.senderId
+          , "requester_name" Aeson..= fromMaybe "" message.senderUsername
+          ])
+        let novelStatusText = fromMaybe ("idle" :: Text) $ AesonTypes.parseMaybe
+              (Aeson.withObject "novel stop" \o -> o Aeson..:? "status" Aeson..!= "")
+              novelResponse
+            novelReply = fromMaybe ("当前会话没有正在进行的番茄小说。" :: Text) $ AesonTypes.parseMaybe
+              (Aeson.withObject "novel stop" \o -> o Aeson..:? "message" Aeson..!= "")
+              novelResponse
+        if novelStatusText /= "stopped"
+          then sendStandalone message reply
+          else do
+            let lastPath = "/data/novel-last-" <> maybe "nochat" show message.chatId <> ".txt"
+            exists <- liftIO (Directory.doesFileExist lastPath)
+            recalledNovel <- if exists
+              then do
+                rawId <- liftIO (TextIO.readFile lastPath)
+                if Text.null (Text.strip rawId)
+                  then pure Nothing
+                  else Just <$> Chat.deleteMessage message (textMessageId (Text.strip rawId))
+              else pure Nothing
+            sendStandalone message $ case recalledNovel of
+              Just True -> novelReply <> " 最近一段也已撤回。"
+              Just False -> novelReply <> " 但最近一段撤回失败（可能超过 QQ 两分钟时限）。"
+              Nothing -> novelReply
+      else sendStandalone message $ case recalled of
+        Just True -> "发文已停止，最近一段也已撤回。"
+        Just False -> "发文已停止，但最近一段撤回失败。"
+        Nothing -> reply
+
+-- | 番茄停止：POST /novel/stop
+postNovelStop :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
+postNovelStop payload = do
+  response <- HTTP.runReq $
+    req POST (http "172.20.0.4" /: "novel" /: "stop")
+      (ReqBodyJson payload) jsonResponse (port 8077)
+  pure (responseBody response :: Aeson.Value)
 
 aiContestQuickHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es)
