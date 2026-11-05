@@ -39,6 +39,7 @@ module Bot.Agent.Tools.FMDomain
 import Bot.Agent.Tool
 import Bot.Agent.Tools.Common
   ( jsonText
+  , optionalBoolean
   , fieldBoolean
   , optionalInt
   , optionalText
@@ -65,6 +66,7 @@ import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.List as List
 import qualified Data.Text as Text
+import qualified Data.Text.IO as TextIO
 import qualified System.Directory as Directory
 import Network.HTTP.Req
 
@@ -328,8 +330,8 @@ standaloneLibraryMessage message =
 --
 -- 书不在库里时由 domain 返回 not_found，工具把「让 fix 哥加上」原样交给模型，
 -- 不要自己编一个「系统不支持」的说法。
-novelReadingPayload :: Context -> Text -> Maybe Int -> Maybe Int -> Aeson.Value
-novelReadingPayload context book maybeChapter maybeLength =
+novelReadingPayload :: Context -> Text -> Maybe Int -> Maybe Int -> Bool -> Aeson.Value
+novelReadingPayload context book maybeChapter maybeLength restart =
   Aeson.object $
     [ "platform" Aeson..= chatPlatformKey context.message.platform
     , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
@@ -339,6 +341,18 @@ novelReadingPayload context book maybeChapter maybeLength =
     ]
       <> maybe [] (\chapter -> ["chapter" Aeson..= chapter]) maybeChapter
       <> maybe [] (\len -> ["length" Aeson..= len]) maybeLength
+      <> (if restart then ["restart" Aeson..= True] else [])
+
+-- | 记住「这个会话上一次发的番茄段落的 message id」，重开时要撤它。
+readNovelLastId :: FilePath -> IO (Maybe Text)
+readNovelLastId path = do
+  exists <- Directory.doesFileExist path
+  if not exists then pure Nothing else Just <$> TextIO.readFile path
+
+writeNovelLastId :: FilePath -> Text -> IO ()
+writeNovelLastId path value = do
+  Directory.createDirectoryIfMissing True "/data"
+  TextIO.writeFile path value
 
 postNovel :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postNovel action payload = do
@@ -359,6 +373,13 @@ novelMessage response =
   fromMaybe "番茄专区请求失败。" $
     AesonTypes.parseMaybe
       (Aeson.withObject "novel response" \o -> o Aeson..:? "message" Aeson..!= "")
+      response
+
+novelFieldBool :: Text -> Aeson.Value -> Bool
+novelFieldBool key response =
+  fromMaybe False $
+    AesonTypes.parseMaybe
+      (Aeson.withObject "novel response" \o -> o Aeson..:? "restarted" Aeson..!= False)
       response
 
 novelChapterText :: Aeson.Value -> Text
@@ -421,7 +442,7 @@ typingStatsTool =
                   message = novelMessage response
               pure (toolText message)
 
-fanqieReadingTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fanqieReadingTool :: (Chat.Chat :> es, HTTP.HTTP :> es, IOE :> es) => Tool (Eff es)
 fanqieReadingTool =
   withDescription
     "番茄小说专区：发网文给用户做**打字跟打练习**（用户说「打番茄小说」「打XX书」就是它）。\n\
@@ -442,23 +463,35 @@ fanqieReadingTool =
         , optionalText "book" "书名关键词，start 和 stats 用。"
         , optionalInt "chapter" "书的章号，jump 用。"
         , optionalInt "length" "每段多少字（1~1400）。用户说「200字一段」时传它；不传就沿用上次的。"
+        , optionalBoolean "restart" "用户说「从开头发 / 重新开始这一章」时传 true。"
         )
-        \rawAction book maybeChapter maybeLength -> do
+        \rawAction book maybeChapter maybeLength maybeRestart -> do
           context <- askToolContext
           let action = Text.toLower (Text.strip rawAction)
           if action `notElem` ["start", "continue", "next", "jump", "progress", "stats"]
             then pure (toolText "action 只能是 start / continue / next / jump / progress / stats。")
             else do
-              response <- postNovel action (novelReadingPayload context (fromMaybe "" book) maybeChapter maybeLength)
+              let chatKeyText = maybe "nopchat" (Text.pack . show) context.message.chatId
+                  lastPath = "/data/novel-last-" <> Text.unpack chatKeyText <> ".txt"
+              response <- postNovel action (novelReadingPayload context (fromMaybe "" book) maybeChapter maybeLength (fromMaybe False maybeRestart))
               let status = novelStatus response
                   message = novelMessage response
+                  restarted = novelFieldBool "restarted" response
               case status of
                 "segment" -> do
+                  -- 重开时先把上一条已发的段落撤掉（用户改段长/要求从开头来时）
+                  when restarted $ do
+                    previous <- liftIO (readNovelLastId lastPath)
+                    case previous of
+                      Just oldId -> void (Chat.deleteMessage context.message (textMessageId oldId))
+                      Nothing -> pure ()
                   sent <- Chat.replyTo (standaloneLibraryMessage context.message) message
                   case rights sent of
-                    _ : _ ->
+                    sentIdRaw : _ -> do
+                      liftIO (writeNovelLastId lastPath (messageIdText sentIdRaw))
                       pure . toolText $
-                        "已发到当前会话（第" <> novelChapterText response
+                        (if restarted then "已撤回上一段并从本章开头重发。 " else "")
+                          <> "已发到当前会话（第" <> novelChapterText response
                           <> "章）。不要复述正文，最多回一句短的。"
                     [] ->
                       pure . toolText $
