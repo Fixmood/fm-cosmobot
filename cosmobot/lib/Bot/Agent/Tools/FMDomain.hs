@@ -328,8 +328,8 @@ standaloneLibraryMessage message =
 --
 -- 书不在库里时由 domain 返回 not_found，工具把「让 fix 哥加上」原样交给模型，
 -- 不要自己编一个「系统不支持」的说法。
-novelReadingPayload :: Context -> Text -> Maybe Int -> Aeson.Value
-novelReadingPayload context book maybeChapter =
+novelReadingPayload :: Context -> Text -> Maybe Int -> Maybe Int -> Aeson.Value
+novelReadingPayload context book maybeChapter maybeLength =
   Aeson.object $
     [ "platform" Aeson..= chatPlatformKey context.message.platform
     , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
@@ -338,6 +338,7 @@ novelReadingPayload context book maybeChapter =
     , "book" Aeson..= book
     ]
       <> maybe [] (\chapter -> ["chapter" Aeson..= chapter]) maybeChapter
+      <> maybe [] (\len -> ["length" Aeson..= len]) maybeLength
 
 postNovel :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postNovel action payload = do
@@ -434,19 +435,21 @@ fanqieReadingTool =
     \· jump    —— 跳到第 N 章，需要 chapter（书的章号）。\n\
     \· progress —— 我打到哪了。\n\
     \· stats   —— 这本书我的均速/准确率。\n\
+    \用户说「每段200字」就传 length=200，之后会记住这个偏好。\n\
     \工具自己会把正文发到当前会话；最终回复最多一句确认，绝不重复正文。"
     $ tool "fanqie_reading"
         ( requiredText "action" "One of: start, continue, next, jump, progress, stats."
         , optionalText "book" "书名关键词，start 和 stats 用。"
         , optionalInt "chapter" "书的章号，jump 用。"
+        , optionalInt "length" "每段多少字（1~1400）。用户说「200字一段」时传它；不传就沿用上次的。"
         )
-        \rawAction book maybeChapter -> do
+        \rawAction book maybeChapter maybeLength -> do
           context <- askToolContext
           let action = Text.toLower (Text.strip rawAction)
           if action `notElem` ["start", "continue", "next", "jump", "progress", "stats"]
             then pure (toolText "action 只能是 start / continue / next / jump / progress / stats。")
             else do
-              response <- postNovel action (novelReadingPayload context (fromMaybe "" book) maybeChapter)
+              response <- postNovel action (novelReadingPayload context (fromMaybe "" book) maybeChapter maybeLength)
               let status = novelStatus response
                   message = novelMessage response
               case status of
