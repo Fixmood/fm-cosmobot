@@ -194,6 +194,10 @@ defaultToolsWith extraTools = tools
       , sendFileTool
       , sendMediaTool
       , mentionUserTool
+      , downloadNovelTool
+      , novelStatusTool
+      , selfMessagesTool
+      , recallSelfMessagesTool
       , replyPrefixTool
       , pokeUserTool
       , likeUserTool

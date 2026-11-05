@@ -7,6 +7,10 @@ Stability   : experimental
 module Bot.Agent.Tools.Chat
   ( queryChatLogTool
   , queryCurrentSenderChatLogTool
+  , downloadNovelTool
+  , novelStatusTool
+  , selfMessagesTool
+  , recallSelfMessagesTool
   , recallRecentSelfMessagesTool
   , sendReplyTool
   , sendFileTool
@@ -35,8 +39,11 @@ import Bot.Prelude
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.Types as AesonTypes
+import System.Directory (createDirectoryIfMissing, doesFileExist)
 import qualified Data.Text as Text
-import Data.Time (TimeZone (..), UTCTime, defaultTimeLocale, formatTime, utcToLocalTime)
+import qualified Data.Text.IO as TextIO
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import Data.Time (TimeZone (..), UTCTime, addUTCTime, defaultTimeLocale, formatTime, getCurrentTime, utcToLocalTime)
 
 queryChatLogTool :: ChatLog.ChatLog :> es => Tool (Eff es)
 queryChatLogTool =
@@ -97,6 +104,159 @@ queryCurrentSenderChatLogTool =
               Right timeRange -> do
                 entries <- ChatLog.queryCurrentSenderChatLog context.message scope keywords limit timeRange
                 pure (toolText (jsonText (map chatLogToolEntry entries)))
+
+-- | 列出 FM 自己最近发过的消息，让它可以判断「该撤哪条」。
+--
+-- 2026-10-30：所有者反馈「撤回只会撤最近一条」。根因之一是 FM 根本看不到
+-- 自己发过什么；chat_log 里其实存了 7000 多条自己发的消息（recordSelfMessage），
+-- 只是从来没有工具把它读出来给模型看。
+selfMessagesTool :: (ChatLog.ChatLog :> es, IOE :> es) => Tool (Eff es)
+selfMessagesTool =
+  tagged [chatTag]
+    . allowWhen superuserOnly
+    . withDescription
+      "List FM's OWN recent messages in the current chat, newest first, with the message id, \
+      \time, text and whether it carried images. Use this whenever the owner asks which \
+      \messages you sent, or asks you to recall something specific (撤回那篇赛文 / 撤回刚才的图): \
+      \look here first to identify the right messages, then call recall_self_messages with \
+      \the ids. Never claim you cannot see your own messages."
+    $ tool "self_messages"
+        ( optionalInt "limit" "How many of FM's own recent messages to list, 1 to 50. Defaults to 20."
+        , optionalInt "since_minutes" "Only include messages from the last N minutes. Defaults to 180."
+        )
+        \requestedLimit requestedMinutes -> do
+          context <- askToolContext
+          let limit = max 1 (min 50 (fromMaybe 20 requestedLimit))
+              minutes = max 1 (min 1440 (fromMaybe 180 requestedMinutes))
+          now <- liftIO getCurrentTime
+          let since = addUTCTime (fromIntegral (negate minutes * 60)) now
+          case chatLogTimeRange (Just since) Nothing of
+            Left err -> pure (argumentFailure err)
+            Right timeRange -> do
+              entries <- ChatLog.queryChat context.message Nothing limit True timeRange
+              let mine = filter (.isBot) entries
+                  rows =
+                    [ Aeson.object
+                        [ "message_id" Aeson..= maybe "" messageIdText entry.messageId
+                        , "time" Aeson..= maybe "" (Text.pack . show) entry.recordedAt
+                        , "text" Aeson..= entry.text
+                        , "images" Aeson..= length entry.imageUrls
+                        ]
+                    | entry <- mine
+                    ]
+              pure . toolText $
+                if null rows
+                  then "最近 " <> Text.pack (show minutes) <> " 分钟里没有我发的消息。"
+                  else jsonText rows
+
+-- | 按 message_id 撤回 FM 自己发过的消息（可以一次撤多条）。
+recallSelfMessagesTool :: Chat.Chat :> es => Tool (Eff es)
+recallSelfMessagesTool =
+  tagged [chatTag]
+    . noisy
+    . allowWhen superuserOnly
+    . withDescription
+      "Recall specific messages that FM itself sent, by message id. Get the ids from \
+      \self_messages first, pick the ones the owner actually means, and pass them here. \
+      \This is how you recall 那篇赛文 / 刚才那张图 / 我说错的那一句 instead of only the \
+      \newest message. IDs older than QQ's two-minute window will fail; report which failed \
+      \and why instead of pretending it worked."
+    $ tool "recall_self_messages"
+        ( requiredArgument (fieldTextArray "message_ids" "Message ids to recall, from self_messages.")
+        )
+        \rawIds -> do
+          context <- askToolContext
+          let ids = filter (not . Text.null) (map Text.strip rawIds)
+          if null ids
+            then pure (argumentFailure "message_ids 不能为空。")
+            else do
+              results <- traverse (\rawId -> do
+                let messageId = textMessageId rawId
+                ok <- Chat.deleteMessage context.message messageId
+                pure (rawId, ok)) ids
+              let okIds = [i | (i, True) <- results]
+                  badIds = [i | (i, False) <- results]
+                  summary =
+                    "撤回完成：成功 " <> Text.pack (show (length okIds))
+                      <> " 条，失败 " <> Text.pack (show (length badIds)) <> " 条。"
+                      <> if null badIds
+                        then ""
+                        else " 失败的多半是超过 QQ 两分钟时限：" <> Text.intercalate "、" badIds
+              pure (toolText summary)
+
+-- | 排队下载一本番茄小说。所有者 2026-11-05：想在 QQ 里说一句就让 FM 自己下。
+--
+-- 不在工具里直接下载：一本 300+ 章要几分钟，会把工具调用卡住。
+-- 这里只把请求写成纯文本任务文件，交给宿主机的 cron 去消费
+-- （容器的 /data 就是宿主机的 /opt/fm-cosmobot/runtime，同一个目录）。
+--
+-- 任务文件格式（一行一个字段，worker 用 splitOn "=" 读）：
+--     job_id=novel-<毫秒时间戳>
+--     book=<链接或 bookId>
+--     chat_kind=group|private
+--     chat_id=<QQ 号>
+--     requester=<发起人 QQ 号>
+downloadNovelTool :: IOE :> es => Tool (Eff es)
+downloadNovelTool =
+  tagged [chatTag]
+    . allowWhen superuserOnly
+    . withDescription
+      "Queue a novel from fanqienovel.com to be downloaded into FM's typing library. \
+      \Pass the book URL or its numeric book id. The download runs in the background and \
+      \takes a few minutes; tell the owner it has started and that they can ask \
+      \novel_status for progress. Do not claim the text is ready immediately."
+    $ tool "download_novel"
+        ( requiredText "book" "fanqienovel.com book URL or numeric book id."
+        )
+        \book -> do
+          context <- askToolContext
+          now <- liftIO getCurrentTime
+          let stamp = show (floor (utcTimeToPOSIXSeconds now * 1000) :: Integer)
+              jobId = "novel-" <> stamp
+              kindText = if context.message.kind == ChatGroup then "group" else "private"
+              chatIdText = maybe "" (Text.pack . show) context.message.chatId
+              requesterText = fromMaybe "" context.message.senderId
+              body =
+                Text.unlines
+                  [ "job_id=" <> jobId
+                  , "book=" <> Text.strip book
+                  , "chat_kind=" <> kindText
+                  , "chat_id=" <> chatIdText
+                  , "requester=" <> requesterText
+                  ]
+          liftIO (createDirectoryIfMissing True "/data/novel-jobs")
+          liftIO (TextIO.writeFile ("/data/novel-jobs/" <> Text.unpack jobId <> ".txt") body)
+          pure . toolText $
+            "已经排队：" <> Text.strip book
+              <> "（任务号 " <> jobId <> "）\n"
+              <> "后台下载中，一般几分钟；下完我会主动告诉你。\n"
+              <> "想查进度可以说：小说下好了吗"
+
+-- | 查看小说下载进度。worker 会把状态追加到 /data/novel-status.txt。
+novelStatusTool :: IOE :> es => Tool (Eff es)
+novelStatusTool =
+  tagged [chatTag]
+    . allowWhen superuserOnly
+    . withDescription
+      "Show recent novel download activity: queued, downloading, done with chapter count, \
+      \or failed. Use when the owner asks 小说下好了吗 or 下载到哪了."
+    $ tool "novel_status" noArguments do
+        exists <- liftIO (doesFileExist novelStatusPath)
+        if not exists
+          then pure (toolText "还没有任何小说下载任务。")
+          else do
+            raw <- liftIO (TextIO.readFile novelStatusPath)
+            let recent = takeLast 12 (filter (not . Text.null) (Text.lines (Text.strip raw)))
+            pure . toolText $
+              if null recent
+                then "还没有任何小说下载任务。"
+                else Text.unlines recent
+
+novelStatusPath :: FilePath
+novelStatusPath = "/data/novel-status.txt"
+
+takeLast :: Int -> [a] -> [a]
+takeLast count items = drop (max 0 (length items - count)) items
 
 recallRecentSelfMessagesTool :: Chat.Chat :> es => Tool (Eff es)
 recallRecentSelfMessagesTool =
