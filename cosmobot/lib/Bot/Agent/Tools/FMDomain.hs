@@ -9,6 +9,8 @@ module Bot.Agent.Tools.FMDomain
   , fmLibraryStopTool
   , fmLibraryRecallRecentTool
   , fmLibraryStatsTool
+  , typingStatsTool
+  , fanqieReadingTool
   , fmRecallQueryTool
   , fmScoreQueryTool
   , fmGroupSetOnlineTool
@@ -314,6 +316,151 @@ standaloneLibraryMessage message =
     , replyToMessageId = Nothing
     , raw = Aeson.Null
     }
+
+-- | 番茄小说专区（2026-11-05）。
+--
+-- 所有者要的用法：
+--   fm 打番茄小说斩神      → action=start book=斩神
+--   fm 继续                → action=continue
+--   fm 跳到第 100 章       → action=jump chapter=100
+--   fm 我打到哪了          → action=progress
+--   fm 这本书均速多少      → action=stats
+--
+-- 书不在库里时由 domain 返回 not_found，工具把「让 fix 哥加上」原样交给模型，
+-- 不要自己编一个「系统不支持」的说法。
+novelReadingPayload :: Context -> Text -> Maybe Int -> Aeson.Value
+novelReadingPayload context book maybeChapter =
+  Aeson.object $
+    [ "platform" Aeson..= chatPlatformKey context.message.platform
+    , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
+    , "requester_id" Aeson..= fromMaybe "" context.message.senderId
+    , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
+    , "book" Aeson..= book
+    ]
+      <> maybe [] (\chapter -> ["chapter" Aeson..= chapter]) maybeChapter
+
+postNovel :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
+postNovel action payload = do
+  response <- HTTP.runReq $
+    req POST (http "172.20.0.4" /: "novel" /: action)
+      (ReqBodyJson payload) jsonResponse (port 8077)
+  pure (responseBody response :: Aeson.Value)
+
+novelStatus :: Aeson.Value -> Text
+novelStatus response =
+  fromMaybe "error" $
+    AesonTypes.parseMaybe
+      (Aeson.withObject "novel response" \o -> o Aeson..:? "status" Aeson..!= "")
+      response
+
+novelMessage :: Aeson.Value -> Text
+novelMessage response =
+  fromMaybe "番茄专区请求失败。" $
+    AesonTypes.parseMaybe
+      (Aeson.withObject "novel response" \o -> o Aeson..:? "message" Aeson..!= "")
+      response
+
+novelChapterText :: Aeson.Value -> Text
+novelChapterText response =
+  fromMaybe "" $
+    AesonTypes.parseMaybe
+      (Aeson.withObject "novel response" \o -> o Aeson..:? "chapter_index" Aeson..!= "")
+      response
+
+-- | 查打字成绩（2026-11-06）。
+--
+-- 所有用户的成绩都已入库（全字段 + 原始文本），这里把常见问法封装成四个 scope。
+-- 所有者原话：「成绩不是专门用来只记均速的，是保留全部，可以用来分析」——
+-- 所以除了均速，还报击键、码长、打词、键准和趋势，够回答大多数分析问题。
+typingStatsPayload :: Context -> Text -> Int -> Text -> Int -> Aeson.Value
+typingStatsPayload context scope days book limit =
+  Aeson.object
+    [ "platform" Aeson..= chatPlatformKey context.message.platform
+    , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
+    , "requester_id" Aeson..= fromMaybe "" context.message.senderId
+    , "requester_name" Aeson..= fromMaybe "" context.message.senderUsername
+    , "scope" Aeson..= scope
+    , "days" Aeson..= days
+    , "book" Aeson..= book
+    , "limit" Aeson..= limit
+    ]
+
+postTypingStats :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
+postTypingStats payload = do
+  response <- HTTP.runReq $
+    req POST (http "172.20.0.4" /: "typing" /: "stats")
+      (ReqBodyJson payload) jsonResponse (port 8077)
+  pure (responseBody response :: Aeson.Value)
+
+typingStatsTool :: HTTP.HTTP :> es => Tool (Eff es)
+typingStatsTool =
+  withDescription
+    "查打字成绩与趋势。随便问「我这周打得怎样」「我均速多少」「最近怎么样」\
+    \「群里谁最快」「这本书我打得怎么样」都用它。\n\
+    \scope:\n\
+    \· me      —— 我的成绩汇总（均速/最快/键准/击键/码长/打词/累计字数）。可给 days。\n\
+    \· trend   —— 按天的趋势，默认 14 天。\n\
+    \· ranking —— 群里均速排行（默认最近 7 天，至少 50 段才上榜）。\n\
+    \· book    —— 某本书我的成绩，需要 book（书名关键词）。\n\
+    \返回的是可以直接念的中文，不要自己再算一遍。"
+    $ tool "typing_stats"
+        ( requiredText "scope" "One of: me, trend, ranking, book."
+        , optionalInt "days" "时间范围（天）。me 默认全部，trend 默认 14，ranking 默认 7。"
+        , optionalText "book" "书名关键词，scope=book 时必填。"
+        )
+        \rawScope maybeDays book -> do
+          context <- askToolContext
+          let scope = Text.toLower (Text.strip rawScope)
+              days = fromMaybe 0 maybeDays
+          if scope `notElem` ["me", "trend", "ranking", "book"]
+            then pure (toolText "scope 只能是 me / trend / ranking / book。")
+            else do
+              response <- postTypingStats (typingStatsPayload context scope days (fromMaybe "" book) 5)
+              let status = novelStatus response
+                  message = novelMessage response
+              pure (toolText message)
+
+fanqieReadingTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
+fanqieReadingTool =
+  withDescription
+    "番茄小说专区：发网文给用户做**打字跟打练习**（用户说「打番茄小说」「打XX书」就是它）。\n\
+    \注意：这是「发文章给用户打」，**不是下载**；书不在库里就回复「让 fix 哥加上」，\n\
+    \绝不要调用任何下载工具，也不要说什么「后台下载中」。\n\
+    \Actions:\n\
+    \· start   —— 开始/继续打某本小说。需要 book（书名或其中一段，如「斩神」）。\
+    \  书不存在的直接告诉用户「让 fix 哥加上」，不要说成系统不支持。\n\
+    \· continue —— 接着上次的进度发下一段。\n\
+    \· next    —— 下一章。\n\
+    \· jump    —— 跳到第 N 章，需要 chapter（书的章号）。\n\
+    \· progress —— 我打到哪了。\n\
+    \· stats   —— 这本书我的均速/准确率。\n\
+    \工具自己会把正文发到当前会话；最终回复最多一句确认，绝不重复正文。"
+    $ tool "fanqie_reading"
+        ( requiredText "action" "One of: start, continue, next, jump, progress, stats."
+        , optionalText "book" "书名关键词，start 和 stats 用。"
+        , optionalInt "chapter" "书的章号，jump 用。"
+        )
+        \rawAction book maybeChapter -> do
+          context <- askToolContext
+          let action = Text.toLower (Text.strip rawAction)
+          if action `notElem` ["start", "continue", "next", "jump", "progress", "stats"]
+            then pure (toolText "action 只能是 start / continue / next / jump / progress / stats。")
+            else do
+              response <- postNovel action (novelReadingPayload context (fromMaybe "" book) maybeChapter)
+              let status = novelStatus response
+                  message = novelMessage response
+              case status of
+                "segment" -> do
+                  sent <- Chat.replyTo (standaloneLibraryMessage context.message) message
+                  case rights sent of
+                    _ : _ ->
+                      pure . toolText $
+                        "已发到当前会话（第" <> novelChapterText response
+                          <> "章）。不要复述正文，最多回一句短的。"
+                    [] ->
+                      pure . toolText $
+                        "正文已生成但发送失败：" <> Text.intercalate "；" (lefts sent)
+                _ -> pure (toolText message)
 
 fmRecallQueryTool :: (HTTP.HTTP :> es, Chat.Chat :> es) => Tool (Eff es)
 fmRecallQueryTool =
