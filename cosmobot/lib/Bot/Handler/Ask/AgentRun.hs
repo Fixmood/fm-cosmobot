@@ -133,6 +133,12 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       recentContextChars = Text.length recentChatContext
       recentContextTokens = (recentContextChars + 3) `div` 4
   logInfo [i|FM ask started: platform=#{platformText} kind=#{kindText} tool_mode=#{toolMode} tools=#{length selectedTools}/#{length tools} category=#{toolCategory} context_messages=#{contextMessageCount} recent_chat_messages=#{recentContextMessages} recent_chat_chars=#{recentContextChars} recent_chat_tokens_estimate=#{recentContextTokens} compaction_threshold_ktokens=#{compactionThresholdTokens cfg `div` 1000}|]
+  -- 复杂任务：先发一句「我打算怎么做」，做完再给完整结论
+  -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
+  when (isComplexRequest input.text && not (isImageTask message)) $ do
+    plan <- quickPlan input.text
+    when (not (Text.null (Text.strip plan))) $
+      void $ Chat.replyTo outputMessage ("😻 FM：" <> Text.strip plan)
   Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
@@ -1236,3 +1242,24 @@ llmFailureMessage err =
   in if any (`Text.isInfixOf` detail) ["timeout", "timed out", "connection", "network"]
       then "这次请求没有连上模型服务，我已经停止等待了。请稍后再试一次。"
       else "这次处理没有成功完成。错误已记录，换个说法重试即可。"
+
+
+-- | 复杂请求判定：需要规划/分析/对比的才发计划预告，闲聊和查询不发。
+isComplexRequest :: Text -> Bool
+isComplexRequest text =
+  let compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) (Text.toCaseFold text)
+  in any (`Text.isInfixOf` compact)
+       [ "分析", "对比", "比较", "计划", "方案", "规划", "总结", "为什么", "值不值"
+       , "建议", "优化", "设计", "帮我想", "怎么写", "怎么做", "评价", "进步"
+       , "退步", "弱在哪", "强在哪", "怎么办", "怎么看"
+       ]
+
+-- | 让模型用一句话说明打算怎么做（低延迟；只给步骤，不给答案）。
+quickPlan :: LLM.LLM :> es => Text -> Eff es Text
+quickPlan userText = do
+  reply <- LLM.ask $ Text.unlines
+    [ "用户在群里向机器人 FM 提了一个请求。"
+    , "请求：" <> Text.take 400 userText
+    , "请用一句中文（不超过 40 字）说明你接下来准备怎么做，只写步骤，不要给答案，不要寒暄。直接输出这一句。"
+    ]
+  pure (Text.take 80 (Text.strip reply))
