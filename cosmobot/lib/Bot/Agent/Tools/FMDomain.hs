@@ -472,6 +472,12 @@ fmContestChartTool =
       \reached -- this path never depends on it. \n\
       \contest: the 段号 or 赛文 name. Known: \
       \HB(虎杯) 100000(锦标赛) 99999(极速杯) 100004(极速联赛) mb 666 555 777 999 groupmatch.\n\
+      \重要：\n\
+      \· 「群赛文」「本群赛文」「这个群自己的赛文」「<某个群名>的群赛文」= **999**，\n\
+      \  例如「梦幻打字阁的群赛文」就是 contest=999（不要传 555）。\n\
+      \· 「555」「AI赛文」才用 contest=555。\n\
+      \· 「晴分身」= 777；「1916996679」= 666；「1847992065」= groupmatch。\n\
+      \· 用户说「曲线」「走势」「趋势」时 mode=trend；否则用默认排行榜。\n\
       \每群不同的 777 / 999 / groupmatch 默认用当前群；需要别的群时传 group_id。\n\
       \days: 天数，0 或不传表示全部时间。\n\
       \画完直接把图发出去，最多补一句「这是全部/最近N天的成绩」，不要自己复述名单。"
@@ -479,8 +485,9 @@ fmContestChartTool =
         ( requiredText "contest" "赛文段号或名称（HB / 100000 / 99999 / 100004 / mb / 666 / 555 / 777 / 999 / groupmatch）。"
         , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
         , optionalText "group_id" "只有 777/999/groupmatch 需要；不传就用当前群。"
+        , optionalText "mode" "rank=排行榜柱状图（默认），trend=按天成绩曲线（用户说「曲线」「走势」时用）。"
         )
-        \contest days maybeGroupId -> do
+        \contest days maybeGroupId maybeMode -> do
           context <- askToolContext
           let chatIdText = maybe "" (Text.pack . show) context.message.chatId
               groupText = fromMaybe chatIdText maybeGroupId
@@ -490,6 +497,7 @@ fmContestChartTool =
                   <> Text.strip contest
                   <> "&group_id=" <> groupText
                   <> "&days=" <> dayText
+                  <> "&mode=" <> (if Text.strip (fromMaybe "rank" maybeMode) == "trend" then "trend" else "rank")
           void $ Chat.replyTo (standaloneLibraryMessage context.message) (ReplyBody.imageDirective url)
           pure . toolText $
             "已按成绩库画好并发出：" <> Text.strip contest
