@@ -1093,12 +1093,16 @@ fmChartTool =
         , optionalText "user" "看谁：留空=当前发言人；说「XXX的」就传 XXX。"
         , optionalText "mode" "rank=排行榜（默认），trend=按天曲线（用户说曲线/走势/趋势时用）。"
         , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
+        , optionalText "group_id" "按群的赛文（999/777/groupmatch）看哪个群。留空=当前群。在没有这些赛文的群里测试时，用它指定有数据的群。"
         )
-        \contest user mode requestedDays -> do
+        \contest user mode requestedDays maybeGroupId -> do
           context <- askToolContext
           withCapability context "scores" do
             let days = fromMaybe 0 requestedDays
-                chatIdText = maybe "" (Text.pack . show) context.message.chatId
+                chatIdText =
+                  case Text.strip (fromMaybe "" maybeGroupId) of
+                    "" -> maybe "" (Text.pack . show) context.message.chatId
+                    given -> given
                 cacheBust = "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
                 inputLower = Text.toLower (context.input.text)
                 groupMentioned =
