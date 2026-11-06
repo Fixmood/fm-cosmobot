@@ -1093,7 +1093,7 @@ fmChartTool =
         , optionalText "user" "看谁：留空=当前发言人；说「XXX的」就传 XXX。"
         , optionalText "mode" "rank=排行榜（默认），trend=按天曲线（用户说曲线/走势/趋势时用）。"
         , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
-        , optionalText "group_id" "按群的赛文（999/777/groupmatch）看哪个群。留空=当前群。在没有这些赛文的群里测试时，用它指定有数据的群。"
+        , optionalText "group_id" "按群的赛文（999/777/groupmatch）看哪个群。**可以直接传群名**（梦幻打字阁/五笔修炼基地/虎码训练营/剑气冲霄堂…），也可以传群号；留空=当前群。"
         )
         \contest user mode requestedDays maybeGroupId -> do
           context <- askToolContext
