@@ -105,8 +105,37 @@ def parse_book_header(path: Path, raw: str) -> dict:
     return info
 
 
+# 番茄正文的占位符清洗（2026-11-06）。
+# 起因：所有者发现发出来的段落里带「［插图］」这种东西。
+# 规则刻意保守 —— 只删确定的占位符，绝不动可能是正文的内容：
+#   · 全角方括号里的媒体占位（［插图］［图片］［视频］）
+#   · 整行只有 [图片]/[视频]/[音乐]/[插图] 的半角占位
+#   · （未完待续）之后的作者催更话
+#   · http(s) 链接
+# **不删**：【图片】（聊天体小说的剧情）、[比心][表情包]（表情动作）、「本站」「加更」
+# 这些在实测里都是正文的一部分，删了会伤内容。
+_TAIL_MARKERS = ("（未完待续）", "(未完待续)", "（本章完）")
+_MEDIA_WORDS = ("插图", "图片", "视频", "音乐", "音频", "语音")
+
+
+def strip_novel_placeholders(text: str) -> str:
+    for word in _MEDIA_WORDS:
+        text = text.replace("［" + word + "］", "")
+    text = re.sub(r"(?m)^\s*\[(?:图片|视频|音乐|插图)\]\s*$", "", text)
+    for marker in _TAIL_MARKERS:
+        index = text.find(marker)
+        if index != -1:
+            text = text[:index]
+            break
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return "\n".join(line.strip() for line in text.splitlines()).strip()
+
+
 def clean_content(content: str) -> str:
     content = content.replace("\u3000", " ")
+    content = strip_novel_placeholders(content)
     content = re.sub(r"[ \t]+\n", "\n", content)
     content = re.sub(r"\n{3,}", "\n\n", content)
     return content.strip()
