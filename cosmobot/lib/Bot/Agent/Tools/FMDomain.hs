@@ -9,6 +9,7 @@ module Bot.Agent.Tools.FMDomain
   , fmLibraryStopTool
   , fmLibraryRecallRecentTool
   , fmLibraryStatsTool
+  , fmContestChartTool
   , typingStatsTool
   , fanqieReadingTool
   , fmRecallQueryTool
@@ -62,10 +63,13 @@ import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.HTTP as HTTP
 import Bot.Prelude
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.List as List
+import Data.Char (isAlphaNum)
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as TextEncoding
 import qualified Data.Text.IO as TextIO
 import qualified System.Directory as Directory
 import Network.HTTP.Req
@@ -448,6 +452,49 @@ typingStatsTool =
               let status = novelStatus response
                   message = novelMessage response
               pure (toolText message)
+
+-- | 赛文成绩图（2026-11-06）。
+--
+-- 所有者要求：网站取不到成绩时，直接从成绩库画。
+-- 这个工具就是那条路 —— 数据全部来自 contest_scores，不依赖任何外部站。
+--
+-- 段号就是赛文身份：
+--   全群共用  HB(虎杯) / 100000(锦标赛) / 99999(极速杯) / 100004(极速联赛)
+--             mb(晴分身每日) / 666(1916996679每日) / 555(555赛文)
+--   每群不同  777(晴分身群赛文) / 999(本群赛文) / groupmatch(1847992065)
+-- 按群分的默认用当前群（所有者 2026-11-06 确认）。
+fmContestChartTool :: (Chat.Chat :> es) => Tool (Eff es)
+fmContestChartTool =
+  allowWhen superuserOnly
+    . withDescription
+      "Draw a ranking chart for one 赛文 from FM's own score database. Use this whenever \
+      \the owner asks for 赛文成绩 / 排行榜图 and especially when the external site cannot be \
+      \reached -- this path never depends on it. \n\
+      \contest: the 段号 or 赛文 name. Known: \
+      \HB(虎杯) 100000(锦标赛) 99999(极速杯) 100004(极速联赛) mb 666 555 777 999 groupmatch.\n\
+      \每群不同的 777 / 999 / groupmatch 默认用当前群；需要别的群时传 group_id。\n\
+      \days: 天数，0 或不传表示全部时间。\n\
+      \画完直接把图发出去，最多补一句「这是全部/最近N天的成绩」，不要自己复述名单。"
+    $ tool "fm_contest_chart"
+        ( requiredText "contest" "赛文段号或名称（HB / 100000 / 99999 / 100004 / mb / 666 / 555 / 777 / 999 / groupmatch）。"
+        , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
+        , optionalText "group_id" "只有 777/999/groupmatch 需要；不传就用当前群。"
+        )
+        \contest days maybeGroupId -> do
+          context <- askToolContext
+          let chatIdText = maybe "" (Text.pack . show) context.message.chatId
+              groupText = fromMaybe chatIdText maybeGroupId
+              dayText = Text.pack (show (fromMaybe 0 days))
+              url =
+                "http://172.20.0.4:8077/contest/chart.png?contest="
+                  <> Text.strip contest
+                  <> "&group_id=" <> groupText
+                  <> "&days=" <> dayText
+          void $ Chat.replyTo (standaloneLibraryMessage context.message) (ReplyBody.imageDirective url)
+          pure . toolText $
+            "已按成绩库画好并发出：" <> Text.strip contest
+              <> (if Text.null (Text.strip groupText) then "（全群）" else "（群 " <> groupText <> "）")
+              <> "。不要复述名单。"
 
 fanqieReadingTool :: (Chat.Chat :> es, HTTP.HTTP :> es, IOE :> es) => Tool (Eff es)
 fanqieReadingTool =
