@@ -294,9 +294,12 @@ contestChartQuickHandler =
             days = pickDays text
             userText = pickUser text message
             groupValue =
-              case message.kind of
-                ChatGroup -> fromMaybe "" (show <$> message.chatId)
-                _ -> ""
+              case pickGroupName text of
+                Just groupName -> groupName
+                Nothing ->
+                  case message.kind of
+                    ChatGroup -> fromMaybe "" (show <$> message.chatId)
+                    _ -> ""
             url =
               "http://172.20.0.4:8077/reports/score-chart.png?contest=" <> urlEncodeText contestKey
                 <> "&group_id=" <> urlEncodeText groupValue
@@ -330,12 +333,31 @@ pickContest text
   | any (`Text.isInfixOf` text) ["群赛文", "本群赛文", "赛文"] = Just ("999", "本群赛文")
   | otherwise = Nothing
 
+-- | 从消息里认出群名（所有者 2026-11-06：群号换成中文）
+pickGroupName :: Text -> Maybe Text
+pickGroupName text
+  | "梦幻打字阁" `Text.isInfixOf` text = Just "梦幻打字阁"
+  | "五笔修炼基地" `Text.isInfixOf` text = Just "五笔修炼基地"
+  | "小鹤进修班" `Text.isInfixOf` text = Just "小鹤进修班"
+  | "仓颉之友" `Text.isInfixOf` text || "倉頡之友" `Text.isInfixOf` text = Just "仓颉之友"
+  | "剑气冲霄堂" `Text.isInfixOf` text = Just "剑气冲霄堂"
+  | "五林风" `Text.isInfixOf` text = Just "五林风"
+  | "虎码训练营" `Text.isInfixOf` text || "虎营" `Text.isInfixOf` text = Just "虎码训练营"
+  | "帝隆" `Text.isInfixOf` text = Just "帝隆"
+  | "092" `Text.isInfixOf` text = Just "092五笔"
+  | otherwise = Nothing
+
 pickDays :: Text -> Int
 pickDays text
+  | any (`Text.isInfixOf` text) ["全部", "所有", "历来", "历史", "累计", "一直", "从头"] = 3650
+  | "半年" `Text.isInfixOf` text || "六个月" `Text.isInfixOf` text = 180
+  | "今年" `Text.isInfixOf` text || "本年" `Text.isInfixOf` text = 365
+  | "两个月" `Text.isInfixOf` text || "60天" `Text.isInfixOf` text = 60
   | "三个月" `Text.isInfixOf` text || "90天" `Text.isInfixOf` text || "90 天" `Text.isInfixOf` text = 90
   | "一周" `Text.isInfixOf` text || "7天" `Text.isInfixOf` text || "七天" `Text.isInfixOf` text = 7
   | "今天" `Text.isInfixOf` text || "当天" `Text.isInfixOf` text = 1
   | "一个月" `Text.isInfixOf` text || "30天" `Text.isInfixOf` text || "30 天" `Text.isInfixOf` text = 30
+  | Just months <- digitsBefore "个月" text = months * 30
   | otherwise = fromMaybe 30 (digitsBefore "天" text)
 
 digitsBefore :: Text -> Text -> Maybe Int
