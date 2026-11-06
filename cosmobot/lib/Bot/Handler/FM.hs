@@ -311,6 +311,32 @@ libraryScoreContinueHandler =
             (Aeson.withObject "FM library score result" (Aeson..: "status")) response
       when (status == "segment") $
         sendDirectLibraryResult message response
+      -- 库文没有在打的文章时，看看番茄专区有没有进度（2026-11-06：
+      -- 所有者问「为什么打完之后没有自动续段」，因为这条路只接了库文）。
+      when (status /= "segment") do
+        novelResponse <- postNovelScore (Aeson.object
+          [ "platform" Aeson..= chatPlatformKey message.platform
+          , "chat_id" Aeson..= maybe ("" :: Text) show message.chatId
+          , "requester_id" Aeson..= fromMaybe "" message.senderId
+          , "requester_name" Aeson..= fromMaybe "" message.senderUsername
+          , "text" Aeson..= message.text
+          ])
+        let novelStatusText = fromMaybe ("idle" :: Text) $ AesonTypes.parseMaybe
+              (Aeson.withObject "novel score" \o -> o Aeson..:? "status" Aeson..!= "")
+              novelResponse
+        when (novelStatusText == "segment") do
+          let novelMessage = fromMaybe "" $ AesonTypes.parseMaybe
+                (Aeson.withObject "novel score" \o -> o Aeson..:? "message" Aeson..!= "")
+                novelResponse
+          void $ Chat.replyTo (standaloneMessage message) novelMessage
+
+-- | 番茄成绩：POST /novel/score
+postNovelScore :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
+postNovelScore payload = do
+  response <- HTTP.runReq $
+    req POST (http "172.20.0.4" /: "novel" /: "score")
+      (ReqBodyJson payload) jsonResponse (port 8077)
+  pure (responseBody response :: Aeson.Value)
 
 recallArchiveHandler :: HTTP.HTTP :> es => RouteHandler es
 recallArchiveHandler =
