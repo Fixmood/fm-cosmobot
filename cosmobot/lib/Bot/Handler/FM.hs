@@ -41,6 +41,7 @@ fmHandlers =
   , aiContestQuickHandler
   , allCompetitionRankQuickHandler
   , liveCompetitionQuickHandler
+   , contestTopQuickHandler
    , contestCountQuickHandler
    , contestChartQuickHandler
   , messageArchiveHandler
@@ -288,6 +289,42 @@ parseLiveCompetition value = AesonTypes.parseMaybe parser value
 --
 -- 所有者 2026-11-06：555 是全群共用的，模型却按群去查、还说「只有 3 条落本群」。
 -- 这类计数问题走确定性通道：/contest/count 认得全群/按群的区别。
+-- | 「谁虎杯最快」这类排名问题：直接查榜，不画图、不走模型。
+contestTopQuickHandler
+  :: (HTTP.HTTP :> es, Chat.Chat :> es) => RouteHandler es
+contestTopQuickHandler =
+  stopOn (matching isContestTopQuick) \message _ -> do
+    let text = Text.toCaseFold (Text.strip message.text)
+        contestKey = maybe "" fst (pickContest text)
+        days = pickDays text
+        groupValue = case message.kind of
+          ChatGroup -> fromMaybe "" (show <$> message.chatId)
+          _ -> ""
+    response <- HTTP.runReq $
+      req GET (http "172.20.0.4" /: "contest" /: "top") NoReqBody jsonResponse
+        ( "contest" =: (contestKey :: Text)
+            <> "group_id" =: (groupValue :: Text)
+            <> "days" =: (Text.pack (show days) :: Text)
+            <> "limit" =: ("5" :: Text)
+            <> port 8077
+        )
+    case AesonTypes.parseMaybe
+      (Aeson.withObject "FM contest top" \o -> o Aeson..:? "message" Aeson..!= "")
+      (responseBody response) of
+      Just reply | not (Text.null (Text.strip reply)) -> sendStandalone message reply
+      _ -> sendStandalone message "没查到排名，可能这个赛文还没有数据。"
+
+isContestTopQuick :: IncomingMessage -> Bool
+isContestTopQuick message =
+  message.eventKind == IncomingMessageCreated
+    && message.platform == PlatformQQ
+    && let text = Text.toCaseFold (Text.strip message.text)
+       in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
+            && any (`Text.isInfixOf` text)
+                  ["谁最快", "谁第一", "最快的是谁", "排名", "排行", "前三", "前十", "第一名", "榜"]
+            && not (any (`Text.isInfixOf` text) ["曲线", "折线", "走势", "趋势", "图"])
+            && not (Text.null (fst (fromMaybe ("", "") (pickContest text))))
+
 contestCountQuickHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es) => RouteHandler es
 contestCountQuickHandler =
@@ -368,6 +405,8 @@ isContestChartQuick message =
             -- （2026-11-06 实测：「那为什么我的555成绩曲线会有162条」又被画成图了）
             && not (any (`Text.isInfixOf` text)
                       ["为什么", "怎么", "多少", "是否", "什么", "哪", "?", "？", "吗", "解释", "统计"])
+            -- 未来时间没有数据，不画图（2026-11-06：「我明天的成绩曲线」画出了全历史）
+            && not (any (`Text.isInfixOf` text) ["明天", "后天", "下周", "下个月", "未来", "以后"])
 
 -- | 有赛文就画那个赛文；没赛文但说了成绩/打字/段，就画「所有打字成绩」。
 pickContestOrAll :: Text -> Maybe (Text, Text)
