@@ -382,6 +382,13 @@ novelFieldBool key response =
       (Aeson.withObject "novel response" \o -> o Aeson..:? "restarted" Aeson..!= False)
       response
 
+novelFieldList :: Aeson.Value -> [Text]
+novelFieldList response =
+  fromMaybe [] $
+    AesonTypes.parseMaybe
+      (Aeson.withObject "novel response" \o -> o Aeson..:? "book_lines" Aeson..!= [])
+      response
+
 novelChapterText :: Aeson.Value -> Text
 novelChapterText response =
   fromMaybe "" $
@@ -456,10 +463,11 @@ fanqieReadingTool =
     \· jump    —— 跳到第 N 章，需要 chapter（书的章号）。\n\
     \· progress —— 我打到哪了。\n\
     \· stats   —— 这本书我的均速/准确率。\n\
+    \· books   —— 列出书库里所有番茄小说（用户问「有哪些书」时用）。\n\
     \用户说「每段200字」就传 length=200，之后会记住这个偏好。\n\
     \工具自己会把正文发到当前会话；最终回复最多一句确认，绝不重复正文。"
     $ tool "fanqie_reading"
-        ( requiredText "action" "One of: start, continue, next, jump, progress, stats."
+        ( requiredText "action" "One of: start, continue, next, jump, progress, stats, books."
         , optionalText "book" "书名关键词，start 和 stats 用。"
         , optionalInt "chapter" "书的章号，jump 用。"
         , optionalInt "length" "每段多少字（1~1400）。用户说「200字一段」时传它；不传就沿用上次的。"
@@ -468,8 +476,8 @@ fanqieReadingTool =
         \rawAction book maybeChapter maybeLength maybeRestart -> do
           context <- askToolContext
           let action = Text.toLower (Text.strip rawAction)
-          if action `notElem` ["start", "continue", "next", "jump", "progress", "stats"]
-            then pure (toolText "action 只能是 start / continue / next / jump / progress / stats。")
+          if action `notElem` ["start", "continue", "next", "jump", "progress", "stats", "books"]
+            then pure (toolText "action 只能是 start / continue / next / jump / progress / stats / books。")
             else do
               let chatKeyText = maybe "nopchat" (Text.pack . show) context.message.chatId
                   lastPath = "/data/novel-last-" <> Text.unpack chatKeyText <> ".txt"
@@ -478,6 +486,27 @@ fanqieReadingTool =
                   message = novelMessage response
                   restarted = novelFieldBool "restarted" response
               case status of
+                "ok" | action == "books" -> do
+                  -- 书单走合并转发（折叠消息），否则 26 本书会把群刷屏
+                  let bookLines = novelFieldList response
+                  if null bookLines
+                    then pure (toolText (novelMessage response))
+                    else do
+                      let nodes =
+                            [ Aeson.object
+                                [ "type" Aeson..= ("node" :: Text)
+                                , "data" Aeson..= Aeson.object
+                                    [ "name" Aeson..= ("FM" :: Text)
+                                    , "uin" Aeson..= ("3471095459" :: Text)
+                                    , "content" Aeson..= line
+                                    ]
+                                ]
+                            | line <- bookLines
+                            ]
+                      sent <- Chat.sendMergedForward (standaloneLibraryMessage context.message) nodes
+                      pure . toolText $ case sent of
+                        Right _ -> "书单已作为一条合并转发（折叠消息）发到会话里，共 " <> Text.pack (show (length bookLines)) <> " 本。不要再把书名一条条列出来。"
+                        Left err -> "书单合并转发失败：" <> err <> "\n" <> novelMessage response
                 "segment" -> do
                   -- 重开时先把上一条已发的段落撤掉（用户改段长/要求从开头来时）
                   when restarted $ do
