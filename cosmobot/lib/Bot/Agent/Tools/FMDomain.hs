@@ -471,7 +471,7 @@ fmContestChartTool =
       \the owner asks for 赛文成绩 / 排行榜图 and especially when the external site cannot be \
       \reached -- this path never depends on it. \n\
       \contest: the 段号 or 赛文 name. Known: \
-      \HB(虎杯) 100000(锦标赛) 99999(极速杯) 100004(极速联赛) mb 666 555 777 999 groupmatch.\n\
+      \HB(虎杯) 100000(锦标赛) 99999(极速杯) 100004(极速联赛) mb 666 777 999 groupmatch.\n\
       \重要：\n\
       \· 「群赛文」「本群赛文」「这个群自己的赛文」「<某个群名>的群赛文」= **999**，\n\
       \  例如「梦幻打字阁的群赛文」就是 contest=999（不要传 555）。\n\
@@ -483,7 +483,7 @@ fmContestChartTool =
       \days: 天数，0 或不传表示全部时间。\n\
       \画完直接把图发出去，最多补一句「这是全部/最近N天的成绩」，不要自己复述名单。"
     $ tool "fm_contest_chart"
-        ( requiredText "contest" "赛文段号或名称（HB / 100000 / 99999 / 100004 / mb / 666 / 555 / 777 / 999 / groupmatch）。"
+        ( requiredText "contest" "赛文段号。999=群赛文/本群赛文（最常用）；HB=虎杯；100000=锦标赛；99999=极速杯；100004=极速联赛；666=1916996679；777=晴分身；groupmatch=1847992065；mb=晴分身每日。注意：555 是 FM 自己的 AI 赛文，不属于这个工具。"
         , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
         , optionalText "group_id" "只有 777/999/groupmatch 需要；不传就用当前群。"
         , optionalText "mode" "rank=排行榜柱状图（默认），trend=按天成绩曲线（用户说「曲线」「走势」时用）。"
@@ -491,7 +491,15 @@ fmContestChartTool =
         )
         \contest days maybeGroupId maybeMode maybeUser -> do
           context <- askToolContext
-          let chatIdText = maybe "" (Text.pack . show) context.message.chatId
+          -- 2026-11-06：模型反复把「群赛文」传成 555（555 是 FM 自己的 AI 赛文，
+          -- 和群赛文是两回事）。这里直接读用户原话纠正，不再依赖模型判断。
+          let inputLower = Text.toLower (context.input.text)
+              groupContestMentioned =
+                any (`Text.isInfixOf` inputLower)
+                  ["群赛文", "本群赛文", "这个群的赛文", "群里的赛文", "本群的赛文"]
+              contestText =
+                if groupContestMentioned then "999" else Text.strip contest
+              chatIdText = maybe "" (Text.pack . show) context.message.chatId
               groupText = fromMaybe chatIdText maybeGroupId
               dayText = Text.pack (show (fromMaybe 0 days))
               -- 默认看「当前发言人」自己的曲线（所有者 2026-11-06：
@@ -509,7 +517,7 @@ fmContestChartTool =
                   <> "&user=" <> userText
           void $ Chat.replyTo (standaloneLibraryMessage context.message) (ReplyBody.imageDirective url)
           pure . toolText $
-            "已按成绩库画好并发出：" <> Text.strip contest
+            "已按成绩库画好并发出：" <> contestText
               <> (if Text.null (Text.strip groupText) then "（全群）" else "（群 " <> groupText <> "）")
               <> "。不要复述名单。"
 
