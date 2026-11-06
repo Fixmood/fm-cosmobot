@@ -287,7 +287,7 @@ contestChartQuickHandler
   :: (Chat.Chat :> es) => RouteHandler es
 contestChartQuickHandler =
   stopOn (matching isContestChartQuick) \message _ -> do
-    case pickContest (Text.toCaseFold (Text.strip message.text)) of
+    case pickContestOrAll (Text.toCaseFold (Text.strip message.text)) of
       Nothing -> sendStandalone message "没认出是哪个赛文。可以说：群赛文 / 虎杯 / 锦标赛 / 极速杯 / 极速联赛 / 666 / 777 / groupmatch。"
       Just (contestKey, contestLabel) -> do
         let text = Text.toCaseFold (Text.strip message.text)
@@ -316,8 +316,18 @@ isContestChartQuick message =
     && message.platform == PlatformQQ
     && let text = Text.toCaseFold (Text.strip message.text)
        in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
-            && any (`Text.isInfixOf` text) ["曲线", "走势", "趋势"]
-            && not (Text.null (fst (fromMaybe ("", "") (pickContest text))))
+            && any (`Text.isInfixOf` text) ["曲线", "折线", "走势", "趋势"]
+            && not (Text.null (fst (fromMaybe ("", "") (pickContestOrAll text))))
+
+-- | 有赛文就画那个赛文；没赛文但说了成绩/打字/段，就画「所有打字成绩」。
+pickContestOrAll :: Text -> Maybe (Text, Text)
+pickContestOrAll text =
+  case pickContest text of
+    Just found -> Just found
+    Nothing
+      | any (`Text.isInfixOf` text) ["打字成绩", "所有成绩", "全部成绩", "所有练习", "全部练习", "所有段", "成绩", "段位"]
+      , not (any (`Text.isInfixOf` text) ["排行榜", "排名", "最高分"]) -> Just ("all", "所有打字")
+      | otherwise -> Nothing
 
 pickContest :: Text -> Maybe (Text, Text)
 pickContest text
