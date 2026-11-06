@@ -331,13 +331,20 @@ selectToolsForMessage context tools =
 
     explicitContest value =
       any (`Text.isInfixOf` value)
-        [ "赛文", "比赛", "比赛文章", "赛事文本", "虎杯", "极速杯", "锦标赛"
-        , "555赛文", "ai赛文", "排行榜", "榜单"
-        ]
-
+        [ "赛文", "比赛", "比赛文章", "赛事文本", "虎杯", "极速杯", "锦标赛", "极速联赛"
+        , "555赛文", "ai赛文", "排行榜", "榜单", "群赛文", "晴分身", "groupmatch"
+        , "1916996679", "1847992065", "mb赛文" ]
     explicitScores value =
-      "成绩" `Text.isInfixOf` value
-        && any (`Text.isInfixOf` value) [ "查", "看", "我的", "怎么样", "如何", "分析", "曲线", "排行" ]
+      -- 成绩类：明确说成绩的，或说了曲线/条数/去重等明确的成绩词（2026-11-06 扩展）
+      or
+        [ "成绩" `Text.isInfixOf` value
+            && any (`Text.isInfixOf` value) [ "查", "看", "我的", "怎么样", "如何", "分析", "曲线", "排行" ]
+        , any (`Text.isInfixOf` value)
+            [ "曲线", "折线", "走势", "趋势", "排行", "排名", "最高分", "最快", "均速"
+            , "键准", "击键", "条数", "几条", "多少条", "去重", "重复", "统计", "记录数" ]
+            && any (`Text.isInfixOf` value)
+                [ "成绩", "分数", "速度", "记录", "我的", "我", "他", "她", "谁", "多少" ]
+        ]
 
 data ToolSelection
   = SimpleChat

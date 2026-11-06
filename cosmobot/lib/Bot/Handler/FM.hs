@@ -314,9 +314,9 @@ isContestCountQuick message =
     && message.platform == PlatformQQ
     && let text = Text.toCaseFold (Text.strip message.text)
        in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
-            && any (`Text.isInfixOf` text) ["多少", "几条", "几条记录", "数量", "统计"]
+            && any (`Text.isInfixOf` text)
+                      ["多少", "几条", "几条记录", "数量", "统计", "去重", "重复", "条记录"]
             && not (any (`Text.isInfixOf` text) ["曲线", "折线", "图"])
-            && not (Text.null (fst (fromMaybe ("", "") (pickContestOrAll text))))
 
 -- | 「陆仟的555…」里的「陆仟」；说「我」或没说人就用发言人。
 pickAskeeName :: Text -> IncomingMessage -> Text
