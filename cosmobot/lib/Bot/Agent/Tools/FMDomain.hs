@@ -1098,6 +1098,15 @@ fmChartTool =
                     ["群赛文", "本群赛文", "这个群的赛文", "群里的赛文", "本群的赛文"]
                 contestText =
                   if groupMentioned then "999" else Text.strip (fromMaybe "" contest)
+                -- 模式也读用户原话判断：2026-11-06 实测模型只传 contest 不传 mode，
+                -- 于是「成绩曲线」画成了排行榜。
+                trendMentioned =
+                  any (`Text.isInfixOf` inputLower)
+                    ["曲线", "走势", "趋势", "折线", "trend"]
+                modeText =
+                  if trendMentioned then "trend"
+                  else if Text.strip (fromMaybe "rank" mode) == "trend" then "trend"
+                  else "rank"
                 userText =
                   case Text.strip (fromMaybe "" user) of
                     "" -> Text.strip (fromMaybe "" context.message.senderUsername)
@@ -1107,7 +1116,7 @@ fmChartTool =
                       "http://172.20.0.4:8077/contest/chart.png?contest=" <> contestText
                         <> "&group_id=" <> chatIdText
                         <> "&days=" <> Text.pack (show days)
-                        <> "&mode=" <> (if Text.strip (fromMaybe "rank" mode) == "trend" then "trend" else "rank")
+                        <> "&mode=" <> modeText
                         <> "&user=" <> userText
                         <> cacheBust
                   | otherwise =
@@ -1118,7 +1127,13 @@ fmChartTool =
                         <> cacheBust
             sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
             case rights sent of
-              _ : _ -> pure (toolText "成绩图表已发送。")
+              _ : _ -> pure . toolText $
+                if Text.null contestText
+                  then "个人成绩图表已发送。"
+                  else "「" <> contestText <> "」的"
+                    <> (if modeText == "trend" then "成绩曲线" else "排行榜")
+                    <> "已发送（看的是 " <> userText <> "）。"
+                    <> "回答时请按这个赛文说，不要提 555 或别的赛文。"
               [] -> do
                 let err = Text.intercalate "；" (lefts sent)
                 pure (toolFailure Failure.Failure
