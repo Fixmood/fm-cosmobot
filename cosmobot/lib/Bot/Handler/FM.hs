@@ -361,7 +361,9 @@ pickGroupName text
 
 pickDays :: Text -> Int
 pickDays text
-  | any (`Text.isInfixOf` text) ["全部", "所有", "历来", "历史", "累计", "一直", "从头"] = 3650
+  -- 注意：「所有」不能算全部时间 —— 「把我近1个月**所有**打字成绩整理出来」里
+  -- 的「所有」指的是「所有成绩」，不是「所有时间」（2026-11-06 实测画成了全部）。
+  | any (`Text.isInfixOf` text) ["全部", "全部时间", "所有时间", "历来", "历史", "累计", "一直", "从头"] = 3650
   | "两年" `Text.isInfixOf` text || "2年" `Text.isInfixOf` text = 730
   | any (`Text.isInfixOf` text) ["一年", "一个年", "1年", "12个月", "近一年", "一年内"] = 365
   | "半年" `Text.isInfixOf` text || "六个月" `Text.isInfixOf` text = 180
