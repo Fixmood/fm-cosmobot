@@ -41,6 +41,7 @@ fmHandlers =
   , aiContestQuickHandler
   , allCompetitionRankQuickHandler
   , liveCompetitionQuickHandler
+   , contestChartQuickHandler
   , messageArchiveHandler
   , recallArchiveHandler
   , pausedGroupHandler
@@ -277,6 +278,109 @@ parseLiveCompetition value = AesonTypes.parseMaybe parser value
         <*> o Aeson..:? "kind" Aeson..!= "champ"
         <*> o Aeson..:? "date" Aeson..!= ""
         <*> o Aeson..:? "message" Aeson..!= "公开赛事网站当前没有返回可用数据。"
+
+-- | 赛文成绩图直接路由（所有者 2026-11-06 批准：不信模型选工具）。
+--
+-- 模型反复失手：选错工具、不传 mode、传错赛文、传「我」当名字。
+-- 这条路由命中「曲线/走势/趋势」+ 赛文关键词就直接出图，完全不经过模型。
+contestChartQuickHandler
+  :: (Chat.Chat :> es) => RouteHandler es
+contestChartQuickHandler =
+  stopOn (matching isContestChartQuick) \message _ -> do
+    case pickContest (Text.toCaseFold (Text.strip message.text)) of
+      Nothing -> sendStandalone message "没认出是哪个赛文。可以说：群赛文 / 虎杯 / 锦标赛 / 极速杯 / 极速联赛 / 666 / 777 / groupmatch。"
+      Just (contestKey, contestLabel) -> do
+        let text = Text.toCaseFold (Text.strip message.text)
+            days = pickDays text
+            userText = pickUser text message
+            groupValue =
+              case message.kind of
+                ChatGroup -> fromMaybe "" (show <$> message.chatId)
+                _ -> ""
+            url =
+              "http://172.20.0.4:8077/reports/score-chart.png?contest=" <> urlEncodeText contestKey
+                <> "&group_id=" <> urlEncodeText groupValue
+                <> "&days=" <> Text.pack (show days)
+                <> "&mode=trend&user=" <> urlEncodeText userText
+                <> "&_=" <> maybe "0" (Text.pack . show) message.messageId
+        sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective url)
+        when (null (rights sent)) $
+          sendStandalone message ("「" <> contestLabel <> "」成绩曲线图发送失败，稍后再试。")
+
+isContestChartQuick :: IncomingMessage -> Bool
+isContestChartQuick message =
+  message.eventKind == IncomingMessageCreated
+    && message.platform == PlatformQQ
+    && let text = Text.toCaseFold (Text.strip message.text)
+       in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
+            && any (`Text.isInfixOf` text) ["曲线", "走势", "趋势"]
+            && not (Text.null (fst (fromMaybe ("", "") (pickContest text))))
+
+pickContest :: Text -> Maybe (Text, Text)
+pickContest text
+  | "极速联赛" `Text.isInfixOf` text = Just ("100004", "极速联赛")
+  | "极速杯" `Text.isInfixOf` text = Just ("99999", "极速杯")
+  | "锦标赛" `Text.isInfixOf` text = Just ("100000", "锦标赛")
+  | "虎杯" `Text.isInfixOf` text = Just ("HB", "虎杯")
+  | "groupmatch" `Text.isInfixOf` text || "1847992065" `Text.isInfixOf` text =
+      Just ("groupmatch", "1847992065群赛文")
+  | "晴分身" `Text.isInfixOf` text || "777" `Text.isInfixOf` text = Just ("777", "晴分身群赛文")
+  | "1916996679" `Text.isInfixOf` text || "666" `Text.isInfixOf` text = Just ("666", "1916996679每日赛文")
+  | "555" `Text.isInfixOf` text = Just ("555", "555赛文")
+  | any (`Text.isInfixOf` text) ["群赛文", "本群赛文", "赛文"] = Just ("999", "本群赛文")
+  | otherwise = Nothing
+
+pickDays :: Text -> Int
+pickDays text
+  | "三个月" `Text.isInfixOf` text || "90天" `Text.isInfixOf` text || "90 天" `Text.isInfixOf` text = 90
+  | "一周" `Text.isInfixOf` text || "7天" `Text.isInfixOf` text || "七天" `Text.isInfixOf` text = 7
+  | "今天" `Text.isInfixOf` text || "当天" `Text.isInfixOf` text = 1
+  | "一个月" `Text.isInfixOf` text || "30天" `Text.isInfixOf` text || "30 天" `Text.isInfixOf` text = 30
+  | otherwise = fromMaybe 30 (digitsBefore "天" text)
+
+digitsBefore :: Text -> Text -> Maybe Int
+digitsBefore marker text =
+  case Text.breakOn marker text of
+    (before, rest)
+      | not (Text.null rest) ->
+          let digits = Text.takeWhileEnd isDigit before
+          in if Text.null digits then Nothing else readMaybe (Text.unpack digits)
+    _ -> Nothing
+
+pickUser :: Text -> IncomingMessage -> Text
+pickUser text message =
+  let speaker = Text.strip (fromMaybe "" message.senderUsername)
+      body = Text.strip (dropFm text)
+      boundary = earliestIndex
+        [ "近", "最", "这", "过", "赛文", "成绩", "曲线", "趋势", "走势", "锦标赛", "虎杯"
+        , "极速", "晴分身", "555", "666", "777", "999", "groupmatch", "一个月", "天", "的" ]
+        body
+      candidate = Text.strip (Text.take boundary body)
+      cleaned = stripPrefixes
+        [ "看下", "看一下", "看看", "查一下", "查询", "查", "画一下", "画下", "画", "给我", "帮我"
+        , "帮忙", "来", "要", "想", "一下", "下" ] candidate
+  in if Text.null cleaned || any (`Text.isInfixOf` cleaned) ["我", "自己", "本人"]
+       then speaker
+       else cleaned
+
+dropFm :: Text -> Text
+dropFm text =
+  let stripped = Text.strip text
+  in fromMaybe stripped (Text.stripPrefix "fm" stripped)
+
+stripPrefixes :: [Text] -> Text -> Text
+stripPrefixes prefixes value =
+  case filter (\p -> Text.isPrefixOf p value) prefixes of
+    (p : _) -> Text.strip (Text.drop (Text.length p) value)
+    [] -> value
+
+earliestIndex :: [Text] -> Text -> Int
+earliestIndex needles hay =
+  foldr min (Text.length hay)
+    (map (\n -> Text.length (fst (Text.breakOn n hay))) (filter (not . Text.null) needles))
+
+urlEncodeText :: Text -> Text
+urlEncodeText = TextEncoding.decodeUtf8 . urlEncode True . TextEncoding.encodeUtf8
 
 messageArchiveHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es)
