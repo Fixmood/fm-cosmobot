@@ -1120,7 +1120,7 @@ fmChartTool =
                     other -> other
                 url
                   | not (Text.null contestText) =
-                      "http://172.20.0.4:8077/contest/chart.png?contest=" <> urlEncodeText contestText
+                      "http://172.20.0.4:8077/reports/score-chart.png?contest=" <> urlEncodeText contestText
                         <> "&group_id=" <> urlEncodeText chatIdText
                         <> "&days=" <> Text.pack (show days)
                         <> "&mode=" <> modeText
