@@ -330,7 +330,9 @@ pickContest text
   | "晴分身" `Text.isInfixOf` text || "777" `Text.isInfixOf` text = Just ("777", "晴分身群赛文")
   | "1916996679" `Text.isInfixOf` text || "666" `Text.isInfixOf` text = Just ("666", "1916996679每日赛文")
   | "555" `Text.isInfixOf` text = Just ("555", "555赛文")
-  | any (`Text.isInfixOf` text) ["群赛文", "本群赛文", "赛文"] = Just ("999", "本群赛文")
+  | any (`Text.isInfixOf` text) ["群赛文", "本群赛文", "赛文", "寒文"] = Just ("999", "本群赛文")
+  -- 错字兜底：含「群」和「文」且是图表请求，按本群赛文处理（2026-11-06 实测「群寒文」）
+  | "群" `Text.isInfixOf` text && "文" `Text.isInfixOf` text = Just ("999", "本群赛文")
   | otherwise = Nothing
 
 -- | 从消息里认出群名（所有者 2026-11-06：群号换成中文）
