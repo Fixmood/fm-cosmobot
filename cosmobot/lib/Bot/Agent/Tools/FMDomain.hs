@@ -73,6 +73,7 @@ import qualified Data.Text.Encoding as TextEncoding
 import qualified Data.Text.IO as TextIO
 import qualified System.Directory as Directory
 import Network.HTTP.Req
+import Network.HTTP.Types.URI (urlEncode)
 
 fmGroupStatusTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmGroupStatusTool =
@@ -516,7 +517,7 @@ fmContestChartTool =
                   <> "&group_id=" <> groupText
                   <> "&days=" <> dayText
                   <> "&mode=" <> (if Text.strip (fromMaybe "rank" maybeMode) == "trend" then "trend" else "rank")
-                  <> "&user=" <> userText
+                  <> "&user=" <> urlEncodeText userText
           void $ Chat.replyTo (standaloneLibraryMessage context.message) (ReplyBody.imageDirective url)
           pure . toolText $
             "已按成绩库画好并发出：" <> contestText
@@ -1065,6 +1066,12 @@ fmCompetitionScoreImageTool =
                 , detail = err
                 })
 
+-- | URL 编码。2026-11-06：用户名是中文+全角括号（「云南」Fixmood（三当家）」），
+-- 直接拼进 URL 会让 http-client 抛 UnicodeEncodeError，图片永远缓存不到，
+-- 表现出来就是「图片 URL 抓不到 / 502」。
+urlEncodeText :: Text -> Text
+urlEncodeText = TextEncoding.decodeUtf8 . urlEncode True . TextEncoding.encodeUtf8
+
 fmChartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmChartTool =
   withDescription
@@ -1113,11 +1120,11 @@ fmChartTool =
                     other -> other
                 url
                   | not (Text.null contestText) =
-                      "http://172.20.0.4:8077/contest/chart.png?contest=" <> contestText
-                        <> "&group_id=" <> chatIdText
+                      "http://172.20.0.4:8077/contest/chart.png?contest=" <> urlEncodeText contestText
+                        <> "&group_id=" <> urlEncodeText chatIdText
                         <> "&days=" <> Text.pack (show days)
                         <> "&mode=" <> modeText
-                        <> "&user=" <> userText
+                        <> "&user=" <> urlEncodeText userText
                         <> cacheBust
                   | otherwise =
                       -- 没点名赛文：老的个人成绩历史图（555/AI赛文那套）
