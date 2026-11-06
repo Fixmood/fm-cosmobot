@@ -1122,7 +1122,12 @@ fmChartTool =
                 userText =
                   case Text.strip (fromMaybe "" user) of
                     "" -> Text.strip (fromMaybe "" context.message.senderUsername)
-                    other -> other
+                    other
+                      -- 模型有时把「我」原样传进来（2026-11-06 实测）：
+                      -- 那样 SQL 会查 %我% 得到 0 条，图就空了。
+                      | Text.toLower other `elem` ["我", "我的", "自己", "本人", "me", "my"] ->
+                          Text.strip (fromMaybe "" context.message.senderUsername)
+                      | otherwise -> other
                 url
                   | not (Text.null contestText) =
                       "http://172.20.0.4:8077/reports/score-chart.png?contest=" <> urlEncodeText contestText
