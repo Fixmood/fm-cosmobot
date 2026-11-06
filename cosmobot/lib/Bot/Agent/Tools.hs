@@ -174,10 +174,7 @@ defaultToolsWith extraTools = tools
       , fmAiContestPublishTool
       , fmAiContestLeaderboardTool
       , fmAiContestLeaderboardImageTool
-      , fmCompetitionScoreQueryTool
-      , fmCompetitionScoreSummaryTool
       , fmScoreAnalysisTool
-      , fmCompetitionScoreImageTool
       , fmChartTool
       , fmBotGuardAccountsTool
       , fmDomainStatsTool
