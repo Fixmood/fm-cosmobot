@@ -139,7 +139,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
     plan <- quickPlan input.text
     when (not (Text.null (Text.strip plan))) $
       void $ Chat.replyTo outputMessage ("😻 FM：" <> Text.strip plan)
-  Agent.withAgentMetadata
+  withChatEffort (isComplexRequest input.text && not (isImageTask message)) $ Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
       , originRunId = runId
@@ -1263,3 +1263,15 @@ quickPlan userText = do
     , "请用一句中文（不超过 40 字）说明你接下来准备怎么做，只写步骤，不要给答案，不要寒暄。直接输出这一句。"
     ]
   pure (Text.take 80 (Text.strip reply))
+
+
+-- | 复杂任务期间临时切到 high effort 的 provider，结束后切回默认。
+-- 用易失切换（不写配置）：并发跑的其他消息在这段时间里也会用 high，可接受。
+withChatEffort :: LLM.LLM :> es => Bool -> Eff es a -> Eff es a
+withChatEffort complex action
+  | not complex = action
+  | otherwise = do
+      _ <- LLM.selectChatModelVolatile "deepseek-flash-high"
+      result <- action
+      _ <- LLM.selectChatModelVolatile "deepseek-flash"
+      pure result

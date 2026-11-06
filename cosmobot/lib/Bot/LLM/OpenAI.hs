@@ -269,6 +269,14 @@ runLLM cfg action = do
               logInfo [i|Chat model switched to provider=#{fromMaybe "default" selectedName}|]
               pure $ maybe (Left "The selected chat model is unavailable.") Right
                 (find (.current) (chatModelInfos cfg selectedName))
+        LLM.SelectChatModelVolatile target ->
+          case resolveChatModelTarget cfg target of
+            Left err -> pure (Left err)
+            Right selectedName -> do
+              -- 易失：只改内存，不写配置文件
+              MVar.modifyMVar_ selection (const (pure selectedName))
+              pure $ maybe (Left "The selected chat model is unavailable.") Right
+                (find (.current) (chatModelInfos cfg selectedName))
         LLM.ResetChatModel -> do
           let selectedName = cfg.chatProviderName
           liftIO (persistChatModelSelection selectedName)

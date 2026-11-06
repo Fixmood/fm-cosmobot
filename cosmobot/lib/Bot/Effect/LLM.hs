@@ -27,6 +27,7 @@ module Bot.Effect.LLM
   , queryAccountBalance
   , selectChatModel
   , probeChatModel
+  , selectChatModelVolatile
   , resetChatModel
   , addChatModel
   , editChatModel
@@ -89,6 +90,8 @@ data LLM :: Effect where
   CurrentChatModel :: LLM m (Maybe ChatModelInfo)
   QueryAccountBalance :: Maybe Text -> LLM m [AccountBalanceResult]
   SelectChatModel :: Text -> LLM m (Either Text ChatModelInfo)
+  -- | 只改内存里的选择，不落盘（复杂任务临时提高 reasoning effort 用）
+  SelectChatModelVolatile :: Text -> LLM m (Either Text ChatModelInfo)
   ProbeChatModel :: Text -> LLM m (Either Text ())
   ResetChatModel :: LLM m (Maybe ChatModelInfo)
   AddChatModel :: ChatModelConfig -> LLM m (Either Text ())
@@ -294,6 +297,10 @@ queryAccountBalance :: LLM :> es => Maybe Text -> Eff es [AccountBalanceResult]
 queryAccountBalance =
   send . QueryAccountBalance
 
+selectChatModelVolatile :: LLM :> es => Text -> Eff es (Either Text ChatModelInfo)
+selectChatModelVolatile = send . SelectChatModelVolatile
+
+-- |
 selectChatModel :: LLM :> es => Text -> Eff es (Either Text ChatModelInfo)
 selectChatModel =
   send . SelectChatModel
