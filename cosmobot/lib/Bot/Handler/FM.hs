@@ -41,6 +41,7 @@ fmHandlers =
   , aiContestQuickHandler
   , allCompetitionRankQuickHandler
   , liveCompetitionQuickHandler
+   , contestCountQuickHandler
    , contestChartQuickHandler
   , messageArchiveHandler
   , recallArchiveHandler
@@ -283,6 +284,51 @@ parseLiveCompetition value = AesonTypes.parseMaybe parser value
 --
 -- 模型反复失手：选错工具、不传 mode、传错赛文、传「我」当名字。
 -- 这条路由命中「曲线/走势/趋势」+ 赛文关键词就直接出图，完全不经过模型。
+-- | 「某人某个赛文有多少条」直接查后端（不经模型）。
+--
+-- 所有者 2026-11-06：555 是全群共用的，模型却按群去查、还说「只有 3 条落本群」。
+-- 这类计数问题走确定性通道：/contest/count 认得全群/按群的区别。
+contestCountQuickHandler
+  :: (HTTP.HTTP :> es, Chat.Chat :> es) => RouteHandler es
+contestCountQuickHandler =
+  stopOn (matching isContestCountQuick) \message _ -> do
+    let text = Text.toCaseFold (Text.strip message.text)
+        contestKey = maybe "" fst (pickContestOrAll text)
+        asked = pickAskeeName text message
+    response <- HTTP.runReq $
+      req GET (http "172.20.0.4" /: "contest" /: "count") NoReqBody jsonResponse
+        ( "contest" =: contestKey
+            <> "user" =: (asked :: Text)
+            <> "group_id" =: maybe ("" :: Text) show message.chatId
+            <> port 8077
+        )
+    case AesonTypes.parseMaybe
+      (Aeson.withObject "FM contest count" \o -> o Aeson..:? "message" Aeson..!= "")
+      (responseBody response) of
+      Just reply | not (Text.null (Text.strip reply)) -> sendStandalone message reply
+      _ -> sendStandalone message "没查到这条记录，可能这个赛文还没有数据。"
+
+isContestCountQuick :: IncomingMessage -> Bool
+isContestCountQuick message =
+  message.eventKind == IncomingMessageCreated
+    && message.platform == PlatformQQ
+    && let text = Text.toCaseFold (Text.strip message.text)
+       in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
+            && any (`Text.isInfixOf` text) ["多少", "几条", "几条记录", "数量", "统计"]
+            && not (any (`Text.isInfixOf` text) ["曲线", "折线", "图"])
+            && not (Text.null (fst (fromMaybe ("", "") (pickContestOrAll text))))
+
+-- | 「陆仟的555…」里的「陆仟」；说「我」或没说人就用发言人。
+pickAskeeName :: Text -> IncomingMessage -> Text
+pickAskeeName text message =
+  let body = Text.strip (dropFm text)
+      (before, rest) = Text.breakOn "的" body
+      candidate = stripPrefixes
+        ["为什么", "那", "那么", "请问", "帮我", "查下", "查一下", "查", "看看"] (Text.strip before)
+  in if Text.null rest || Text.null candidate || any (`Text.isInfixOf` candidate) ["我", "自己", "本人"]
+       then Text.strip (fromMaybe "" message.senderUsername)
+       else candidate
+
 contestChartQuickHandler
   :: (Chat.Chat :> es) => RouteHandler es
 contestChartQuickHandler =
