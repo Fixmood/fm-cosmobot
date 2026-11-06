@@ -26,6 +26,9 @@ import qualified Data.Text as Text
 import qualified System.Directory as Directory
 import qualified Data.Text.IO as TextIO
 import Network.HTTP.Req
+import Network.HTTP.Types.URI (urlEncode)
+import qualified Data.Text.Encoding as TextEncoding
+import Text.Read (readMaybe)
 
 fmHandlers
   :: (HTTP.HTTP :> es, Chat.Chat :> es, LLM.LLM :> es, IOE :> es)
