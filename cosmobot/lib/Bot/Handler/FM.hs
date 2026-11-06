@@ -318,6 +318,10 @@ isContestChartQuick message =
        in (Text.isPrefixOf "fm" text || "@fm" `Text.isInfixOf` text)
             && any (`Text.isInfixOf` text) ["曲线", "折线", "走势", "趋势"]
             && not (Text.null (fst (fromMaybe ("", "") (pickContestOrAll text))))
+            -- 问句不拦：问「为什么/多少/吗」的人要的是解释，不是再画一张图
+            -- （2026-11-06 实测：「那为什么我的555成绩曲线会有162条」又被画成图了）
+            && not (any (`Text.isInfixOf` text)
+                      ["为什么", "怎么", "多少", "是否", "什么", "哪", "?", "？", "吗", "解释", "统计"])
 
 -- | 有赛文就画那个赛文；没赛文但说了成绩/打字/段，就画「所有打字成绩」。
 pickContestOrAll :: Text -> Maybe (Text, Text)
