@@ -963,7 +963,7 @@ fmAiContestLeaderboardImageTool =
 
 fmCompetitionScoreQueryTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmCompetitionScoreQueryTool =
-  withDescription "Query FM's preserved personal contest-score archive by QQ ID, display name, or contest source."
+  withDescription "赛文相关（群赛文/本群赛文/虎杯/锦标赛/极速杯/极速联赛/mb/666/777/groupmatch）的近一个月成绩、排行、曲线、趋势，一律用 **fm_chart**（它的数据每天更新到最近一天）；本工具读的是已经停更的旧归档，只适合查更早的历史。Query FM's preserved personal contest-score archive by QQ ID, display name, or contest source."
     $ tool "fm_competition_score_query"
       ( optionalText "user_id" "Optional QQ or platform user ID."
       , optionalText "name" "Optional display-name fragment."
@@ -986,7 +986,7 @@ fmCompetitionScoreQueryTool =
 
 fmCompetitionScoreSummaryTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmCompetitionScoreSummaryTool =
-  withDescription "Summarize FM's preserved personal contest-score history by QQ ID, display name, or contest source, including best and average values."
+  withDescription "赛文相关（群赛文/本群赛文/虎杯/锦标赛/极速杯/极速联赛/mb/666/777/groupmatch）的近一个月成绩、排行、曲线、趋势，一律用 **fm_chart**（它的数据每天更新到最近一天）；本工具读的是已经停更的旧归档，只适合查更早的历史。Summarize FM's preserved personal contest-score history by QQ ID, display name, or contest source, including best and average values."
   $ tool "fm_competition_score_summary"
       ( optionalText "user_id" "Optional QQ or platform user ID."
       , optionalText "name" "Optional display-name fragment."
@@ -1006,7 +1006,7 @@ fmCompetitionScoreSummaryTool =
 
 fmScoreAnalysisTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmScoreAnalysisTool =
-  withDescription "Analyze the current user's typing performance from live public contest leaderboards and FM's archived typing scores. Use for natural-language questions such as today's contest results, today's typing results, all scores together, comparisons, averages, best results, accuracy below 95%, or a recent date range. The tool resolves the current sender by QQ ID, keeps contest and ordinary typing results separate, and never treats a missing leaderboard row as a zero score. Do not use this for merely sending a leaderboard image."
+  withDescription "赛文相关（群赛文/本群赛文/虎杯/锦标赛/极速杯/极速联赛/mb/666/777/groupmatch）的近一个月成绩、排行、曲线、趋势，一律用 **fm_chart**（它的数据每天更新到最近一天）；本工具读的是已经停更的旧归档，只适合查更早的历史。Analyze the current user's typing performance from live public contest leaderboards and FM's archived typing scores. Use for natural-language questions such as today's contest results, today's typing results, all scores together, comparisons, averages, best results, accuracy below 95%, or a recent date range. The tool resolves the current sender by QQ ID, keeps contest and ordinary typing results separate, and never treats a missing leaderboard row as a zero score. Do not use this for merely sending a leaderboard image."
   $ tool "fm_score_analysis"
       ( optionalText "scope" "Optional scope: all, contest, or typing. Defaults to all."
       , optionalText "start_date" "Optional start date in YYYY-MM-DD format."
@@ -1041,7 +1041,7 @@ fmScoreAnalysisTool =
 fmCompetitionScoreImageTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmCompetitionScoreImageTool =
   noisy
-  . withDescription "Generate and send a PNG report for one person's preserved contest-score history. Resolve the target from natural language and provide a QQ ID or display name."
+  . withDescription "赛文相关（群赛文/本群赛文/虎杯/锦标赛/极速杯/极速联赛/mb/666/777/groupmatch）的近一个月成绩、排行、曲线、趋势，一律用 **fm_chart**（它的数据每天更新到最近一天）；本工具读的是已经停更的旧归档，只适合查更早的历史。Generate and send a PNG report for one person's preserved contest-score history. Resolve the target from natural language and provide a QQ ID or display name."
   $ tool "fm_competition_score_image"
       ( optionalText "user_id" "Optional QQ or platform user ID."
       , optionalText "name" "Optional display-name fragment."
