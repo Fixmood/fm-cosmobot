@@ -478,6 +478,7 @@ fmContestChartTool =
       \· 「555」「AI赛文」才用 contest=555。\n\
       \· 「晴分身」= 777；「1916996679」= 666；「1847992065」= groupmatch。\n\
       \· 用户说「曲线」「走势」「趋势」时 mode=trend；否则用默认排行榜。\n\
+      \· 曲线默认画**当前发言人自己**的；用户说「XXX的曲线」就传 user=XXX。\n\
       \每群不同的 777 / 999 / groupmatch 默认用当前群；需要别的群时传 group_id。\n\
       \days: 天数，0 或不传表示全部时间。\n\
       \画完直接把图发出去，最多补一句「这是全部/最近N天的成绩」，不要自己复述名单。"
@@ -486,18 +487,26 @@ fmContestChartTool =
         , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
         , optionalText "group_id" "只有 777/999/groupmatch 需要；不传就用当前群。"
         , optionalText "mode" "rank=排行榜柱状图（默认），trend=按天成绩曲线（用户说「曲线」「走势」时用）。"
+        , optionalText "user" "看谁的成绩曲线。用户说「我的」或不指定就留空（= 当前发言人）；说别人名字就传名字关键字。"
         )
-        \contest days maybeGroupId maybeMode -> do
+        \contest days maybeGroupId maybeMode maybeUser -> do
           context <- askToolContext
           let chatIdText = maybe "" (Text.pack . show) context.message.chatId
               groupText = fromMaybe chatIdText maybeGroupId
               dayText = Text.pack (show (fromMaybe 0 days))
+              -- 默认看「当前发言人」自己的曲线（所有者 2026-11-06：
+              -- 他问的个人成绩曲线，结果我画成全群平均了 ✗）
+              userText =
+                case Text.strip (fromMaybe "" maybeUser) of
+                  "" -> Text.strip (fromMaybe "" context.message.senderUsername)
+                  other -> other
               url =
                 "http://172.20.0.4:8077/contest/chart.png?contest="
                   <> Text.strip contest
                   <> "&group_id=" <> groupText
                   <> "&days=" <> dayText
                   <> "&mode=" <> (if Text.strip (fromMaybe "rank" maybeMode) == "trend" then "trend" else "rank")
+                  <> "&user=" <> userText
           void $ Chat.replyTo (standaloneLibraryMessage context.message) (ReplyBody.imageDirective url)
           pure . toolText $
             "已按成绩库画好并发出：" <> Text.strip contest
