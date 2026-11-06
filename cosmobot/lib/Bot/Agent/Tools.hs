@@ -144,7 +144,6 @@ defaultToolsWith extraTools = tools
       , datetimeTool
       , chatModelStatusTool
       , fmGroupStatusTool
-      , fmContestChartTool
       , fanqieReadingTool
       , typingStatsTool
       , fmLibrarySearchTool
@@ -257,7 +256,6 @@ selectToolsForMessage context tools =
       -- 额度/余额类问题会命中 Admin 子集，而搜索额度不属于任何一个域，
       -- 不加进来就会被子集过滤掉（2026-10-25 实测：工具在二进制里但模型看不到）。
       , "search_quota"
-       , "fm_contest_chart"
        , "fanqie_reading"
        , "typing_stats"
       ]

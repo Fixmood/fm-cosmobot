@@ -467,9 +467,11 @@ fmContestChartTool :: (Chat.Chat :> es) => Tool (Eff es)
 fmContestChartTool =
   allowWhen superuserOnly
     . withDescription
-      "Draw a ranking chart for one 赛文 from FM's own score database. Use this whenever \
-      \the owner asks for 赛文成绩 / 排行榜图 and especially when the external site cannot be \
-      \reached -- this path never depends on it. \n\
+      "Draw a 赛文 chart -- ranking bars, or a per-person score **curve / 趋势 / 走势** when \
+      \mode=trend. Use this for ANY request that names a 赛文 (群赛文/本群赛文/虎杯/锦标赛/极速杯/\
+      \极速联赛/晴分身/666/777/groupmatch) and wants 成绩/排行/曲线/趋势. Data comes from the \
+      \official site first and falls back to FM's contest table, so it works even when the site \
+      \is down. Do NOT use fm_chart for these -- fm_chart only knows 555赛文.\n\
       \contest: the 段号 or 赛文 name. Known: \
       \HB(虎杯) 100000(锦标赛) 99999(极速杯) 100004(极速联赛) mb 666 777 999 groupmatch.\n\
       \重要：\n\
@@ -1065,34 +1067,65 @@ fmCompetitionScoreImageTool =
 
 fmChartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmChartTool =
-  withDescription "Generate and send a professional high-resolution PNG chart from preserved contest scores. Use for requests for a score curve, trend chart, history chart, or data visualization; this is a chart tool, not image generation. Resolve the person by QQ ID or display name."
-  $ tool "fm_chart"
-      ( optionalText "user_id" "Optional QQ or platform user ID."
-      , optionalText "name" "Optional display-name fragment."
-      , optionalText "source" "Optional source, such as 虎杯 or 锦标赛."
-      , optionalInt "days" "Optional number of recent calendar days, from 1 to 3650."
-      , optionalText "metric" "Optional metric: speed, accuracy, or keystrokes. Defaults to speed."
-      )
-      \userId name source requestedDays metric -> do
-        context <- askToolContext
-        withCapability context "scores" do
-          let days = max 1 (min 3650 (fromMaybe 3650 requestedDays))
-              url = "http://172.20.0.4:8077/reports/score-chart.png?user_id="
-                <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name
-                <> "&source=" <> fromMaybe "" source <> "&days=" <> show days
-                <> "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
-                <> "&metric=" <> fromMaybe "speed" metric
-                <> "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
-          sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
-          case rights sent of
-            _ : _ -> pure (toolText "成绩图表已发送。")
-            [] -> do
-              let err = Text.intercalate "；" (lefts sent)
-              pure (toolFailure Failure.Failure
-                { category = Failure.ExternalServiceUnavailable
-                , userMessage = "成绩图表发送失败：" <> err
-                , detail = err
-                })
+  withDescription
+    "成绩图表统一入口：排行榜柱状图、个人成绩曲线、趋势、历史，全部用它。\n\
+    \\n\
+    \两种模式，看有没有点名赛文：\n\
+    \1) 赛文成绩（排行榜/曲线）：传 contest。\n\
+    \   999=群赛文/本群赛文（最常用）；777=晴分身群赛文；groupmatch=1847992065；\n\
+    \   HB=虎杯；100000=锦标赛；99999=极速杯；100004=极速联赛；666=1916996679；555=555赛文。\n\
+    \   说「曲线」「走势」「趋势」时 mode=trend，否则默认排行榜。\n\
+    \   user 留空=当前发言人自己；说「XXX的」就传 XXX。\n\
+    \   数据优先取官网，拿不到自动用成绩库，所以永远能出图。\n\
+    \2) 不分赛文的个人成绩历史：不传 contest，只传 user_id / name。\n\
+    \\n\
+    \画完把图发出去，最多补一句说明，不要复述名单。"
+    $ tool "fm_chart"
+        ( optionalText "contest" "赛文段号或名称。群赛文=999；虎杯=HB；锦标赛=100000；极速杯=99999；极速联赛=100004；666；777；groupmatch；555。留空=不分赛文。"
+        , optionalText "user" "看谁：留空=当前发言人；说「XXX的」就传 XXX。"
+        , optionalText "mode" "rank=排行榜（默认），trend=按天曲线（用户说曲线/走势/趋势时用）。"
+        , optionalInt "days" "统计天数，0 或不传 = 全部时间。"
+        )
+        \contest user mode requestedDays -> do
+          context <- askToolContext
+          withCapability context "scores" do
+            let days = fromMaybe 0 requestedDays
+                chatIdText = maybe "" (Text.pack . show) context.message.chatId
+                cacheBust = "&_=" <> maybe "0" (Text.pack . show) context.message.messageId
+                inputLower = Text.toLower (context.input.text)
+                groupMentioned =
+                  any (`Text.isInfixOf` inputLower)
+                    ["群赛文", "本群赛文", "这个群的赛文", "群里的赛文", "本群的赛文"]
+                contestText =
+                  if groupMentioned then "999" else Text.strip (fromMaybe "" contest)
+                userText =
+                  case Text.strip (fromMaybe "" user) of
+                    "" -> Text.strip (fromMaybe "" context.message.senderUsername)
+                    other -> other
+                url
+                  | not (Text.null contestText) =
+                      "http://172.20.0.4:8077/contest/chart.png?contest=" <> contestText
+                        <> "&group_id=" <> chatIdText
+                        <> "&days=" <> Text.pack (show days)
+                        <> "&mode=" <> (if Text.strip (fromMaybe "rank" mode) == "trend" then "trend" else "rank")
+                        <> "&user=" <> userText
+                        <> cacheBust
+                  | otherwise =
+                      -- 没点名赛文：老的个人成绩历史图（555/AI赛文那套）
+                      "http://172.20.0.4:8077/reports/score-chart.png?name="
+                        <> userText
+                        <> "&days=" <> Text.pack (show (max 1 (min 3650 days)))
+                        <> cacheBust
+            sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
+            case rights sent of
+              _ : _ -> pure (toolText "成绩图表已发送。")
+              [] -> do
+                let err = Text.intercalate "；" (lefts sent)
+                pure (toolFailure Failure.Failure
+                  { category = Failure.ExternalServiceUnavailable
+                  , userMessage = "成绩图表发送失败：" <> err
+                  , detail = err
+                  })
 
 fmBotGuardAccountsTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmBotGuardAccountsTool =
