@@ -13,6 +13,7 @@ module Bot.Agent.Tools.Chat
   , recallSelfMessagesTool
   , recallRecentSelfMessagesTool
   , sendReplyTool
+  , messageBreakTool
   , sendFileTool
   , mentionUserTool
   , replyPrefixTool
@@ -283,6 +284,17 @@ recallRecentSelfMessagesTool =
               "已成功撤回最近 " <> show successes <> " 条 FM 消息。"
             (successes, failures) ->
               "已撤回 " <> show successes <> " 条，另有 " <> show failures <> " 条撤回失败。"
+
+-- | 一个空工具：模型调用它来表示"这条消息到此为止"。
+--
+-- 断点由模型决定，而不是由字数规则猜——这是 dsh-im-humanize 打磨出来的做法。
+-- 工具本身什么都不做，回复管线把这个调用当作消息分隔。
+messageBreakTool :: Tool (Eff es)
+messageBreakTool =
+  tagged [chatTag]
+  . withDescription "Insert a chat message break here: everything you have written so far is delivered as its own chat message, and you continue afterwards. Call it when you would pause and send another line. It performs no action; pass no arguments."
+  $ tool "message_break" noArguments do
+      pure (toolText "break")
 
 sendReplyTool :: Chat.Chat :> es => Tool (Eff es)
 sendReplyTool =

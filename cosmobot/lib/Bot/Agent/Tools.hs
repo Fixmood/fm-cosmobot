@@ -138,6 +138,7 @@ defaultToolsWith extraTools = tools
       , chatModelResetTool
       , queryChatLogTool
       , queryCurrentSenderChatLogTool
+      , messageBreakTool
       , stickerListTool
       , stickerSendTool
       , recallRecentSelfMessagesTool

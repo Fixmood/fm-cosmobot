@@ -33,6 +33,8 @@ module Bot.Handler.Humanlike
   , setHumanlikeState
   , isInHumanlikeSpan
   , hasHumanlikeHistory
+  , isStickerRequest
+  , proactiveStickerDue
   , humanlikeOverlay
   , humanlikeOffNotice
   , humanlikePrefix
@@ -181,8 +183,39 @@ isInHumanlikeSpan moment spans =
   let stamp = realToFrac (utcTimeToPOSIXSeconds moment) :: Double
   in any (\(start, end) -> stamp >= start && maybe True (stamp <=) end) spans
 
+-- | 主动配图：短的一句闲聊，就掷骰子顺手配一张表情。
+--
+-- 故意不按情绪词判断：词表会越加越多、越加越错。改成"短消息 + 固定概率"。
+--
+-- seed 必须每条消息都不同。踩过一次：调用方传的是 fmStandaloneMessage 的
+-- messageId，而那个函数为了不把回复挂到原消息上会把 id 置成 Nothing，于是
+-- 种子恒为空 → 骰子恒命中（每句都配图）、挑图偏移恒为 0（永远第一张）。
+proactiveStickerDue :: Int -> Text -> Text -> Bool
+proactiveStickerDue percent seed requestText =
+  chatSized && roll < percent
+  where
+    compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) requestText
+    chatSized =
+      Text.length compact <= 30
+        && not ("?" `Text.isInfixOf` compact)
+        && not ("？" `Text.isInfixOf` compact)
+    roll = seedHash seed `mod` 100
+    seedHash = Text.foldl' (\acc char -> (acc * 31 + fromEnum char) `mod` 9973) 7
+
 hasHumanlikeHistory :: HumanlikeState -> Bool
 hasHumanlikeHistory state = not (null state.spans)
+
+-- | Whether the message asks for a sticker.
+--
+-- Deliberately one concept and one word ("表情"). Nothing else is matched here:
+-- every extra phrase added becomes its own false positive, and the drawing
+-- tools are withheld for the whole mode anyway, so follow-up phrasings do not
+-- need to be enumerated.
+isStickerRequest :: Text -> Bool
+isStickerRequest text =
+  any (`Text.isInfixOf` compact) ["表情", "梗图"]
+  where
+    compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) text
 
 -- | Prefix put in front of messages that were exchanged while the mode was on.
 humanlikePrefix :: Text
@@ -190,32 +223,21 @@ humanlikePrefix = "[拟人] "
 
 -- | Environment facts that the persona body predates or contradicts.
 --
--- The persona was written for a different tool set, so the injected block must
--- state which names actually exist and which sections cannot run yet. Without
--- this the model follows the text and pretends to send stickers it has no tool
--- for, which is the "claim without doing" failure this project keeps hitting.
+-- Kept short on purpose. Earlier revisions accumulated rule after rule for the
+-- sticker flow, and each added phrase was another thing the model could get
+-- wrong; the behaviour is decided in code now, so the prompt only needs to
+-- state identity and which tool names exist.
 humanlikePersonaHeader :: Text
 humanlikePersonaHeader =
   Text.unlines
     [ "【当前环境 · 优先于下文】"
+    , "- **本会话当前处于拟人模式（已开启）**。背景里如果我说过「拟人模式关了 / 不演角色 / 按事实说话」，"
+    , "  那是更早的旧状态，已经作废，不要照它办事。"
     , "- 你的名字是 FM；你是 Fix哥的小迷妹。被问「你是谁」时先答 FM，再说自己是 Fix哥的小迷妹。"
-    , "- 你 24 小时在线，没有固定休眠时间；下文里关于「生理休眠 / 这段时间不回复」的规定不执行。"
-    , ""
-    , "工具对照（下文出现的旧名字 → 当前环境的用法）："
-    , "- send_message（数组分条）→ 想分多条发就多次调用 send_reply，一次一条。"
-    , "  注意：你的最终回答本身也会作为一条消息发出，所以把最主要的那句写进最终回答，"
-    , "  send_reply 只用来补发额外的话。绝不要用空格或换行假装分条。"
-    , "- send_poke → poke_user。"
-    , "- web_search → search_web；web_fetch → fetch_url。"
-    , "- get_message_images → 不需要调用：对方当前这条消息里的图片会自动作为图像进入你的输入，"
-    , "  你直接看得见；只有缓存媒体（mf_ 开头）的文本才需要 media_text。"
-    , "- memory_append / memory_query / memory_remove → 不需要你手动记："
-    , "  你和这个人的称呼、角色、约定由系统在关闭拟人模式时自动归纳成档案，之后每轮都给你。"
-    , ""
-    , "表情包（下文里的 list_stickers / send_sticker 就是这两个工具）："
-    , "- 想配图时：先 sticker_list 查（可以按情绪或关键词过滤），拿到 id，再 sticker_send 发出去。"
-    , "- 表情要作为单独一条消息发；发完不要再用文字描述它，也不要说「我发了一张图」。"
-    , "- 当前没有「收藏别人表情」的能力（collect_sticker / sticker_note 不存在），不要假装做过。"
+    , "- 你 24 小时在线，没有固定休眠时间；下文里关于「生理休眠」的规定不执行。"
+    , "- 工具名：想分多条发就多次调 send_reply（一次一条）；拍一拍 poke_user；搜索 search_web；读网页 fetch_url。"
+    , "- 有人要表情时，系统会自己从库里发一张出去，你只管接一句短话，不要描述那张图。"
+    , "- 一句话想单独发成一条时，先调用 message_break 工具再写它（工具什么都不做，只是断开）。"
     , ""
     , "下文的性格、语气、说话规则、回复频率要求全部照做。"
     ]

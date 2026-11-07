@@ -15,6 +15,10 @@ module Bot.Handler.Ask.AgentRun
   , earlyFlushDue
   , earlyFlushMinChars
   , continuationReplyChunks
+  , humanlikeNextPiece
+  , humanlikeBreakPiece
+  , humanlikeStructured
+  , humanlikeTypingDelayUs
   , reminderEntries
   )
 where
@@ -23,6 +27,7 @@ import Control.Monad.Trans.Class (lift)
 import qualified Bot.Agent as Agent
 import qualified Bot.Agent.Tool as AgentTool
 import qualified Bot.Agent.Tools as AgentTools
+import qualified Bot.Agent.Tools.Sticker as Sticker
 import qualified Bot.Agent.Failure as Failure
 import qualified Bot.Agent.Middleware.Observation as AgentObservation
 import Bot.Core.Thread
@@ -119,6 +124,29 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   humanlike <- humanlikeContext message
   humanlikePersona <- Humanlike.loadHumanlikePersonaText message
   humanlikeRecord <- HumanlikeArchive.loadHumanlikeRecordText message
+  logInfo [i|humanlike state: enabled=#{humanlike.enabled} persona_chars=#{Text.length humanlikePersona} record_chars=#{Text.length humanlikeRecord} kind=#{show message.kind :: String}|]
+  -- 拟人模式下要表情，或短句闲聊命中主动配图概率时，由代码直接把库存里的那张发出去。
+  -- 交给模型选工具试过三轮：它宁可 typst_render 现画、被收走后再用
+  -- tool_enable 把画图组重新打开，也不肯调 sticker_send。
+  --
+  -- 种子用**原始** messageId + 开始时间：outputMessage 是 fmStandaloneMessage
+  -- 的产物，messageId 被它清成了 Nothing，拿它当种子会恒定命中并总挑同一张。
+  let stickerSeed =
+        maybe "" (Text.pack . show) message.messageId <> "|" <> Text.pack (show startedAt)
+      stickerPercent =
+        case message.kind of
+          ChatGroup -> humanlikeProactiveStickerPercentGroup
+          _ -> humanlikeProactiveStickerPercentPrivate
+      stickerWanted =
+        humanlike.enabled
+          && (Humanlike.isStickerRequest input.text || Humanlike.proactiveStickerDue stickerPercent stickerSeed input.text)
+  stickerSent <- if stickerWanted
+    then do
+      catalog <- Sticker.loadStickerCatalog
+      case catalog >>= \loaded -> Sticker.pickStickerForRequest stickerSeed input.text loaded.stickers of
+        Nothing -> pure False
+        Just sticker -> Sticker.sendStickerMessage outputMessage sticker
+    else pure False
   rosterTriggers <- loadRosterTriggers message
   Chat.rememberRosterTriggers message rosterTriggers
   (recentContextMessages, recentChatContext) <- loadRecentChatContext cfg humanlike message startedAt
@@ -127,20 +155,30 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       aiContestConstraint = aiContestGenerationSystemPrompt startedAt input.text
       imageTaskConstraint = imageTaskSystemPrompt message
       imageSearchConstraint = imageSearchSystemPrompt message
-      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, humanlikeRecordPrompt humanlikeRecord, humanlikeInstruction humanlike humanlikePersona])
+      stickerRequestConstraint
+        | stickerSent = Text.unlines
+            [ "**表情已发**"
+            , "- 刚才那张表情已经作为单独一条消息发出去了，你不需要再调用 sticker_send 或 sticker_list。"
+            , "- 现在只要回一句很短的话（十来个字），不要描述那张图，也不要说「已发送」。"
+            ]
+        | otherwise = ""
+      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, humanlikeInstruction humanlike humanlikePersona])
       requestTranscript = if isImageTask message then startWithUserInput input else transcript
       context = agentContext toolCfg cfg outputMessage input effectiveSystemPrompt
-      selectedTools = AgentTools.selectToolsForMessage context tools
+      selectedTools = humanlikeSelectTools humanlike input.text (AgentTools.selectToolsForMessage context tools)
       (toolMode, toolCategory) = AgentTools.toolSelectionSummary context tools
       platformText = show message.platform :: String
       kindText = show message.kind :: String
       contextMessageCount = length requestTranscript.messages
       recentContextChars = Text.length recentChatContext
       recentContextTokens = (recentContextChars + 3) `div` 4
+  logInfo [i|humanlike prompt: enabled=#{humanlike.enabled} persona_chars=#{Text.length humanlikePersona} injected=#{personaInjected humanlikePersona effectiveSystemPrompt} system_chars=#{Text.length effectiveSystemPrompt}|]
   logInfo [i|FM ask started: platform=#{platformText} kind=#{kindText} tool_mode=#{toolMode} tools=#{length selectedTools}/#{length tools} category=#{toolCategory} context_messages=#{contextMessageCount} recent_chat_messages=#{recentContextMessages} recent_chat_chars=#{recentContextChars} recent_chat_tokens_estimate=#{recentContextTokens} compaction_threshold_ktokens=#{compactionThresholdTokens cfg `div` 1000}|]
   -- 复杂任务：先发一句「我打算怎么做」，做完再给完整结论
   -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
-  when (isComplexRequest input.text && not (isImageTask message)) $ do
+  -- 拟人模式下不发计划预告：那句「我先确认…再查相关记录后回复」是助手腔，
+  -- 和这个人设正相反，用户实测一眼就看出"味道不对"。
+  when (isComplexRequest input.text && not (isImageTask message) && not humanlike.enabled) $ do
     plan <- quickPlan input.text
     when (not (Text.null (Text.strip plan))) $
       void $ Chat.replyTo outputMessage ("😻 FM：" <> Text.strip plan)
@@ -157,7 +195,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       selectedTools
       \runtime ->
         withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text requestTranscript \activeReply -> do
-          reply <- streamAgentReply runtime activeReply outputMessage requestTranscript rosterTriggers
+          reply <- streamAgentReply (humanlikeStreaming humanlike) runtime activeReply outputMessage requestTranscript rosterTriggers
           finishedAt <- liftIO getCurrentTime
           let replyResult = reply.result
               replyStatus = replyResult.status
@@ -181,6 +219,28 @@ humanlikeContext message =
     `catchSync` \err -> do
       logWarning [i|humanlike switch lookup failed: #{show err :: String}|]
       pure Humanlike.disabledHumanlike
+
+-- | In humanlike mode, a request for a sticker must not leave the drawing tools
+-- within reach.
+--
+-- This is deliberately a tool-set change rather than another sentence of
+-- instruction: with the choice available the model rendered a fresh picture
+-- with typst_render three times in a row, across two prompt rewrites that
+-- spelled out the rule in bold. Removing the tool is what actually decides it.
+humanlikeSelectTools
+  :: Humanlike.HumanlikeState
+  -> Text
+  -> [AgentTool.Tool (Eff es)]
+  -> [AgentTool.Tool (Eff es)]
+humanlikeSelectTools state _requestText
+  | state.enabled = filter (not . drawingTool . AgentTool.toolName)
+  | otherwise = id
+  where
+    -- 拟人模式下永远不给画图工具。先试过"只在要表情时收走"，模型改用
+    -- tool_enable 把画图组重新打开；之后又在"再来一张"这类不含"表情"
+    -- 二字的追补请求里画图，还被当成 png 文件发出来。这个模式就是聊天，
+    -- 画图留给平常模式。
+    drawingTool name = name `elem` ["typst_render", "image_generate", "image_edit"]
 
 -- | The durable relationship record, injected in **both** modes.
 --
@@ -604,13 +664,14 @@ streamAgentReply
      , Prim :> es
      , Concurrent :> es
   )
-  => Agent.Runtime '[] (Eff es)
+  => Bool
+  -> Agent.Runtime '[] (Eff es)
   -> ActiveReplyState
   -> IncomingMessage
   -> Transcript
   -> [Text]
   -> Eff es AgentReply
-streamAgentReply runtime activeReply message transcript triggers =
+streamAgentReply humanlikeMode runtime activeReply message transcript triggers =
   do
     let sink = Agent.ToolEmittedMessageSink (rememberToolEmittedMessage activeReply)
         program =
@@ -623,7 +684,7 @@ streamAgentReply runtime activeReply message transcript triggers =
     (lastReply, replyResult) <-
       S.mapM_
         (recordReplyUpdate activeReply)
-        (Chat.streamMultipleRepliesTo message (agentReplyTextSegments message.text triggers (autoContinuingAgentStream program message transcript)))
+        (Chat.streamMultipleRepliesTo message (agentReplyTextSegments humanlikeMode message.text triggers (autoContinuingAgentStream program message transcript)))
     let responseId = lastReply.responseId
         (answer, result) = replyResult
         correctedResult = result
@@ -743,27 +804,29 @@ isExplicitImageSearchRequest raw =
 -- tool call follows, that text is process narration and is deliberately
 -- discarded instead of being exposed in chat.
 agentReplyTextSegments
-  :: (Prim :> es, LLM.LLM :> es, KatipE :> es)
-  => Text
+  :: (Prim :> es, LLM.LLM :> es, KatipE :> es, Concurrency.Concurrency :> es)
+  => Bool
+  -> Text
   -> [Text]
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Stream (Of Text) (Eff es)) (Eff es) (Text, Agent.Result)
-agentReplyTextSegments request triggers =
-  S.maps (S.mapMaybe id) . S.breaks isNothing . agentReplyTextEvents request triggers
+agentReplyTextSegments humanlikeMode request triggers =
+  S.maps (S.mapMaybe id) . S.breaks isNothing . agentReplyTextEvents humanlikeMode request triggers
 
 agentReplyTextEvents
-  :: (Prim :> es, LLM.LLM :> es, KatipE :> es)
-  => Text
+  :: (Prim :> es, LLM.LLM :> es, KatipE :> es, Concurrency.Concurrency :> es)
+  => Bool
+  -> Text
   -> [Text]
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Of (Maybe Text)) (Eff es) (Text, Agent.Result)
-agentReplyTextEvents request triggers stream = do
+agentReplyTextEvents humanlikeMode request triggers stream = do
   retryUsed <- lift (IORef.newIORef False)
   openingHandled <- lift (IORef.newIORef False)
   earlyFlushed <- lift (IORef.newIORef False)
-  go retryUsed openingHandled earlyFlushed mempty mempty stream
+  go retryUsed openingHandled earlyFlushed 0 mempty mempty stream
   where
-    go retryUsed openingHandled earlyFlushed answer pending currentStream = do
+    go retryUsed openingHandled earlyFlushed pieceIndex answer pending currentStream = do
       next <- lift (S.next currentStream)
       case next of
         Left result -> do
@@ -776,21 +839,66 @@ agentReplyTextEvents request triggers stream = do
         Right (Agent.ContentDelta chunk, rest) -> do
           let pendingText = renderReplyText (appendReplyText chunk pending)
           alreadyFlushed <- lift (IORef.readIORef earlyFlushed)
-          -- A long answer does not have to wait for its own ending. Process
-          -- narration is short and rarely reaches a finished sentence, so once a
-          -- body is this long its beginning is the answer itself; sending it now
-          -- turns "wait for the whole reply" into "wait for the first sentence".
-          if not alreadyFlushed && Text.null (renderReplyText answer) && earlyFlushDue request pendingText
-            then do
-              lift (logInfo [i|FM early flush: sending #{Text.length pendingText} chars before the turn ended|])
-              yieldFinalReply True pendingText
-              lift (IORef.writeIORef earlyFlushed True)
-              go retryUsed openingHandled earlyFlushed (appendReplyText pendingText answer) mempty rest
-            else go retryUsed openingHandled earlyFlushed answer (appendReplyText chunk pending) rest
-        Right (Agent.ToolCallNotification{}, rest) -> do
-          S.yield Nothing
-          lift (IORef.writeIORef earlyFlushed False)
-          go retryUsed openingHandled earlyFlushed answer mempty rest
+          if humanlikeMode
+            && pieceIndex < humanlikeMaxSegments - 1
+            && Text.length pendingText >= humanlikeMinPieceChars
+            && not (humanlikeStructured pendingText)
+            then
+              -- 拟人模式：模型自己写的换行就是换气点，按它切。
+              -- 条数有硬上限：超过 humanlikeMaxSegments 就不再拆，剩下的留到最后
+              -- 一次性发完。三家成熟实现都是这个思路（openhuman 2–5 条、
+              -- goclaw "at most configured max messages"、astrbot 默认 3 条），
+              -- 否则一段话能连着发六条，比不拆还像刷屏。
+              case humanlikeNextPiece pendingText of
+                Just (piece, restText) -> do
+                  lift (logInfo [i|FM humanlike flush: #{Text.length piece} chars mid-turn|])
+                  yieldFinalReply (not alreadyFlushed) piece
+                  -- QQ 的流式是把后续内容追加进同一条消息，只 yield 文本的话
+                  -- 几段会被拼成一个气泡。这个 Nothing 才是"这条说完了"的分隔，
+                  -- 有了它每一段才是独立的一条消息。
+                  S.yield Nothing
+                  lift (IORef.writeIORef earlyFlushed True)
+                  -- 模拟真人的停顿：想一下 + 按字数敲 + 抖动，间隔不是固定值。
+                  lift (Concurrency.sleepMicroseconds (humanlikeTypingDelayUs pieceIndex piece))
+                  go retryUsed openingHandled earlyFlushed (pieceIndex + 1)
+                    (appendReplyText piece answer) (TextBuilder.fromText restText) rest
+                Nothing -> go retryUsed openingHandled earlyFlushed pieceIndex answer (appendReplyText chunk pending) rest
+            else
+              -- A long answer does not have to wait for its own ending. Process
+              -- narration is short and rarely reaches a finished sentence, so once a
+              -- body is this long its beginning is the answer itself; sending it now
+              -- turns "wait for the whole reply" into "wait for the first sentence".
+              if not alreadyFlushed && Text.null (renderReplyText answer) && earlyFlushDue request pendingText
+                then do
+                  lift (logInfo [i|FM early flush: sending #{Text.length pendingText} chars before the turn ended|])
+                  yieldFinalReply True pendingText
+                  lift (IORef.writeIORef earlyFlushed True)
+                  go retryUsed openingHandled earlyFlushed (pieceIndex + 1) (appendReplyText pendingText answer) mempty rest
+                else go retryUsed openingHandled earlyFlushed pieceIndex answer (appendReplyText chunk pending) rest
+        Right (Agent.ToolCallNotification toolCalls, rest) -> do
+          -- message_break 是模型自己标记的换气点：它什么都不做，只表示"这条到此为止"。
+          let breakRequested =
+                humanlikeMode
+                  && pieceIndex < humanlikeMaxSegments - 1
+                  && any ((== messageBreakToolName) . (.name)) (toList toolCalls)
+          if breakRequested
+            then
+              case humanlikeBreakPiece (renderReplyText pending) of
+                Just (piece, restText) -> do
+                  alreadyFlushed <- lift (IORef.readIORef earlyFlushed)
+                  lift (logInfo [i|FM humanlike break: #{Text.length piece} chars|])
+                  yieldFinalReply (not alreadyFlushed) piece
+                  S.yield Nothing
+                  lift (IORef.writeIORef earlyFlushed True)
+                  lift (Concurrency.sleepMicroseconds (humanlikeTypingDelayUs pieceIndex piece))
+                  go retryUsed openingHandled earlyFlushed (pieceIndex + 1)
+                    (appendReplyText piece answer) (TextBuilder.fromText restText) rest
+                Nothing -> go retryUsed openingHandled earlyFlushed pieceIndex answer mempty rest
+            else do
+              S.yield Nothing
+              -- 拟人模式下前缀只出现一次，工具调用不重置它。
+              unless humanlikeMode $ lift (IORef.writeIORef earlyFlushed False)
+              go retryUsed openingHandled earlyFlushed pieceIndex answer mempty rest
         Right (Agent.ReplyBoundary, rest) -> do
           completedChunk <- lift (correctVisibleReply retryUsed openingHandled request (renderReplyText pending))
           let
@@ -798,7 +906,7 @@ agentReplyTextEvents request triggers stream = do
           yieldFinalReply True completedChunk
           S.yield Nothing
           lift (IORef.writeIORef earlyFlushed False)
-          go retryUsed openingHandled earlyFlushed completedAnswer mempty rest
+          go retryUsed openingHandled earlyFlushed (pieceIndex + 1) completedAnswer mempty rest
 
     -- The prefix belongs to the first part of a delivered message. Later parts
     -- are appended (streaming) or edited into that same body, so repeating the
@@ -806,6 +914,184 @@ agentReplyTextEvents request triggers stream = do
     yieldFinalReply prefixed =
       traverse_ (S.yield . Just)
         . if prefixed then streamingReplyChunksForRequest triggers request else continuationReplyChunks
+
+-- | 模型用这个空工具标记一条消息的结束（对应 dsh-im-humanize 的 message_break）。
+messageBreakToolName :: Text
+messageBreakToolName = "message_break"
+
+-- | Pause between two humanlike bubbles, in microseconds.
+--
+-- It is deliberately not constant: a fixed interval reads as a metronome. The
+-- three parts are a thinking pause, a typing time proportional to how much text
+-- just went out, and a jitter derived from the text itself (there is no random
+-- dependency here, and the text is already varied).
+humanlikeTypingDelayUs :: Int -> Text -> Int
+humanlikeTypingDelayUs pieceIndex chunk =
+  max minDelayUs (min maxDelayUs (round (fromIntegral base * rhythm)))
+  where
+    thinkUs = 220_000
+    typingUs = Text.length chunk * 32_000
+    jitterUs = digest * 160
+    base = thinkUs + typingUs + jitterUs
+    digest = Text.foldl' (\acc char -> (acc * 33 + fromEnum char) `mod` 997) (pieceIndex * 7919 + 13) chunk
+    -- 断续节奏：真人不是匀速的，偶尔连着发、偶尔停下来想。用同一份 digest
+    -- 再摇一次，不引入随机数依赖。
+    rhythm = case digest `mod` 100 of
+      value | value < 25 -> 0.55
+      value | value > 85 -> 1.9
+      _ -> 1.0
+    minDelayUs = 200_000
+    maxDelayUs = 2_500_000
+
+-- | 人设文本是否真的落进了最终的 system prompt。
+--
+-- 用来把"文件在不在"和"有没有进 prompt"分开：两者都会让人以为人设生效了，
+-- 只有这一项能证明模型确实收到了。
+personaInjected :: Text -> Text -> Bool
+personaInjected persona finalPrompt =
+  Text.length persona >= 80
+    && Text.isInfixOf (Text.take 60 persona) finalPrompt
+
+-- | 主动配图概率。群里人多、消息密，所以要低得多；私聊可以高一些。
+humanlikeProactiveStickerPercentPrivate :: Int
+humanlikeProactiveStickerPercentPrivate = 25
+
+humanlikeProactiveStickerPercentGroup :: Int
+humanlikeProactiveStickerPercentGroup = 8
+
+-- | 太短的回复不拆：一条就能说完，拆开反而像刷屏。
+--
+-- openhuman 的 messageSegmentation 就是这么做的（< 80 字符直接整条发），
+-- 另外两家也把"短回复"列为不可拆的情况。
+humanlikeMinPieceChars :: Int
+humanlikeMinPieceChars = 40
+
+-- | 结构化内容整体发，不拆。
+--
+-- 代码、行内代码、编号/项目列表、引用、表格、链接，一旦拆开会直接读不懂；
+-- goclaw 的 splitter 明确"preserves fenced code, quotes, tables, lists, links"，
+-- astrbot 也写着"长文、代码、列表和引用尽量不要主动分段"。
+humanlikeStructured :: Text -> Bool
+humanlikeStructured text =
+  any (`Text.isInfixOf` text) ["```", "`", "http://", "https://"]
+    || any isListLine (Text.lines text)
+  where
+    isListLine line =
+      let stripped = Text.strip line
+      in case Text.uncons stripped of
+           Just ('-', rest) | Text.isPrefixOf " " rest -> True
+           Just ('*', rest) | Text.isPrefixOf " " rest -> True
+           Just ('>', _) -> True
+           Just ('|', _) -> True
+           Just (char, _)
+             | char >= '0' && char <= '9' ->
+                 any (`Text.isInfixOf` stripped) [". ", "、", "）", ")"]
+           _ -> False
+
+-- | 一轮回复最多拆成几条消息（含最后收尾那条）。
+--
+-- 这个上限比"怎么切"更重要：没有它，一段长回复会被拆成五六条，读起来就是刷屏。
+humanlikeMaxSegments :: Int
+humanlikeMaxSegments = 3
+
+-- | 单行超过这么多字才退回到标点兜底，避免一口气发一条。
+humanlikeMaxLineChars :: Int
+humanlikeMaxLineChars = 48
+
+-- | 切出下一段：优先用模型自己写的换行。
+--
+-- 它本来就在那里分行（真人换气就是换行），而按字数切永远会把词切断——实测
+-- 把「轻一点儿嘛」切成「轻 / 点儿嘛」。所以这里只认换行；代码块内部的换行
+-- 不算，单行过长才退回到标点兜底。
+humanlikeNextPiece :: Text -> Maybe (Text, Text)
+humanlikeNextPiece pending =
+  case firstSafeLineBreak (Text.unpack pending) of
+    Just index ->
+      let (headPart, tailPart) = Text.splitAt index pending
+          rest = Text.drop 1 tailPart
+      in case nonEmptyPiece headPart of
+           Just piece -> Just (piece, rest)
+           Nothing -> humanlikeNextPiece rest
+    Nothing -> humanlikeLongLine pending
+
+-- | 扫描下一个"安全的换行"。
+--
+-- 规则照抄 qikou：代码块、行内代码、引号括号、加粗标记内部都不是断点——
+-- 在那里切开会把 Markdown 或引文撕成两半。返回的是换行符在字符串中的下标。
+firstSafeLineBreak :: String -> Maybe Int
+firstSafeLineBreak = go 0 splitScanEmpty
+  where
+    go _ _ [] = Nothing
+    go index state ('\n' : _)
+      | splitBreakAllowed state = Just index
+    go index state ('`' : '`' : '`' : rest)
+      | not state.inInlineCode = go (index + 3) state{inCodeFence = not state.inCodeFence} rest
+    go index state ('`' : rest)
+      | not state.inCodeFence = go (index + 1) state{inInlineCode = not state.inInlineCode} rest
+    go index state ('*' : '*' : rest)
+      | not state.inCodeFence && not state.inInlineCode =
+          go (index + 2) state{boldMarkers = state.boldMarkers + 1} rest
+    go index state (char : rest)
+      | not state.inCodeFence && not state.inInlineCode =
+          case bracketDelta char of
+            Just delta -> go (index + 1) state{bracketDepth = max 0 (state.bracketDepth + delta)} rest
+            Nothing -> go (index + 1) state rest
+    go index state (_ : rest) = go (index + 1) state rest
+
+data SplitScan = SplitScan
+  { inCodeFence :: !Bool
+  , inInlineCode :: !Bool
+  , bracketDepth :: !Int
+  , boldMarkers :: !Int
+  }
+
+splitScanEmpty :: SplitScan
+splitScanEmpty = SplitScan{inCodeFence = False, inInlineCode = False, bracketDepth = 0, boldMarkers = 0}
+
+splitBreakAllowed :: SplitScan -> Bool
+splitBreakAllowed state =
+  not state.inCodeFence
+    && not state.inInlineCode
+    && state.bracketDepth <= 0
+    && even state.boldMarkers
+
+bracketDelta :: Char -> Maybe Int
+bracketDelta char
+  | char `elem` ("「『“（([【" :: String) = Just 1
+  | char `elem` ("」』”）)]】" :: String) = Just (-1)
+  | otherwise = Nothing
+
+-- | 显式换气点：模型调用 message_break 时，把已生成的整段作为一条消息发出。
+humanlikeBreakPiece :: Text -> Maybe (Text, Text)
+humanlikeBreakPiece pending =
+  case nonEmptyPiece pending of
+    Just piece -> Just (piece, "")
+    Nothing -> Nothing
+
+
+-- | 一整行还没有换行时，才在标点处兜底切，实在没有标点就按上限切。
+humanlikeLongLine :: Text -> Maybe (Text, Text)
+humanlikeLongLine pending
+  | Text.length pending <= humanlikeMaxLineChars = Nothing
+  | otherwise =
+      let window = Text.take humanlikeMaxLineChars pending
+          breaks =
+            [ index + 1
+            | (index, char) <- zip [0 ..] (Text.unpack window)
+            , char `elem` ("，,、；;：: " :: String)
+            ]
+          cut = fromMaybe humanlikeMaxLineChars (viaNonEmpty last (filter (>= 6) breaks))
+      in case nonEmptyPiece (Text.take cut pending) of
+           Just piece -> Just (piece, Text.drop cut pending)
+           Nothing -> Nothing
+
+nonEmptyPiece :: Text -> Maybe Text
+nonEmptyPiece text =
+  let stripped = Text.strip text
+  in if Text.null stripped then Nothing else Just stripped
+
+humanlikeStreaming :: Humanlike.HumanlikeState -> Bool
+humanlikeStreaming state = state.enabled
 
 requestedOpeningSystemPrompt :: Text -> Text
 requestedOpeningSystemPrompt request =

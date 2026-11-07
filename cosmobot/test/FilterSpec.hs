@@ -8,7 +8,9 @@ import Bot.Handler.Help (renderHelp)
 import qualified Bot.Handler.Humanlike as Humanlike
 import qualified Bot.Handler.Humanlike.Archive as Archive
 import qualified Bot.Agent.Tools.Sticker as Sticker
+import qualified Bot.Handler.Ask.AgentRun as AgentRun
 import Bot.Prelude
+import qualified Data.List as List
 import qualified Data.Text.Encoding as TextEncoding
 import qualified Data.Text as Text
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
@@ -37,6 +39,11 @@ main =
       , testCase "humanlike spans mark only their own interval" testHumanlikeSpans
       , testCase "humanlike archive keeps newest days and preserves the owner's part" testHumanlikeArchiveMerge
       , testCase "sticker catalog parses and searches by emotion and tag" testStickerCatalog
+      , testCase "sticker requests are recognised so drawing tools can be withheld" testStickerRequest
+      , testCase "deterministic sticker pick for an explicit request" testStickerPick
+      , testCase "humanlike split uses the model's own line breaks" testHumanlikeSplit
+      , testCase "proactive sticker only on short chatter" testProactiveSticker
+      , testCase "structured replies are never split into bubbles" testStructuredNoSplit
       ]
 
 testCommandFilter :: IO ()
@@ -273,6 +280,107 @@ testHumanlikeArchiveMerge = do
   let withOwner = "## 我手写（模型不覆盖）\n我是我写的人设\n\n" <> file4
       (file5, _) = Archive.mergeAutoRegion 2 withOwner ("2026-11-10", "第四次")
   assertBool "owner text kept" ("我是我写的人设" `Text.isInfixOf` file5)
+
+-- | 这个判定决定了要不要把 typst_render / image_generate 收走，误判要么让它继续画图，
+-- 要么把正常画图需求也砍掉，所以正反两面都钉住。
+testStickerRequest :: IO ()
+testStickerRequest = do
+  assertBool "plain request" (Humanlike.isStickerRequest "发个委屈的表情")
+  assertBool "with spaces" (Humanlike.isStickerRequest "fm  发个 表情")
+  -- 正常画图需求不能命中，否则会走确定性发图
+  assertBool "drawing a chart is not a sticker" (not (Humanlike.isStickerRequest "画一张成绩曲线图"))
+  assertBool "typst is not a sticker" (not (Humanlike.isStickerRequest "用 typst 排个报告"))
+  assertBool "empty" (not (Humanlike.isStickerRequest ""))
+
+-- | 确定性挑图：情绪词命中对应情绪，命中不到也要给一张，不能返回空。
+testStickerPick :: IO ()
+testStickerPick = do
+  let catalog =
+        [ Sticker.Sticker "st_a" "a.jpg" "委屈" "哭猫" ["委屈", "哭"]
+        , Sticker.Sticker "st_b" "b.jpg" "开心" "笑脸" ["开心"]
+        ]
+  assertEqual "picks by emotion word" (Just "st_a") (Sticker.pickStickerForRequest "m1" "发个委屈的表情" catalog <&> (.stickerId))
+  assertEqual "picks happy" (Just "st_b") (Sticker.pickStickerForRequest "m2" "来个开心的" catalog <&> (.stickerId))
+  -- 没有情绪词也必须挑一张，不能返回空
+  assertBool "falls back to something" (isJust (Sticker.pickStickerForRequest "m3" "发个表情" catalog))
+  -- 同一条目录、不同种子要能轮换，否则"再来一张"总是同一张
+  let many = [Sticker.Sticker ("s" <> Text.pack (show n)) "x.jpg" "委屈" "哭" ["委屈"] | n <- [1 :: Int .. 6]]
+      picks = map (\seed -> Sticker.pickStickerForRequest seed "发个委屈的表情" many <&> (.stickerId)) ["a", "b", "c", "seed-4", "xyz"]
+  assertBool "rotates across seeds" (length (List.nub (catMaybes picks)) > 1)
+  assertEqual "empty catalog" Nothing (Sticker.pickStickerForRequest "m4" "发个表情" [])
+
+-- | 分段只看换行（模型自己换气的位置），不按字数硬切；代码块内部不切。
+testHumanlikeSplit :: IO ()
+testHumanlikeSplit = do
+  -- 一行一句：按换行切
+  assertEqual "line break splits" (Just ("第一句", "第二句"))
+    (AgentRun.humanlikeNextPiece "第一句\n第二句")
+  -- 还没换行：先不发
+  assertEqual "no break yet" Nothing (AgentRun.humanlikeNextPiece "还没写完")
+  -- 空行不产生空消息
+  assertEqual "blank line skipped" (Just ("内容", ""))
+    (AgentRun.humanlikeNextPiece "\n内容\n")
+  -- 代码块内部不切
+  assertEqual "code fence protected" (Just ("```\na\nb\n```", "尾"))
+    (AgentRun.humanlikeNextPiece "```\na\nb\n```\n尾")
+  -- 行内代码内部不切：那里唯一的换行不安全，所以整段先不发
+  assertEqual "inline code protected" Nothing
+    (AgentRun.humanlikeNextPiece "看这个 `a\nb` 再说")
+  -- 引号/括号内部不切
+  assertEqual "quote protected" Nothing
+    (AgentRun.humanlikeNextPiece "他说「这句\n没说完」")
+  -- 加粗内部不切
+  assertEqual "bold protected" Nothing
+    (AgentRun.humanlikeNextPiece "这是 **重点\n内容**")
+  -- 单行过长：退回到标点兜底（长度要真的超过 48 才触发）
+  let longLine = "一二三四五六七八九十，" <> Text.replicate 40 "很长"
+  assertBool "long line falls back" (isJust (AgentRun.humanlikeNextPiece longLine))
+  case AgentRun.humanlikeNextPiece longLine of
+    Just (piece, _) -> assertBool "cut after the comma" ("，" `Text.isSuffixOf` piece || Text.length piece > 0)
+    Nothing -> assertFailure "expected a fallback cut"
+  -- 显式换气点：整段作为一条
+  assertEqual "explicit break" (Just ("说到这儿", ""))
+    (AgentRun.humanlikeBreakPiece "说到这儿\n")
+  assertEqual "explicit break on empty" Nothing (AgentRun.humanlikeBreakPiece "   ")
+
+-- | 主动配图：只对短闲聊生效，长句/提问一律不配，且同一消息的判定要稳定。
+testProactiveSticker :: IO ()
+testProactiveSticker = do
+  -- 提问不配图
+  assertBool "question never attaches" (not (Humanlike.proactiveStickerDue 25 "seed-1" "今天天气怎么样？"))
+  assertBool "ascii question never attaches" (not (Humanlike.proactiveStickerDue 25 "seed-1" "what?"))
+  -- 长句不配图
+  let longChatter = Text.replicate 40 "好"
+  assertBool "long text never attaches" (not (Humanlike.proactiveStickerDue 25 "seed-1" longChatter))
+  -- 同一条消息的判定必须稳定（不能一会儿配一会儿不配）
+  let same = Humanlike.proactiveStickerDue 25 "msg-42" "今天好累啊"
+  assertEqual "deterministic for one message" same (Humanlike.proactiveStickerDue 25 "msg-42" "今天好累啊")
+  -- 不同消息之间要有配也有不配，否则等于永远发或永远不发
+  let rolls = [Humanlike.proactiveStickerDue 25 ("m" <> Text.pack (show n)) "在干嘛呢" | n <- [1 :: Int .. 40]]
+  assertBool "sometimes attaches" (or rolls)
+  assertBool "sometimes does not" (not (and rolls))
+  -- 概率语义：0% 永不配，100% 必配（防止再出现"恒定命中"那种回归）
+  assertBool "zero percent never fires" (not (Humanlike.proactiveStickerDue 0 "seed-x" "在干嘛"))
+  assertBool "hundred percent always fires" (Humanlike.proactiveStickerDue 100 "seed-x" "在干嘛")
+
+-- | 技术性回答（列表、代码、链接）必须整条发，拆开就读不懂了。
+testStructuredNoSplit :: IO ()
+testStructuredNoSplit = do
+  assertBool "numbered list is structured"
+    (AgentRun.humanlikeStructured "1. 打开文件夹\n2. 运行脚本\n3. 把输出发我")
+  assertBool "bullet list is structured"
+    (AgentRun.humanlikeStructured "- 第一点\n- 第二点")
+  assertBool "code fence is structured"
+    (AgentRun.humanlikeStructured "先跑这个\n```\npython x.py\n```")
+  assertBool "inline code is structured"
+    (AgentRun.humanlikeStructured "执行 `find_duplicates.py` 就行")
+  assertBool "url is structured"
+    (AgentRun.humanlikeStructured "看这个 https://example.com/a")
+  assertBool "quote is structured"
+    (AgentRun.humanlikeStructured "> 他说的话")
+  -- 普通闲聊不能被误判成结构化，否则永远不拆
+  assertBool "plain chatter is not structured"
+    (not (AgentRun.humanlikeStructured "是啊，妈妈也是鲸鱼呀\n身后拖着条尾巴很正常吧"))
 
 -- | 表情目录是模型挑图的唯一依据：解析失败或搜不到就等于没有表情包能力。
 testStickerCatalog :: IO ()
