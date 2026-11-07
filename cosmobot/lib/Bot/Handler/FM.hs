@@ -12,17 +12,23 @@ module Bot.Handler.FM
 
 import Bot.Core.Message
 import Bot.Core.Route
+import qualified Bot.Handler.Humanlike as Humanlike
+import qualified Bot.Handler.Humanlike.Archive as HumanlikeArchive
 import qualified Bot.Core.ReplyBody as ReplyBody
 import qualified Bot.Effect.Chat as Chat
+import qualified Bot.Effect.ChatLog as ChatLog
 import qualified Bot.Effect.ChatDriver as ChatDriver
+import qualified Bot.Effect.Concurrency as Concurrency
 import qualified Bot.Effect.HTTP as HTTP
 import qualified Bot.Effect.LLM as LLM
+import qualified Bot.Effect.Memory as Memory
 import Bot.Prelude
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as AesonKey
 import qualified Data.Aeson.Types as AesonTypes
 import Data.Char (isDigit, isSpace)
 import qualified Data.Text as Text
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import qualified System.Directory as Directory
 import qualified Data.Text.IO as TextIO
 import Network.HTTP.Req
@@ -31,11 +37,20 @@ import qualified Data.Text.Encoding as TextEncoding
 import Text.Read (readMaybe)
 
 fmHandlers
-  :: (HTTP.HTTP :> es, Chat.Chat :> es, LLM.LLM :> es, IOE :> es)
+  :: ( HTTP.HTTP :> es
+     , Chat.Chat :> es
+     , ChatLog.ChatLog :> es
+     , Concurrency.Concurrency :> es
+     , LLM.LLM :> es
+     , Memory.Memory :> es
+     , KatipE :> es
+     , IOE :> es
+     )
   => [RouteHandler es]
 fmHandlers =
   [ modelRecoveryHandler
   , groupSwitchHandler
+  , humanlikeHandler
   , recallDirectHandler
   , libraryStopHandler
   , aiContestQuickHandler
@@ -113,6 +128,81 @@ groupSwitchHandler =
           let reply = if online then "FM 已在本群上线。" else "FM 已在本群下线。"
           void (Chat.replyTo message reply)
         _ -> pure ()
+
+humanlikeHandler
+  :: ( HTTP.HTTP :> es
+     , Chat.Chat :> es
+     , ChatLog.ChatLog :> es
+     , Concurrency.Concurrency :> es
+     , LLM.LLM :> es
+     , Memory.Memory :> es
+     , KatipE :> es
+     , IOE :> es
+     )
+  => RouteHandler es
+humanlikeHandler =
+  stopOn (matching isHumanlikeSwitch) \message _ ->
+    if not (isSuperuser message)
+      then sendStandalone message "拟人模式只有主人能开关。"
+      else case Humanlike.humanlikeScope message of
+        Nothing -> sendStandalone message "拟人模式只能在 QQ 私聊或群里切换。"
+        Just scope -> case Humanlike.parseHumanlikeCommand message of
+          Just Humanlike.HumanlikeEnable -> do
+            state <- Humanlike.setHumanlikeState scope True
+            sendStandalone message (humanlikeConfirm state)
+          Just Humanlike.HumanlikeDisable -> do
+            state <- Humanlike.setHumanlikeState scope False
+            sendStandalone message (humanlikeConfirm state)
+            humanlikeRecordAfterDisable message state
+          Just Humanlike.HumanlikeStatus -> do
+            state <- Humanlike.fetchHumanlikeState scope
+            sendStandalone message (humanlikeStatus state)
+          Nothing -> pure ()
+
+-- | 关闭拟人模式之后，把刚结束的那一段压成一条档案记录。
+--
+-- 放在后台跑：写档案要调一次模型，不能让「关闭」这条命令等它。
+-- 失败只记日志，档案保持原样。
+humanlikeRecordAfterDisable
+  :: ( ChatLog.ChatLog :> es
+     , Concurrency.Concurrency :> es
+     , LLM.LLM :> es
+     , Memory.Memory :> es
+     , KatipE :> es
+     , IOE :> es
+     )
+  => IncomingMessage
+  -> Humanlike.HumanlikeState
+  -> Eff es ()
+humanlikeRecordAfterDisable message state =
+  case reverse (filter (isJust . snd) state.spans) of
+    ((started, Just ended) : _) ->
+      Concurrency.fire "humanlike.record" $
+        HumanlikeArchive.recordHumanlikeSession humanlikeRetentionDays message
+          (posixSecondsToUTCTime (realToFrac started))
+          (posixSecondsToUTCTime (realToFrac ended))
+    _ -> pure ()
+
+-- | 档案里保留几天。改这里的数字即可，不需要动别的。
+humanlikeRetentionDays :: Int
+humanlikeRetentionDays = 3
+
+isHumanlikeSwitch :: IncomingMessage -> Bool
+isHumanlikeSwitch message =
+  message.eventKind == IncomingMessageCreated
+    && isJust (Humanlike.parseHumanlikeCommand message)
+
+humanlikeConfirm :: Humanlike.HumanlikeState -> Text
+humanlikeConfirm state
+  | state.enabled =
+      [i|好，这个会话开始拟人模式了。要关就说「fm 关闭拟人模式」。每天最多主动说 #{state.dailyLimit} 次。|]
+  | otherwise = "关掉了，回到平常的说话方式。"
+
+humanlikeStatus :: Humanlike.HumanlikeState -> Text
+humanlikeStatus state
+  | state.enabled =
+      [i|拟人模式：开着。每天最多主动说 #{state.dailyLimit} 次。|]
+  | otherwise = "拟人模式：关着。"
 
 recallDirectHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es)

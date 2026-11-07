@@ -27,6 +27,7 @@ import Bot.Agent.Tools.Schedule
 import Bot.Agent.Tools.Sandbox
 import Bot.Agent.Tools.Shell
 import Bot.Agent.Tools.Skills
+import Bot.Agent.Tools.Sticker
 import Bot.Agent.Tools.SubAgent
 import Bot.Agent.Tools.Continuation
 import Bot.Agent.Tools.Meta
@@ -137,6 +138,8 @@ defaultToolsWith extraTools = tools
       , chatModelResetTool
       , queryChatLogTool
       , queryCurrentSenderChatLogTool
+      , stickerListTool
+      , stickerSendTool
       , recallRecentSelfMessagesTool
       , webSearchTool
       , searchQuotaTool

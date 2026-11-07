@@ -34,7 +34,9 @@ import qualified Bot.Core.ReplyBody as ReplyBody
 import qualified Bot.Chat.Bridge.FM as FMBridge
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.ChatLog as ChatLog
+import qualified Bot.Effect.HTTP as HTTP
 import qualified Bot.Effect.Media as Media
+import qualified Bot.Handler.Humanlike as Humanlike
 import Bot.Prelude
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as Key
@@ -45,7 +47,7 @@ import qualified Data.Text.IO as TextIO
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Time (TimeZone (..), UTCTime, addUTCTime, defaultTimeLocale, formatTime, getCurrentTime, utcToLocalTime)
 
-queryChatLogTool :: ChatLog.ChatLog :> es => Tool (Eff es)
+queryChatLogTool :: (ChatLog.ChatLog :> es, HTTP.HTTP :> es, KatipE :> es) => Tool (Eff es)
 queryChatLogTool =
   tagged [chatTag]
   . allowWhen hasExplicitChatLogIntent
@@ -71,9 +73,10 @@ queryChatLogTool =
                 pure (argumentFailure err)
               Right timeRange -> do
                 entries <- ChatLog.queryChat context.message senderFilter (max 0 limit) includeBotMessages timeRange
-                pure (toolText (jsonText (map chatLogToolEntry entries)))
+                humanlike <- Humanlike.humanlikeScopeStateOrDisabled context.message
+                pure (toolText (jsonText (map (chatLogToolEntry humanlike) entries)))
 
-queryCurrentSenderChatLogTool :: ChatLog.ChatLog :> es => Tool (Eff es)
+queryCurrentSenderChatLogTool :: (ChatLog.ChatLog :> es, HTTP.HTTP :> es, KatipE :> es) => Tool (Eff es)
 queryCurrentSenderChatLogTool =
   tagged [chatTag]
   . noisy
@@ -103,7 +106,8 @@ queryCurrentSenderChatLogTool =
                 pure (argumentFailure err)
               Right timeRange -> do
                 entries <- ChatLog.queryCurrentSenderChatLog context.message scope keywords limit timeRange
-                pure (toolText (jsonText (map chatLogToolEntry entries)))
+                humanlike <- Humanlike.humanlikeScopeStateOrDisabled context.message
+                pure (toolText (jsonText (map (chatLogToolEntry humanlike) entries)))
 
 -- | 列出 FM 自己最近发过的消息，让它可以判断「该撤哪条」。
 --
@@ -543,9 +547,14 @@ currentMessageInfoValue message =
     , "text" Aeson..= message.text
     ]
 
-chatLogToolEntry :: ChatLog.ChatLogEntry -> Aeson.Value
-chatLogToolEntry entry =
-  Aeson.object
+-- | Render one chat-log row for a tool result.
+--
+-- Rows exchanged while the humanlike mode was on carry a @mode@ field so the
+-- model can scope an earlier style agreement to that mode instead of reading it
+-- as a standing rule. The row itself is never hidden or rewritten.
+chatLogToolEntry :: Humanlike.HumanlikeState -> ChatLog.ChatLogEntry -> Aeson.Value
+chatLogToolEntry humanlike entry =
+  Aeson.object $
     [ "timestamp" Aeson..= fmap formatChinaTimestamp entry.recordedAt
     , "chatId" Aeson..= entry.chatId
     , "senderId" Aeson..= entry.senderId
@@ -554,6 +563,10 @@ chatLogToolEntry entry =
     , "imageUrls" Aeson..= entry.imageUrls
     , "text" Aeson..= entry.text
     ]
+      <> [ "mode" Aeson..= ("humanlike" :: Text)
+         | Just recordedAt <- [entry.recordedAt]
+         , Humanlike.isInHumanlikeSpan recordedAt humanlike.spans
+         ]
 
 -- Chat-log records are stored in UTC; present them in the user's China timezone.
 formatChinaTimestamp :: UTCTime -> Text

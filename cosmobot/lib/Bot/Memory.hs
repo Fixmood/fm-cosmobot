@@ -51,6 +51,16 @@ data MemoryScope
   | GroupPersonaMemory !Integer
   | DefaultGroupPersonaMemory
   | MemberStyleMemory !Text
+  -- | Relationship record kept for a conversation that uses the humanlike
+  -- mode. Injected in both modes; the mode only changes how FM speaks.
+  | HumanlikeMemory !ChatPlatform !Text
+  -- | Records pushed out of 'HumanlikeMemory' by the retention limit. Kept so
+  -- nothing is destroyed, but never injected.
+  | HumanlikeArchiveMemory !ChatPlatform !Text
+  -- | The persona body used only while the mode is on. Kept separate from the
+  -- relationship record because the record is shared by both modes while the
+  -- persona must not leak into normal conversation.
+  | HumanlikePersonaMemory !ChatPlatform !Text
   deriving (Eq, Show)
 
 memoryLimitChars :: Int
@@ -279,6 +289,12 @@ memoryPath cfg scope =
           (PlatformQQ, "group_persona", "_default")
         MemberStyleMemory userId ->
           (PlatformQQ, "member_style", userId)
+        HumanlikeMemory scopePlatform scopeId ->
+          (scopePlatform, "humanlike", scopeId)
+        HumanlikeArchiveMemory scopePlatform scopeId ->
+          (scopePlatform, "humanlike_archive", scopeId)
+        HumanlikePersonaMemory scopePlatform scopeId ->
+          (scopePlatform, "humanlike_persona", scopeId)
 
 platformPathPart :: ChatPlatform -> FilePath
 platformPathPart = toString . chatPlatformKey
