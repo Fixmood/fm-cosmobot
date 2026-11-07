@@ -286,6 +286,25 @@ selectToolsForMessage context tools =
         , "send_media", "read_media_text", "media_to_file", "view_image"
         , "search_web"
         ]
+      -- 普通消息的默认工具集：常用能力都在，但**不是全部 94 个**。
+      -- 2026-11-07 实测：FullTools 给 101 个工具说明，提示词巨大又容易选错。
+      General ->
+        [ "datetime", "current_message_info", "fm_tell_member"
+        , "fm_library_search", "fm_library_pick", "fm_library_start"
+        , "fm_library_continue", "fm_library_continue_same", "fm_library_stop", "fm_library_stats"
+        , "fm_contest_search", "fm_contest_send"
+        , "fm_live_competition_rank", "fm_live_competition_text"
+        , "fm_ai_contest_text", "fm_ai_contest_leaderboard", "fm_ai_contest_leaderboard_image"
+        , "fm_chart", "fm_score_query", "fm_score_analysis"
+        , "fm_admin_status", "fm_domain_stats", "fm_group_status"
+        , "chat_model_status", "account_balance", "search_quota"
+        , "image_generate", "image_edit", "view_image", "user_avatar"
+        , "search_web", "web_search", "fetch_url", "send_reply", "send_media"
+        , "self_messages", "recall_self_messages", "reply_prefix"
+        , "repeat_command", "repeat_follow"
+        , "sticker_list", "sticker_send", "memory_save", "memory_search"
+        , "fanqie_reading", "typing_stats", "trigger_manage"
+        ]
 
     normalized = Text.toCaseFold context.input.text
     compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) normalized
@@ -297,7 +316,7 @@ selectToolsForMessage context tools =
       | explicitContest value = ToolSubset Contest
       | explicitLibrary value = ToolSubset Library
       | simpleChat value = SimpleChat
-      | otherwise = FullTools
+      | otherwise = ToolSubset General
 
     simpleChat value =
       Text.length value <= 48
@@ -380,15 +399,16 @@ toolSelectionSummary context _tools =
       | any (`Text.isInfixOf` value) ["文来", "发文", "发文章", "来一篇", "来篇", "练一篇", "练文", "开始跟打", "继续打", "上一篇", "下一篇", "这篇文", "继续"] = ToolSubset Library
       | Text.length value <= 48 && any (`Text.isInfixOf` value)
           ["你好", "您好", "嗨", "嘿", "谢谢", "感谢", "辛苦了", "早安", "晚安", "哈哈", "笑死", "在吗", "好的", "好啊", "嗯嗯", "收到", "明白了"] = SimpleChat
-      | otherwise = FullTools
+      | otherwise = ToolSubset General
     domainName = \case
       Library -> "library"
       Contest -> "contest"
       Scores -> "scores"
       Admin -> "admin"
       Image -> "image"
+      General -> "general"
 
-data RequestDomain = Library | Contest | Scores | Admin | Image
+data RequestDomain = Library | Contest | Scores | Admin | Image | General
 
 acpTools :: ACP.ACP :> es => [Tool (Eff es)]
 acpTools =
