@@ -42,7 +42,6 @@ fmHandlers =
   , allCompetitionRankQuickHandler
   , liveCompetitionQuickHandler
    , contestTopQuickHandler
-   , contestCountQuickHandler
    , contestChartQuickHandler
   , messageArchiveHandler
   , recallArchiveHandler
