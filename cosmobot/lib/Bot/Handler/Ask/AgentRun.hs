@@ -959,12 +959,11 @@ humanlikeProactiveStickerPercentPrivate = 25
 humanlikeProactiveStickerPercentGroup :: Int
 humanlikeProactiveStickerPercentGroup = 8
 
--- | 太短的回复不拆：一条就能说完，拆开反而像刷屏。
+-- | 太短的段不单独发：并进下一段，避免「嗯」「好」「对呀」刷屏。
 --
--- openhuman 的 messageSegmentation 就是这么做的（< 80 字符直接整条发），
--- 另外两家也把"短回复"列为不可拆的情况。
+-- 参数照抄 dsh-qq-waifu 的 minChunkChars = 4。
 humanlikeMinPieceChars :: Int
-humanlikeMinPieceChars = 40
+humanlikeMinPieceChars = 4
 
 -- | 结构化内容整体发，不拆。
 --
@@ -992,11 +991,13 @@ humanlikeStructured text =
 --
 -- 这个上限比"怎么切"更重要：没有它，一段长回复会被拆成五六条，读起来就是刷屏。
 humanlikeMaxSegments :: Int
-humanlikeMaxSegments = 3
+humanlikeMaxSegments = 5
 
--- | 单行超过这么多字才退回到标点兜底，避免一口气发一条。
+-- | 单条气泡的字数上限：超过就退回标点兜底。
+--
+-- 参数照抄 dsh-qq-waifu 的 maxChunkChars = 60。
 humanlikeMaxLineChars :: Int
-humanlikeMaxLineChars = 48
+humanlikeMaxLineChars = 60
 
 -- | 切出下一段：优先用模型自己写的换行。
 --
@@ -1010,9 +1011,55 @@ humanlikeNextPiece pending =
       let (headPart, tailPart) = Text.splitAt index pending
           rest = Text.drop 1 tailPart
       in case nonEmptyPiece headPart of
-           Just piece -> Just (piece, rest)
+           Just piece -> Just (stripTrailingPeriod piece, rest)
            Nothing -> humanlikeNextPiece rest
-    Nothing -> humanlikeLongLine pending
+    Nothing -> humanlikeSentencePiece pending
+
+-- | 没有换行时按句子切。
+--
+-- 只有句末标点才是断点：逗号、顿号、空格一律不切，否则气泡会以「，」结尾
+-- （实测就是用户说的"逗号结尾、乱七八糟"）。超过单条上限又找不到句末标点时，
+-- 才退回到逗号兜底，宁可长一点也不发半句。
+humanlikeSentencePiece :: Text -> Maybe (Text, Text)
+humanlikeSentencePiece pending
+  | Text.length pending < humanlikeMinPieceChars + 2 = Nothing
+  | otherwise =
+      case lastCutSentence of
+        Just cut -> finish cut
+        Nothing
+          | Text.length pending > humanlikeMaxLineChars -> commaOrHardCut
+          | otherwise -> Nothing
+  where
+    window = Text.take humanlikeMaxLineChars pending
+    lastCutSentence =
+      viaNonEmpty last
+        (filter (>= humanlikeMinPieceChars)
+          [ index + 1
+          | (index, char) <- zip [0 ..] (Text.unpack window)
+          , char `elem` ("。！？…!?" :: String)
+          ])
+    commaOrHardCut =
+      case viaNonEmpty last (filter (>= humanlikeMinPieceChars) commaPositions) of
+        Just cut -> finish cut
+        Nothing ->
+          Just (stripTrailingPeriod (Text.take humanlikeMaxLineChars pending), Text.drop humanlikeMaxLineChars pending)
+    commaPositions =
+      [ index + 1
+      | (index, char) <- zip [0 ..] (Text.unpack window)
+      , char `elem` ("，、；：, " :: String)
+      ]
+    finish cut =
+      case nonEmptyPiece (Text.take cut pending) of
+        Just piece -> Just (stripTrailingPeriod piece, Text.drop cut pending)
+        Nothing -> Nothing
+
+-- | 条末的句号去掉：真人打完字很少补句号，「？」「！」保留。
+stripTrailingPeriod :: Text -> Text
+stripTrailingPeriod text =
+  let stripped = Text.strip text
+  in case Text.unsnoc stripped of
+       Just (body, char) | char == '。' -> Text.strip body
+       _ -> stripped
 
 -- | 扫描下一个"安全的换行"。
 --
@@ -1068,22 +1115,6 @@ humanlikeBreakPiece pending =
     Just piece -> Just (piece, "")
     Nothing -> Nothing
 
-
--- | 一整行还没有换行时，才在标点处兜底切，实在没有标点就按上限切。
-humanlikeLongLine :: Text -> Maybe (Text, Text)
-humanlikeLongLine pending
-  | Text.length pending <= humanlikeMaxLineChars = Nothing
-  | otherwise =
-      let window = Text.take humanlikeMaxLineChars pending
-          breaks =
-            [ index + 1
-            | (index, char) <- zip [0 ..] (Text.unpack window)
-            , char `elem` ("，,、；;：: " :: String)
-            ]
-          cut = fromMaybe humanlikeMaxLineChars (viaNonEmpty last (filter (>= 6) breaks))
-      in case nonEmptyPiece (Text.take cut pending) of
-           Just piece -> Just (piece, Text.drop cut pending)
-           Nothing -> Nothing
 
 nonEmptyPiece :: Text -> Maybe Text
 nonEmptyPiece text =

@@ -41,6 +41,7 @@ module Bot.Handler.Humanlike
   , humanlikeScopeState
   , humanlikeScopeStateOrDisabled
   , loadHumanlikePersonaText
+  , loadPersonaForScope
   , humanlikePersonaHeader
   , disabledHumanlike
   )
@@ -248,14 +249,28 @@ humanlikePersonaHeader =
 -- Empty means "no custom persona", and the caller falls back to the built-in
 -- short overlay.
 loadHumanlikePersonaText :: Memory.Memory :> es => IncomingMessage -> Eff es Text
-loadHumanlikePersonaText message = do
-  specific <- case humanlikeScopeSuffix message of
+loadHumanlikePersonaText message =
+  case humanlikeScope message of
+    Nothing -> pure ""
+    Just scope -> loadPersonaForScope scope
+
+-- | 按会话 scope（@qq:private:…@ / @qq:group:…@）取人设，主动发言时也要用。
+loadPersonaForScope :: Memory.Memory :> es => Text -> Eff es Text
+loadPersonaForScope scope = do
+  specific <- case scopeSuffixOf scope of
     Nothing -> pure Nothing
     Just suffix -> Memory.loadMemory (MemoryStore.HumanlikePersonaMemory PlatformQQ suffix)
   case specific of
     Just text
       | not (Text.null (Text.strip text)) -> pure text
     _ -> fromMaybe "" <$> Memory.loadMemory (MemoryStore.HumanlikePersonaMemory PlatformQQ "_default")
+
+scopeSuffixOf :: Text -> Maybe Text
+scopeSuffixOf scope = do
+  rest <- Text.stripPrefix "qq:" scope
+  let (kindText, withColon) = Text.breakOn ":" rest
+  chatIdText <- Text.stripPrefix ":" withColon
+  pure (kindText <> "-" <> chatIdText)
 
 humanlikeScopeSuffix :: IncomingMessage -> Maybe Text
 humanlikeScopeSuffix message =

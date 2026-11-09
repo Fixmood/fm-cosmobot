@@ -14,6 +14,7 @@ import Bot.Core.Message
 import Bot.Core.Route
 import qualified Bot.Handler.Humanlike as Humanlike
 import qualified Bot.Handler.Humanlike.Archive as HumanlikeArchive
+import qualified Bot.Handler.Humanlike.Proactive as HumanlikeProactive
 import qualified Bot.Core.ReplyBody as ReplyBody
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.ChatLog as ChatLog
@@ -27,6 +28,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as AesonKey
 import qualified Data.Aeson.Types as AesonTypes
 import Data.Char (isDigit, isSpace)
+import Effectful.FileSystem (FileSystem)
 import qualified Data.Text as Text
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import qualified System.Directory as Directory
@@ -43,6 +45,7 @@ fmHandlers
      , Concurrency.Concurrency :> es
      , LLM.LLM :> es
      , Memory.Memory :> es
+     , FileSystem :> es
      , KatipE :> es
      , IOE :> es
      )
@@ -57,6 +60,7 @@ fmHandlers =
   , allCompetitionRankQuickHandler
   , liveCompetitionQuickHandler
    , contestTopQuickHandler
+   , contestCountQuickHandler
    , contestChartQuickHandler
   , messageArchiveHandler
   , recallArchiveHandler
@@ -136,6 +140,7 @@ humanlikeHandler
      , Concurrency.Concurrency :> es
      , LLM.LLM :> es
      , Memory.Memory :> es
+     , FileSystem :> es
      , KatipE :> es
      , IOE :> es
      )
@@ -149,9 +154,11 @@ humanlikeHandler =
         Just scope -> case Humanlike.parseHumanlikeCommand message of
           Just Humanlike.HumanlikeEnable -> do
             state <- Humanlike.setHumanlikeState scope True
+            HumanlikeProactive.recordScope scope True
             sendStandalone message (humanlikeConfirm state)
           Just Humanlike.HumanlikeDisable -> do
             state <- Humanlike.setHumanlikeState scope False
+            HumanlikeProactive.recordScope scope False
             sendStandalone message (humanlikeConfirm state)
             humanlikeRecordAfterDisable message state
           Just Humanlike.HumanlikeStatus -> do

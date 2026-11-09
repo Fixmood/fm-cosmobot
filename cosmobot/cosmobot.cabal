@@ -284,6 +284,8 @@ library
         Bot.Handler.Huma
         Bot.Handler.Humanlike
         Bot.Handler.Humanlike.Archive
+        Bot.Handler.Humanlike.Proactive
+        Bot.Handler.GroupGate
         Bot.Handler.Poke
         Bot.Handler.Status
         Bot.Handler.FM

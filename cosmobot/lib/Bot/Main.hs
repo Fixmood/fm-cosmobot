@@ -39,6 +39,8 @@ import qualified Bot.Effect.Scheduler as Scheduler
 import qualified Bot.Effect.Skills as Skills
 import qualified Bot.Effect.Storage as Storage
 import qualified Bot.Effect.Typst as Typst
+import qualified Bot.Handler.GroupGate as GroupGate
+import qualified Bot.Handler.Humanlike.Proactive as HumanlikeProactive
 import qualified Bot.LLM.OpenAI as OpenAI
 import qualified Bot.Media.Interpreter as Media
 import qualified Bot.Resource as Resource
@@ -133,18 +135,19 @@ runOnce configPath = runEff . runPrim . runFailIO $ do
           Python.runPython resourceOwner ResourceEffect.Init{message, arguments} runTools request
   runRuntime . runInfrastructure $ do
     pythonArguments <- preparePython cfg.tool.python
-    runApplication pythonArguments do
-      logInfo "Cosmobot stand by!"
-      let allStreams =
-            [ Chat.incomingMessages
-            , Scheduler.scheduledMessages
-            ]
-          messageConsumer =
-            consumeWith
-              (zipWith withRouteDebugLogging [1 :: Int ..] (routes cfg threads))
-              (ChatLog.recordIncomingMessages (StreamUtil.mergeStreams allStreams))
+    runApplication pythonArguments $
+      HumanlikeProactive.withProactiveWorker do
+        logInfo "Cosmobot stand by!"
+        let allStreams =
+              [ Chat.incomingMessages
+              , Scheduler.scheduledMessages
+              ]
+            messageConsumer =
+              consumeWith
+                (zipWith withRouteDebugLogging [1 :: Int ..] (routes cfg threads))
+                (GroupGate.applyGroupGate (ChatLog.recordIncomingMessages (StreamUtil.mergeStreams allStreams)))
 
-      runConfiguredServers cfg threads rpcState acpState messageConsumer
+        runConfiguredServers cfg threads rpcState acpState messageConsumer
   readIORef restartRequested
 
 preparePython

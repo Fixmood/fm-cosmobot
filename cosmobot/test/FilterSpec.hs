@@ -9,10 +9,12 @@ import qualified Bot.Handler.Humanlike as Humanlike
 import qualified Bot.Handler.Humanlike.Archive as Archive
 import qualified Bot.Agent.Tools.Sticker as Sticker
 import qualified Bot.Handler.Ask.AgentRun as AgentRun
+import qualified Bot.Handler.Humanlike.Proactive as Proactive
 import Bot.Prelude
 import qualified Data.List as List
 import qualified Data.Text.Encoding as TextEncoding
 import qualified Data.Text as Text
+import Data.Time (LocalTime (..), TimeOfDay (..), fromGregorian, hoursToTimeZone, localTimeToUTC, utcToLocalTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -44,6 +46,7 @@ main =
       , testCase "humanlike split uses the model's own line breaks" testHumanlikeSplit
       , testCase "proactive sticker only on short chatter" testProactiveSticker
       , testCase "structured replies are never split into bubbles" testStructuredNoSplit
+      , testCase "proactive speaking: scope parsing, quiet hours, daily life" testProactiveScheduling
       ]
 
 testCommandFilter :: IO ()
@@ -382,7 +385,30 @@ testStructuredNoSplit = do
   assertBool "plain chatter is not structured"
     (not (AgentRun.humanlikeStructured "是啊，妈妈也是鲸鱼呀\n身后拖着条尾巴很正常吧"))
 
--- | 表情目录是模型挑图的唯一依据：解析失败或搜不到就等于没有表情包能力。
+-- | 主动发言的地基：scope 解析、静默时段、日程稳定性。
+testProactiveScheduling :: IO ()
+testProactiveScheduling = do
+  assertEqual "private scope" (Just (ChatPrivate, 2822751355)) (Proactive.parseScopeTarget "qq:private:2822751355")
+  assertEqual "group scope" (Just (ChatGroup, 819641961)) (Proactive.parseScopeTarget "qq:group:819641961")
+  assertEqual "other platform" Nothing (Proactive.parseScopeTarget "matrix:private:1")
+  -- 静默时段 00:00–08:00（北京时间）
+  let at hour = localTimeToUTC (hoursToTimeZone 8) (LocalTime (fromGregorian 2026 11 7) (TimeOfDay hour 0 0))
+  assertBool "3am is quiet" (Proactive.inQuietHours (at 3))
+  assertBool "7am is quiet" (Proactive.inQuietHours (at 7))
+  assertBool "9am is not quiet" (not (Proactive.inQuietHours (at 9)))
+  -- 同一天同一会话的日程必须稳定，否则"你在干嘛"会前后矛盾
+  let day = utcToLocalTime (hoursToTimeZone 8) (at 12)
+      firstRun = Proactive.lifeActivities "qq:private:1" day
+      secondRun = Proactive.lifeActivities "qq:private:1" day
+  assertEqual "schedule is stable within a day" firstRun secondRun
+  assertBool "schedule has entries" (not (null firstRun))
+  -- 不同会话的日程要不同，否则所有会话同步起床
+  assertBool "different scopes differ"
+    (Proactive.lifeActivities "qq:private:1" day /= Proactive.lifeActivities "qq:group:2" day)
+  -- currentActivity 必须落在一个活动上
+  let (activity, minutes) = Proactive.currentActivity "qq:private:1" (at 12)
+  assertBool "activity is non-empty" (not (Text.null activity))
+  assertBool "minutes non-negative" (minutes >= 0)
 testStickerCatalog :: IO ()
 testStickerCatalog = do
   let raw = TextEncoding.encodeUtf8 $ Text.unlines
