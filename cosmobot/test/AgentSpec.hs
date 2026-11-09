@@ -3322,7 +3322,9 @@ testAskHandlerAnnouncesEachNoisyToolTypeOnlyOnce = do
       tools = [noisyProbe "fm_library_start", noisyProbe "fm_score_analysis"]
   _ <- runAgentWith answers (ChatMock (Just replies) (Just "45-dedup") Nothing) do
     threads <- newThreadStore
-    runAskHandlersWithToolsAndWait Agent.defaultToolConfig tools askHandlerConfig threads askHandlerPrivateMessage
+    -- 用一句明确落在 General 子集的消息：否则工具会被子集过滤、根本不会执行
+    runAskHandlersWithToolsAndWait Agent.defaultToolConfig tools askHandlerConfig threads
+      askHandlerPrivateMessage{text = "最近怎么样"}
   IORef.readIORef replies >>= (@?=
     [ "😻 FM：正在调用 fm_library_start 工具…"
     , "😻 FM：正在调用 fm_score_analysis 工具…"
