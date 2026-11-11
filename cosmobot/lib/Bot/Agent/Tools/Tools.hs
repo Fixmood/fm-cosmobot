@@ -117,6 +117,7 @@ defaultToolsWith extraTools = tools
       , chatModelResetTool
       , queryChatLogTool
       , queryCurrentSenderChatLogTool
+      , chatSearchTool
       , recallRecentSelfMessagesTool
       , webSearchTool
       , webFetchTool

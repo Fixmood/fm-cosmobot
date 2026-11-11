@@ -17,6 +17,7 @@ module Bot.Effect.ChatLog
   , lookupMessage
   , queryCurrentSenderChatLog
   , queryBySenders
+  , searchAllChatLog
   , runChatLog
   )
 where
@@ -68,6 +69,15 @@ data ChatLog :: Effect where
     -> ChatLogTimeRange
     -> ChatLog m [ChatLogEntry]
 
+  -- | 全成员关键字搜索（不只当前发言人）
+  SearchAllChatLog
+    :: IncomingMessage
+    -> SenderChatLogScope
+    -> [[Text]]
+    -> Int
+    -> ChatLogTimeRange
+    -> ChatLog m [ChatLogEntry]
+
 type instance DispatchOf ChatLog = Dynamic
 
 -- | Record a user/platform message.
@@ -110,6 +120,10 @@ queryCurrentSenderChatLog :: ChatLog :> es => IncomingMessage -> SenderChatLogSc
 queryCurrentSenderChatLog message scope keywords limit timeRange =
   send (QueryCurrentSenderChatLog message scope keywords limit timeRange)
 
+searchAllChatLog :: ChatLog :> es => IncomingMessage -> SenderChatLogScope -> [[Text]] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]
+searchAllChatLog message scope keywords limitCount timeRange =
+  send (SearchAllChatLog message scope keywords limitCount timeRange)
+
 queryBySenders :: ChatLog :> es => [Text] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]
 queryBySenders senders limit timeRange =
   send (QueryBySenders senders limit timeRange)
@@ -134,5 +148,7 @@ runChatLog inner =
         ChatLogStorage.queryCurrentSenderStored message scope keywords limit timeRange
       QueryBySenders senders limit timeRange ->
         ChatLogStorage.queryBySenders senders limit timeRange
+      SearchAllChatLog context scope keywords limit timeRange ->
+        ChatLogStorage.searchAllStored context scope keywords limit timeRange
     )
     inner

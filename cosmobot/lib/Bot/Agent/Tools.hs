@@ -138,6 +138,7 @@ defaultToolsWith extraTools = tools
       , chatModelResetTool
       , queryChatLogTool
       , queryCurrentSenderChatLogTool
+      , chatSearchTool
       , messageBreakTool
       , stickerListTool
       , stickerSendTool
@@ -257,6 +258,7 @@ selectToolsForMessage context tools =
       -- 额度/余额类问题会命中 Admin 子集，而搜索额度不属于任何一个域，
       -- 不加进来就会被子集过滤掉（2026-10-25 实测：工具在二进制里但模型看不到）。
       , "search_quota"
+       , "chat_search"
        , "fanqie_reading"
        , "typing_stats"
       ]
@@ -305,6 +307,7 @@ selectToolsForMessage context tools =
         , "image_generate", "image_edit", "view_image", "user_avatar"
         , "search_web", "web_search", "fetch_url", "send_reply", "send_media"
         , "self_messages", "recall_self_messages", "reply_prefix"
+        , "chat_search", "sender_log", "chat_log"
         , "repeat_command", "repeat_follow"
         , "sticker_list", "sticker_send", "memory_save", "memory_search"
         , "fanqie_reading", "typing_stats", "trigger_manage"

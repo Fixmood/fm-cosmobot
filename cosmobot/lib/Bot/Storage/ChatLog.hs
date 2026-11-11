@@ -11,6 +11,7 @@ module Bot.Storage.ChatLog
   , queryStored
   , lookupStoredMessage
   , queryCurrentSenderStored
+  , searchAllStored
   , queryBySenders
   )
 where
@@ -238,6 +239,29 @@ timeRangeMatches :: forall (backend :: Type). ChatLogTimeRange -> Row backend Ch
 timeRangeMatches timeRange row =
   maybe true (\since -> row ! #recorded_at .> literal (Just since)) timeRange.since
     .&& maybe true (\before -> row ! #recorded_at .< literal (Just before)) timeRange.before
+
+-- | 全成员关键字搜索（所有者 2026-11-11：要能翻所有聊天记录，不只是自己发的）。
+searchAllStored :: Storage.Storage :> es => IncomingMessage -> SenderChatLogScope -> [[Text]] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]
+searchAllStored message scope keywords limitCount timeRange = do
+  ensureChatLogTable
+  case keywordLikePatterns keywords of
+    [] -> pure []
+    patterns -> do
+      rows <- runSelda $
+        query $
+          queryLimit 0 (boundedChatLogLimit limitCount) do
+            row <- select chatLogRows
+            restrict (allSenderChatLogMatches scope message patterns row .&& timeRangeMatches timeRange row)
+            order (row ! #id) descending
+            pure row
+      pure (map (chatLogEntryFromRow message) rows)
+
+allSenderChatLogMatches :: forall (backend :: Type). SenderChatLogScope -> IncomingMessage -> [Text] -> Row backend ChatLogRow -> Col backend Bool
+allSenderChatLogMatches scope message patterns row =
+  row ! #platform_key .== literal (platformKey message.platform)
+    .&& senderChatLogScopeMatches scope message row
+    .&& botVisibilityMatches False row
+    .&& keywordPatternsMatch patterns row
 
 currentSenderChatLogMatches :: forall (backend :: Type). SenderChatLogScope -> IncomingMessage -> [Text] -> Row backend ChatLogRow -> Col backend Bool
 currentSenderChatLogMatches scope message patterns row =

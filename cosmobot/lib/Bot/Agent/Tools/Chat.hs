@@ -7,6 +7,7 @@ Stability   : experimental
 module Bot.Agent.Tools.Chat
   ( queryChatLogTool
   , queryCurrentSenderChatLogTool
+  , chatSearchTool
   , downloadNovelTool
   , novelStatusTool
   , selfMessagesTool
@@ -109,6 +110,43 @@ queryCurrentSenderChatLogTool =
                 entries <- ChatLog.queryCurrentSenderChatLog context.message scope keywords limit timeRange
                 humanlike <- Humanlike.humanlikeScopeStateOrDisabled context.message
                 pure (toolText (jsonText (map (chatLogToolEntry humanlike) entries)))
+
+-- | 全成员聊天记录全文搜索（所有者 2026-11-11）。
+--
+-- 群里有人说「翻翻所有聊天记录，有没有提到 X」时，sender_log 只能搜「当前发言人自己」的
+-- 消息，翻不到别人说的内容。这个工具搜所有成员：scope=chat 只搜当前群，scope=global 搜
+-- 同一平台的所有群。数据一直在 chat_log 里（38 万条），以前缺的是这个入口。
+chatSearchTool :: (ChatLog.ChatLog :> es, HTTP.HTTP :> es, KatipE :> es) => Tool (Eff es)
+chatSearchTool =
+  tagged [chatTag]
+    . noisy
+    . withDescription
+      "Full-text search the recorded chat history across ALL members (not just the current sender). Use whenever someone asks whether the group ever mentioned something, or asks you to look through past chat. scope=chat searches the current chat, scope=global searches every chat on the same platform. keywords is a list of keyword groups: within a group the terms match in order with anything between them; groups are OR-ed. Newest first, at most 100 rows."
+    $ tool "chat_search"
+        ( requiredArgument (fieldTextArrayArray "keywords" "Keyword groups; each group is LIKE-matched in order, groups are OR-ed.")
+        , validateArgument validSenderLogLimit
+            (requiredArgument (fieldIntegerMax "limit" 100 "Maximum number of matching messages to return. Must be <= 100."))
+        , validateArgument parseSenderChatLogScope
+            (withDefault "chat" (optionalArgument
+              ("scope", Aeson.object
+                [ "type" Aeson..= ("string" :: Text)
+                , "enum" Aeson..= (["chat", "global"] :: [Text])
+                , "description" Aeson..= ("Search the current chat or every chat on this platform. Defaults to chat." :: Text)
+                ])))
+        , optionalArgument (fieldDateTime "since" "Return messages strictly after this ISO-8601 UTC timestamp.")
+        , optionalArgument (fieldDateTime "before" "Return messages strictly before this ISO-8601 UTC timestamp.")
+        )
+        \keywords limit scope since before -> do
+          context <- askToolContext
+          case currentSenderChatLogScopeError scope context.message of
+            Just err -> pure (argumentFailure err)
+            Nothing ->
+              case chatLogTimeRange since before of
+                Left err -> pure (argumentFailure err)
+                Right timeRange -> do
+                  entries <- ChatLog.searchAllChatLog context.message scope keywords limit timeRange
+                  humanlike <- Humanlike.humanlikeScopeStateOrDisabled context.message
+                  pure (toolText (jsonText (map (chatLogToolEntry humanlike) entries)))
 
 -- | 列出 FM 自己最近发过的消息，让它可以判断「该撤哪条」。
 --
