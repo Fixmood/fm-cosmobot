@@ -187,15 +187,6 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
   -- 拟人模式下不发计划预告：那句「我先确认…再查相关记录后回复」是助手腔，
   -- 和这个人设正相反，用户实测一眼就看出"味道不对"。
-  when (isComplexRequest input.text && not (isImageTask message)) $ do
-    line <-
-      if humanlike.enabled
-        then humanlikePlanAheadLine humanlikePersona input.text
-        else do
-          plan <- quickPlan input.text
-          pure (if Text.null (Text.strip plan) then "" else "😻 FM：" <> Text.strip plan)
-    when (not (Text.null line)) $
-      void $ Chat.replyTo outputMessage line
   withChatEffort (isComplexRequest input.text && not (isImageTask message)) $ Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
@@ -710,6 +701,7 @@ streamAgentReply
      , Concurrency.Concurrency :> es
      , LLM.LLM :> es
      , Media.Media :> es
+     , Memory.Memory :> es
      , Storage.Storage :> es
      , KatipE :> es
      , Prim :> es
@@ -732,10 +724,16 @@ streamAgentReply humanlikeMode runtime activeReply message transcript triggers =
           . Agent.withNormalizingToolReplies
           )
             runtime
+    -- B 方案：不猜意图，等 agent 真的调了慢工具再发一句预告（每轮最多一次）。
+    let headsUp = do
+          persona <- Humanlike.loadHumanlikePersonaText message
+          line <- humanlikePlanAheadLine persona message.text
+          when (not (Text.null line)) $
+            void $ Chat.replyTo (FMBridge.fmStandaloneMessage message) line
     (lastReply, replyResult) <-
       S.mapM_
         (recordReplyUpdate activeReply)
-        (Chat.streamMultipleRepliesTo message (agentReplyTextSegments humanlikeMode message.text triggers (autoContinuingAgentStream program message transcript)))
+        (Chat.streamMultipleRepliesTo message (agentReplyTextSegments humanlikeMode message.text triggers headsUp (autoContinuingAgentStream program message transcript)))
     let responseId = lastReply.responseId
         (answer, result) = replyResult
         correctedResult = result
@@ -859,19 +857,24 @@ agentReplyTextSegments
   => Bool
   -> Text
   -> [Text]
+  -> Eff es ()
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Stream (Of Text) (Eff es)) (Eff es) (Text, Agent.Result)
-agentReplyTextSegments humanlikeMode request triggers =
-  S.maps (S.mapMaybe id) . S.breaks isNothing . agentReplyTextEvents humanlikeMode request triggers
+agentReplyTextSegments humanlikeMode request triggers headsUp stream = do
+  headsUpSent <- lift (IORef.newIORef False)
+  S.maps (S.mapMaybe id)
+    (S.breaks isNothing (agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp stream))
 
 agentReplyTextEvents
   :: (Prim :> es, LLM.LLM :> es, KatipE :> es, Concurrency.Concurrency :> es)
   => Bool
   -> Text
   -> [Text]
+  -> IORef.IORef Bool
+  -> Eff es ()
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Of (Maybe Text)) (Eff es) (Text, Agent.Result)
-agentReplyTextEvents humanlikeMode request triggers stream = do
+agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp stream = do
   retryUsed <- lift (IORef.newIORef False)
   openingHandled <- lift (IORef.newIORef False)
   earlyFlushed <- lift (IORef.newIORef False)
@@ -929,6 +932,13 @@ agentReplyTextEvents humanlikeMode request triggers stream = do
                   go retryUsed openingHandled earlyFlushed (pieceIndex + 1) (appendReplyText pendingText answer) mempty rest
                 else go retryUsed openingHandled earlyFlushed pieceIndex answer (appendReplyText chunk pending) rest
         Right (Agent.ToolCallNotification toolCalls, rest) -> do
+          -- 真的调用了慢工具 = 这一轮确实要花时间，这时才发预告（B 方案）。
+          when humanlikeMode do
+            already <- lift (IORef.readIORef headsUpSent)
+            let slowTools = ["web_search", "search_web", "fetch_url", "command", "image_generate", "image_edit", "chat_search", "typst_render"]
+            when (not already && any ((`elem` slowTools) . (.name)) (toList toolCalls)) do
+              lift (IORef.writeIORef headsUpSent True)
+              lift headsUp
           -- message_break 是模型自己标记的换气点：它什么都不做，只表示"这条到此为止"。
           let breakRequested =
                 humanlikeMode
