@@ -303,6 +303,9 @@ proactiveTick now
                     then pure (spoken, states)
                     else do
                       logInfo [i|proactive: spoke in #{scope}: #{Text.take 40 line}|]
+                      -- 记进 chat_log：Chat.replyTo 自己不落库，不记的话模型看不见
+                      -- 自己说过什么，会退化成「我说什么了吗」并接不上话。
+                      ChatLog.recordSelfMessage message (listToMaybe (rights sent)) line
                       let entry = ProactiveState scope today (count + 1) nowEpoch
                           rest = filter (\candidate -> candidate.stateScope /= scope) states
                       pure (spoken + 1, entry : rest)
