@@ -1766,4 +1766,4 @@ withChatEffort complex action
 
 -- | 正常模式的长任务预告（没有拟人人设时用一句固定的短话）。
 normalModeHeadsUpLine :: Text
-normalModeHeadsUpLine = "😻 FM：这个要查一会儿，我先去办，稍等～"
+normalModeHeadsUpLine = "这个要查一会儿，我先去办，稍等～"
