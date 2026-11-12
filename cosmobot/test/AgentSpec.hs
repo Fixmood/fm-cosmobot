@@ -3326,9 +3326,8 @@ testAskHandlerAnnouncesEachNoisyToolTypeOnlyOnce = do
     runAskHandlersWithToolsAndWait Agent.defaultToolConfig tools askHandlerConfig threads
       askHandlerPrivateMessage{text = "最近怎么样"}
   IORef.readIORef replies >>= (@?=
-    [ "😻 FM：正在调用 fm_library_start 工具…"
-    , "😻 FM：正在调用 fm_score_analysis 工具…"
-    , "😻 FM：done"
+    -- 2026-11-12 所有者关闭了工具进度播报：只应有最终回复
+    [ "😻 FM：done"
     ])
 
 -- | The owner's rule, 2026-09-30: background messages never go to a group.

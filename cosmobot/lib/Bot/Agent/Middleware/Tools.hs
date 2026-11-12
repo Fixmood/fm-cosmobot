@@ -84,8 +84,9 @@ progressSilentTools =
 -- from the tool definition so the fast/slow split is testable and can be tuned
 -- in one place.
 shouldAnnounceProgress :: Bool -> Text -> Bool
-shouldAnnounceProgress noisyFlag toolName =
-  noisyFlag && toolName `notElem` progressSilentTools
+shouldAnnounceProgress _ _ = False
+  -- 2026-11-12 所有者：不要在任何会话显示「正在调用 xx 工具」这类进度行。
+  -- 保留函数是为了审计/链接路径不变，只是不再播报。
 
 importantDynamicTool :: LLM.ToolCall -> Bool
 importantDynamicTool call =
