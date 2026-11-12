@@ -1699,8 +1699,36 @@ messageText = \case
 
 messageImageUrls :: Aeson.Value -> [Text]
 messageImageUrls = \case
-  Aeson.Array segments -> mapMaybe imageSegmentUrl (toList segments)
+  Aeson.Array segments ->
+    mapMaybe imageSegmentUrl (toList segments) <> mapMaybe mfaceSegmentUrl (toList segments)
   _ -> []
+
+-- | QQ 表情包（mface）本质是图片：把 url 带上，视觉管线才看得见内容。
+mfaceSegmentUrl :: Aeson.Value -> Maybe Text
+mfaceSegmentUrl = \case
+  Aeson.Object obj
+    | Just (Aeson.String "mface") <- KeyMap.lookup "type" obj
+    , Just (Aeson.Object data_) <- KeyMap.lookup "data" obj
+    , Just (Aeson.String url) <- KeyMap.lookup "url" data_ ->
+        Just url
+  _ -> Nothing
+
+-- | QQ 内置表情 id → emoji。只覆盖常用的一批，其余给通用占位。
+qqFaceEmoji :: Int -> Text
+qqFaceEmoji faceId = case faceId of
+  0 -> "[微笑]"; 1 -> "[撇嘴]"; 2 -> "[色]"; 3 -> "[发呆]"; 4 -> "[得意]"
+  5 -> "[流泪]"; 6 -> "[害羞]"; 7 -> "[闭嘴]"; 8 -> "[睡]"; 9 -> "[大哭]"
+  10 -> "[尴尬]"; 11 -> "[发怒]"; 12 -> "[调皮]"; 13 -> "[呲牙]"; 14 -> "[惊讶]"
+  15 -> "[难过]"; 16 -> "[酷]"; 17 -> "[冷汗]"; 18 -> "[抓狂]"; 19 -> "[吐]"
+  20 -> "[偷笑]"; 21 -> "[可爱]"; 22 -> "[白眼]"; 23 -> "[傲慢]"; 24 -> "[饥饿]"
+  25 -> "[困]"; 26 -> "[惊恐]"; 27 -> "[流汗]"; 28 -> "[憨笑]"; 29 -> "[悠闲]"
+  30 -> "[奋斗]"; 31 -> "[咒骂]"; 32 -> "[疑问]"; 33 -> "[嘘]"; 34 -> "[晕]"
+  35 -> "[折磨]"; 36 -> "[衰]"; 37 -> "[骷髅]"; 38 -> "[敲打]"; 39 -> "[再见]"
+  96 -> "[鼓掌]"; 97 -> "[擦汗]"; 98 -> "[抠鼻]"; 99 -> "[坏笑]"; 101 -> "[鄙视]"
+  102 -> "[委屈]"; 103 -> "[快哭了]"; 104 -> "[阴险]"; 105 -> "[亲亲]"; 106 -> "[可怜]"
+  178 -> "[强]"; 179 -> "[弱]"; 180 -> "[握手]"; 181 -> "[胜利]"; 182 -> "[抱拳]"
+  187 -> "[赞]"; 188 -> "[踩]"; 190 -> "[礼物]"; 192 -> "[抱抱]"
+  _ -> "[表情]"
 
 messageFiles :: Aeson.Value -> [MessageFile]
 messageFiles = \case
@@ -1963,6 +1991,19 @@ segmentText = \case
     , Just value <- KeyMap.lookup "qq" data_
     , Just qq <- mentionValueText value ->
         "@" <> qq
+    -- QQ 内置表情：转成对应的 emoji 字符，模型能直接读懂情绪。
+    | Just (Aeson.String "face") <- KeyMap.lookup "type" obj
+    , Just (Aeson.Object data_) <- KeyMap.lookup "data" obj
+    , Just (Aeson.Number faceId) <- KeyMap.lookup "id" data_ ->
+        qqFaceEmoji (round faceId)
+    -- 表情包：带上原始 label（OneBot 的 summary 字段，如「[动画表情]」）。
+    | Just (Aeson.String "mface") <- KeyMap.lookup "type" obj
+    , Just (Aeson.Object data_) <- KeyMap.lookup "data" obj
+    , Just (Aeson.String summary) <- KeyMap.lookup "summary" data_
+    , not (Text.null (Text.strip summary)) ->
+        summary
+    | Just (Aeson.String "mface") <- KeyMap.lookup "type" obj ->
+        "[表情包]"
   _ -> ""
 
 rawMessageText :: Text -> Text
