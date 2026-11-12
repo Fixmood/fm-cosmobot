@@ -38,6 +38,7 @@ import qualified Bot.Effect.AgentAudit as AgentAudit
 import qualified Bot.Effect.Agent as AgentEffect
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Chat.Bridge.FM as FMBridge
+import qualified Bot.ChatLog.Types as ChatLogTypes
 import qualified Bot.Effect.ChatLog as ChatLog
 import qualified Bot.Effect.Concurrency as Concurrency
 import qualified Bot.Effect.HTTP as HTTP
@@ -125,6 +126,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   humanlike <- humanlikeContext message
   systemPrompt <- askSystemPrompt cfg humanlike.enabled message
   humanlikePersona <- Humanlike.loadHumanlikePersonaText message
+  autoMemory <- if humanlike.enabled then autoMemoryPrompt message startedAt else pure ""
   humanlikeRecord <- HumanlikeArchive.loadHumanlikeRecordText message
   -- 这个人的回复风格：直接注入，不靠模型自己想起来调 fm_member_style。
   memberStyle <- if humanlike.enabled
@@ -172,7 +174,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
             , "- 现在只要回一句很短的话（十来个字），不要描述那张图，也不要说「已发送」。"
             ]
         | otherwise = ""
-      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, HumanlikeProactive.moodPrompt (fromMaybe "" (Humanlike.humanlikeScope message)) startedAt, humanlikeInstruction humanlike humanlikePersona, memberStylePrompt memberStyle])
+      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, autoMemory, HumanlikeProactive.moodPrompt (fromMaybe "" (Humanlike.humanlikeScope message)) startedAt, humanlikeInstruction humanlike humanlikePersona, memberStylePrompt memberStyle])
       requestTranscript = if isImageTask message then startWithUserInput input else transcript
       context = agentContext toolCfg cfg outputMessage input effectiveSystemPrompt
       selectedTools = humanlikeSelectTools humanlike input.text (AgentTools.selectToolsForMessage context tools)
@@ -258,6 +260,49 @@ humanlikeSelectTools state _requestText
 --
 -- 用户定过：风格要跟着人走，但不能靠"硬规则"逼模型去查；直接把已存的那条
 -- 放进提示里，比再写一句"你必须记得"有效。
+-- | 自动记忆检索：从这句话里机械切出检索词，去 chat_log 找相关旧对话。
+--
+-- 不做关键词表：按 ASCII 单词和中文二元组切，够用且不会"换个说法就失效"。
+-- 命中就注入一小段，模型不用先想到去调工具。
+autoMemoryPrompt
+  :: ChatLog.ChatLog :> es
+  => IncomingMessage
+  -> UTCTime
+  -> Eff es Text
+autoMemoryPrompt message now = do
+  let terms = take 4 (memorySearchTerms message.text)
+  if null terms
+    then pure ""
+    else do
+      let since = addUTCTime (negate (fromIntegral (30 * 24 * 3600))) now
+          before = addUTCTime (-5) now
+      entries <- ChatLog.searchAllChatLog message ChatLogTypes.SenderChatLogChat
+        (map (: []) terms) 8 (ChatLog.ChatLogTimeRange (Just since) (Just before))
+      let rendered =
+            [ (if entry.isBot then "FM: " else "对方: ")
+                <> Text.take 80 (Text.unwords (Text.words entry.text))
+            | entry <- entries
+            , not (Text.null (Text.strip entry.text))
+            ]
+      pure $
+        if null rendered
+          then ""
+          else Text.unlines ("（你记得这个会话里相关的旧对话，供参考）：" : take 6 rendered)
+
+-- | 机械切词：ASCII 单词（>=3 字符）+ 中文二元组。
+memorySearchTerms :: Text -> [Text]
+memorySearchTerms text =
+  let letters c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+      cjk c = (c >= '\x4E00' && c <= '\x9FFF')
+      asciiWords =
+        [ word
+        | word <- Text.words (Text.map (\c -> if letters c then c else ' ') text)
+        , Text.length word >= 3
+        ]
+      cjkRuns = Text.words (Text.map (\c -> if cjk c then c else ' ') text)
+      bigrams = [ Text.take 2 run | run <- cjkRuns, Text.length run >= 2 ]
+  in take 6 (asciiWords <> bigrams)
+
 memberStylePrompt :: Text -> Text
 memberStylePrompt style
   | Text.null (Text.strip style) = ""
