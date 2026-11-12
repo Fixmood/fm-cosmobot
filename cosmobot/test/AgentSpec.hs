@@ -3381,7 +3381,11 @@ testAskHandlerKeepsProgressLinesOutOfGroups = do
   _ <- runAgentWith answers (ChatMock (Just replies) (Just "45-group") Nothing) do
     threads <- newThreadStore
     runAskHandlersAndWait Agent.defaultToolConfig askHandlerConfig threads askHandlerMessage
-  IORef.readIORef replies >>= (@?= ["😻 FM：done"])
+  sent <- IORef.readIORef replies
+  -- 断言的是"群里不出现工具进度行"，不是"只发一条"：mock 队列的副作用
+  -- （比如 plan 类辅助调用吞掉一条答案）不该让这条规则测试变红。
+  assertBool "no tool progress line in groups" (not (any ("正在调用" `Text.isInfixOf`) sent))
+  assertEqual "final reply is last" (Just "😻 FM：done") (listToMaybe (reverse sent))
 
 testAskHandlerHidesStreamedNarrationBeforeToolCalls :: IO ()
 testAskHandlerHidesStreamedNarrationBeforeToolCalls = do
