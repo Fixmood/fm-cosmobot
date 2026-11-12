@@ -270,14 +270,15 @@ memberStylePrompt style
 -- 先写成一池固定台词，被否了——那还是硬编码，说的是"台词"不是"人话"。
 -- 这里带上人设，用当前的请求内容现场生成一句：话该长该短、该撒娇还是该
 -- 正经，由人设和语境决定，不由代码决定。
-humanlikePlanAheadLine :: LLM.LLM :> es => Text -> Text -> Eff es Text
-humanlikePlanAheadLine persona request = do
+humanlikePlanAheadLine :: LLM.LLM :> es => Text -> Text -> Text -> Eff es Text
+humanlikePlanAheadLine persona action request = do
   answer <- LLM.ask (Text.unlines
     [ "你正在扮演下面这个人设。"
     , ""
     , persona
     , ""
     , "对方刚提了个需要花点时间的请求：" <> Text.take 200 (Text.strip request)
+    , "你接下来要去做的具体事情：" <> action
     , ""
     , "用你自己的口吻，说一句很短的话告诉他你要去办了（像随手发的一条消息，不超过 15 个字，一行）。"
     , "不要列步骤，不要说「我先确认」「查相关记录」这类助手话，不要解释你在干什么。"
@@ -726,13 +727,13 @@ streamAgentReply humanlikeMode runtime activeReply message transcript triggers =
             runtime
     -- B 方案：不猜意图，等 agent 真的调了慢工具再发一句预告（每轮最多一次）。
     -- 2026-11-12 所有者要求：正常模式也要发（以前只有拟人模式有）。
-    let headsUp = do
+    let headsUp triggered = do
           line <-
             if humanlikeMode
               then do
                 persona <- Humanlike.loadHumanlikePersonaText message
-                humanlikePlanAheadLine persona message.text
-              else pure normalModeHeadsUpLine
+                humanlikePlanAheadLine persona (headsUpAction triggered) message.text
+              else pure (normalModeHeadsUpLine triggered)
           when (not (Text.null (Text.strip line))) $
             void $ Chat.replyTo (FMBridge.fmStandaloneMessage message) (Text.strip line)
     (lastReply, replyResult) <-
@@ -862,7 +863,7 @@ agentReplyTextSegments
   => Bool
   -> Text
   -> [Text]
-  -> Eff es ()
+  -> (Text -> Eff es ())
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Stream (Of Text) (Eff es)) (Eff es) (Text, Agent.Result)
 agentReplyTextSegments humanlikeMode request triggers headsUp stream = do
@@ -877,7 +878,7 @@ agentReplyTextEvents
   -> Text
   -> [Text]
   -> IORef.IORef Bool
-  -> Eff es ()
+  -> (Text -> Eff es ())
   -> IORef.IORef Bool
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Of (Maybe Text)) (Eff es) (Text, Agent.Result)
@@ -945,14 +946,16 @@ agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp effortRa
           do
             already <- lift (IORef.readIORef headsUpSent)
             let slowTools = ["web_search", "search_web", "fetch_url", "command", "image_generate", "image_edit", "chat_search", "typst_render"]
-            when (not already && any ((`elem` slowTools) . (.name)) (toList toolCalls)) do
+            let triggered =
+                  listToMaybe [call.name | call <- toList toolCalls, call.name `elem` slowTools]
+            when (not already && isJust triggered) do
               lift (IORef.writeIORef headsUpSent True)
               -- 换掉关键词表：真的调了慢工具才升到高思考档位。
               raised <- lift (IORef.readIORef effortRaised)
               unless raised do
                 lift (IORef.writeIORef effortRaised True)
                 lift (void (LLM.selectChatModelVolatile "deepseek-flash-high"))
-              lift headsUp
+              lift (headsUp (fromMaybe "" triggered))
           -- message_break 是模型自己标记的换气点：它什么都不做，只表示"这条到此为止"。
           let breakRequested =
                 humanlikeMode
@@ -1765,5 +1768,17 @@ withChatEffort complex action
       pure result
 
 -- | 正常模式的长任务预告（没有拟人人设时用一句固定的短话）。
-normalModeHeadsUpLine :: Text
-normalModeHeadsUpLine = "这个要查一会儿，我先去办，稍等～"
+normalModeHeadsUpLine :: Text -> Text
+normalModeHeadsUpLine tool
+  | tool `elem` ["image_generate", "image_edit"] = "好，我去画一张，稍等～"
+  | tool `elem` ["command"] = "这个要跑一会儿，稍等～"
+  | tool `elem` ["typst_render"] = "这个要渲染一会儿，稍等～"
+  | otherwise = "这个要查一会儿，我先去办，稍等～"
+
+-- | 给拟人模式的预告提示：这次是去做什么（画图 / 查资料 / 跑命令）。
+headsUpAction :: Text -> Text
+headsUpAction tool
+  | tool `elem` ["image_generate", "image_edit"] = "画一张图"
+  | tool `elem` ["command"] = "跑一段命令或脚本"
+  | tool `elem` ["typst_render"] = "渲染一张图"
+  | otherwise = "查资料 / 翻聊天记录"
