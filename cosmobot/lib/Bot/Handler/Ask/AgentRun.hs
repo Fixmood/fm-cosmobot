@@ -1062,9 +1062,36 @@ humanlikeNextPiece pending =
       let (headPart, tailPart) = Text.splitAt index pending
           rest = Text.drop 1 tailPart
       in case nonEmptyPiece headPart of
-           Just piece -> Just (stripTrailingPeriod piece, rest)
+           Just piece
+             -- 「然后下 PC / 客户端」：断点落在中英文交界，等于把一个词劈开。
+             -- 这种断点不用，合并到下一个安全断点。
+             | boundarySplitsToken piece rest ->
+                 case firstSafeLineBreak (Text.unpack rest) of
+                   Just laterIndex ->
+                     let (more, tail2) = Text.splitAt laterIndex rest
+                     in case nonEmptyPiece (piece <> "\n" <> more) of
+                          Just merged -> Just (stripTrailingPeriod merged, Text.drop 1 tail2)
+                          Nothing -> Nothing
+                   Nothing -> Nothing
+             | otherwise -> Just (stripTrailingPeriod piece, rest)
            Nothing -> humanlikeNextPiece rest
     Nothing -> humanlikeSentencePiece pending
+
+-- | 断点两边是不是同一个词的两半（中文和 ASCII 直接相接）。
+--
+-- 实测：「然后下 PC」+「客户端，用 QQ…」被切成两条，读起来是断的。
+-- 这不是长度问题，是边界处本来就不该断。
+boundarySplitsToken :: Text -> Text -> Bool
+boundarySplitsToken left right =
+  case (Text.unsnoc (Text.stripEnd left), Text.uncons (Text.stripStart right)) of
+    (Just (_, before), Just (after, _)) ->
+      (isAsciiWordChar before && isCjkChar after) || (isCjkChar before && isAsciiWordChar after)
+    _ -> False
+  where
+    isAsciiWordChar char =
+      (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')
+    isCjkChar char =
+      (char >= '\x4E00' && char <= '\x9FFF') || (char >= '\x3400' && char <= '\x4DBF')
 
 -- | 没有换行时按句子切。
 --
