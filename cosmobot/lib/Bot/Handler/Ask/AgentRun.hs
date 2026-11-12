@@ -892,7 +892,9 @@ agentReplyTextEvents humanlikeMode request triggers stream = do
           alreadyFlushed <- lift (IORef.readIORef earlyFlushed)
           if humanlikeMode
             && pieceIndex < humanlikeMaxSegments - 1
-            && Text.length pendingText >= humanlikeMinPieceChars
+            -- 第一条要「秒出」：门槛压到 2 个字（后面几条仍按 4 字合并，
+            -- 否则「嗯」这种一个字的气泡会刷屏）。间隔由下面的 typing delay 负责。
+            && Text.length pendingText >= (if pieceIndex == 0 then 2 else humanlikeMinPieceChars)
             && not (humanlikeStructured pendingText)
             then
               -- 拟人模式：模型自己写的换行就是换气点，按它切。
