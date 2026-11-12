@@ -240,7 +240,7 @@ humanlikeSelectTools state _requestText
     -- tool_enable 把画图组重新打开；之后又在"再来一张"这类不含"表情"
     -- 二字的追补请求里画图，还被当成 png 文件发出来。这个模式就是聊天，
     -- 画图留给平常模式。
-    drawingTool name = name `elem` ["typst_render", "image_generate", "image_edit"]
+    drawingTool name = name `elem` ["typst_render"]
 
 -- | The durable relationship record, injected in **both** modes.
 --
