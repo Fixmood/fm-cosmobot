@@ -223,13 +223,20 @@ decideToSpeak now scope message = do
   if Text.null (Text.strip persona)
     then pure Nothing
     else do
-      recent <- ChatLog.queryChat message Nothing 1 True (ChatLog.ChatLogTimeRange (Just (addUTCTime (negate (6 * 3600)) now)) Nothing)
+      -- 看最近 12 条再决定说什么。只看最后一条会让主动发言和上一轮脱节，
+      -- 用户实测「它像是突然冒出来一句」。
+      recent <- ChatLog.queryChat message Nothing 12 True (ChatLog.ChatLogTimeRange (Just (addUTCTime (negate (6 * 3600)) now)) Nothing)
       let (activity, minutes) = currentActivity scope now
-          lastLine = case recent of
-            (entry : _) ->
-              let ago = maybe (0 :: Int) (\at -> round (diffUTCTime now at / 60)) entry.recordedAt
-              in [i|#{ago} 分钟前对方说：「#{Text.take 40 (Text.unwords (Text.words entry.text))}」|]
-            [] -> "最近没聊过天"
+          -- 把这十几条按「谁说的」渲染出来，模型才知道刚才聊到哪儿、自己说过什么。
+          historyLines =
+            [ (if entry.isBot then "FM: " else "对方: ") <> Text.take 60 (Text.unwords (Text.words entry.text))
+            | entry <- recent
+            , not (Text.null (Text.strip entry.text))
+            ]
+          history =
+            if null historyLines
+              then "（最近没聊过天）"
+              else Text.unlines historyLines
           local = utcToLocalTime chinaTimeZone now
           clock = formatTime defaultTimeLocale "%H:%M" (LocalTime (localDay local) (localTimeOfDay local))
       answer <- LLM.ask (Text.unlines
@@ -237,7 +244,8 @@ decideToSpeak now scope message = do
         , ""
         , "【主动开口判断】"
         , "- 现在 " <> Text.pack clock <> "，你正在" <> activity <> "，已经 " <> Text.pack (show minutes) <> " 分钟。"
-        , "- " <> lastLine
+        , "最近的对话："
+        , history
         , "- 你要不要主动找对方说一句话？"
         , "  想说：只输出这一句话，不超过 15 个字，用上文的说话方式。"
         , "  不想说：只输出 SILENCE，不要解释。"
