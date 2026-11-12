@@ -520,6 +520,9 @@ startDrawThread label cfg threads message prompt = do
   let input = inputWithAttachments contextPrompt contextImages contextFiles
   let transcript = startWithIncomingMessage message input
   -- 画图路径不是聊天，按非拟人模式拼提示词。
+  -- 快捷路径（纯打招呼）不进 agent 运行时，typing 中间件不会装；
+  -- 这里手动推一次「正在输入」，否则私聊里这类回复完全没有提示。
+  void (trySync (Chat.setTyping message 30000))
   systemPrompt <- askSystemPrompt cfg False message
   answer <- drawTranscript systemPrompt transcript
   responseId <- listToMaybe . rights <$> Chat.replyTo message answer
