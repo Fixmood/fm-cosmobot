@@ -121,8 +121,8 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   startedAt <- liftIO getCurrentTime
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
-  systemPrompt <- askSystemPrompt cfg message
   humanlike <- humanlikeContext message
+  systemPrompt <- askSystemPrompt cfg humanlike message
   humanlikePersona <- Humanlike.loadHumanlikePersonaText message
   humanlikeRecord <- HumanlikeArchive.loadHumanlikeRecordText message
   -- 这个人的回复风格：直接注入，不靠模型自己想起来调 fm_member_style。
@@ -171,7 +171,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
             , "- 现在只要回一句很短的话（十来个字），不要描述那张图，也不要说「已发送」。"
             ]
         | otherwise = ""
-      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, memberStylePrompt memberStyle, humanlikeInstruction humanlike humanlikePersona])
+      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, humanlikeInstruction humanlike humanlikePersona, memberStylePrompt memberStyle])
       requestTranscript = if isImageTask message then startWithUserInput input else transcript
       context = agentContext toolCfg cfg outputMessage input effectiveSystemPrompt
       selectedTools = humanlikeSelectTools humanlike input.text (AgentTools.selectToolsForMessage context tools)
@@ -264,7 +264,10 @@ humanlikeSelectTools state _requestText
 memberStylePrompt :: Text -> Text
 memberStylePrompt style
   | Text.null (Text.strip style) = ""
-  | otherwise = "（这个人的说话风格记录，参考用：" <> Text.strip style <> "）"
+  | otherwise =
+      "（只对这个人生效的说话风格，优先于上面的通用语气："
+        <> Text.strip style
+        <> "）"
 
 humanlikeRecordPrompt :: Text -> Text
 humanlikeRecordPrompt record
@@ -438,14 +441,19 @@ agentContext toolCfg cfg message input systemPrompt =
     , toolConfig = toolCfg
     }
 
-askSystemPrompt :: (Memory.Memory :> es, Skills.Skills :> es, FileSystem :> es, IOE :> es) => AskHandlerConfig -> IncomingMessage -> Eff es Text
-askSystemPrompt cfg message = do
+askSystemPrompt
+  :: (Memory.Memory :> es, Skills.Skills :> es, FileSystem :> es, IOE :> es)
+  => AskHandlerConfig
+  -> Humanlike.HumanlikeState
+  -> IncomingMessage
+  -> Eff es Text
+askSystemPrompt cfg humanlike message = do
   skillsPrompt <- Skills.skillsSystemPrompt
   senderMemory <- loadScopedMemory (MemoryStore.senderMemoryScope message)
   chatMemory <- loadScopedMemory (MemoryStore.chatMemoryScope message)
-  privatePersona <- loadPrivatePersona message
-  groupPersona <- loadGroupPersona message
-  memberStyle <- loadMemberStyle message
+  privatePersona <- if humanlike.enabled then pure Nothing else loadPrivatePersona message
+  groupPersona <- if humanlike.enabled then pure Nothing else loadGroupPersona message
+  memberStyle <- if humanlike.enabled then pure Nothing else loadMemberStyle message
   selfMemory <- selfMemoryLayers
   pure . Text.intercalate "\n\n" $
     [ LLM.contextSystemPrompt cfg.systemPrompt skillsPrompt senderMemory chatMemory
