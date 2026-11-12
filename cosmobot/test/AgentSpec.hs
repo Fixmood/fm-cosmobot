@@ -5431,7 +5431,8 @@ testSelectToolsForExplicitDomainRequest = do
       selected = AgentTools.selectToolsForMessage
         (agentContext{Agent.input = inputWithImages "fm 给我来一篇灵异的" []})
         tools
-  map AgentTool.toolName selected @?= ["fm_library_start"]
+  -- 2026-11-12：领域子集全部取消（白名单导致 FM 频繁说「没工具」），现在一律给全部工具。
+  map AgentTool.toolName selected @?= map AgentTool.toolName tools
 
 testSelectToolsForAmbiguousRequest :: Assertion
 testSelectToolsForAmbiguousRequest = do
