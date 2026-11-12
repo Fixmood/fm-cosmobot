@@ -121,7 +121,7 @@ chatSearchTool =
   tagged [chatTag]
     . noisy
     . withDescription
-      "Full-text search the recorded chat history across ALL members (not just the current sender). Use whenever someone asks whether the group ever mentioned something, or asks you to look through past chat. scope=chat searches the current chat, scope=global searches every chat on the same platform. keywords is a list of keyword groups: within a group the terms match in order with anything between them; groups are OR-ed. Newest first, at most 100 rows."
+      "Full-text search of chat history across all members (not just the sender). Use when asked whether the group ever mentioned something, or to look through past chat. scope=chat (this chat) or global (same platform). keywords: list of groups; a group matches its terms in order with anything between, groups are OR-ed. Newest first, <=100 rows."
     $ tool "chat_search"
         ( requiredArgument (fieldTextArrayArray "keywords" "Keyword groups; each group is LIKE-matched in order, groups are OR-ed.")
         , validateArgument validSenderLogLimit

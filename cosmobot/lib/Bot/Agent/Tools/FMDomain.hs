@@ -116,7 +116,7 @@ fmLibraryPickTool =
 fmLibraryStartTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLibraryStartTool =
   allowWhen hasExplicitLibraryIntent
-  . withDescription "Open a NEW typing-practice article session in the current chat and send its first segment. THIS is the tool to use whenever the current message asks FM to send an article in any phrasing -- 来一篇、来篇、来点文、发一篇、开一篇、文来、发文、文章、练习文, or a difficulty word such as 水文/水档/来篇水文 -- and also whenever no session is in progress yet. Passing difficulty (淼/水/易/普/难/虐) picks strictly inside that interval; leave query empty then. The selected mode persists after typing scores. A topic mentioned in ordinary conversation is not a request to send an article. If a session is already running and the user asks for another article, use fm_library_continue instead. The tool sends the article itself; do not repeat the article body in the final response."
+  . withDescription "Open a NEW typing-practice session in this chat and send its first segment. Use whenever the message asks for an article in any phrasing (来一篇/发一篇/文来/发文/练文) or mentions a difficulty (水/普/难 etc), and whenever no session is running. difficulty (淼水易普难虐) picks strictly inside that interval; leave query empty then. A topic mentioned in ordinary chat is not a request. If a session is already running, use fm_library_continue. The tool sends the article itself -- do not repeat it."
   $ tool "fm_library_start"
       ( optionalText "query" "Optional title, topic, style, or content keyword. Leave empty for 文来 and difficulty commands."
       , optionalText "difficulty" "Optional strict difficulty mode: 淼、水、易、普、难、虐. Empty means random 文来."
@@ -131,7 +131,7 @@ fmLibraryStartTool =
 
 fmLibraryContinueTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLibraryContinueTool =
-  withDescription "Continue an ALREADY RUNNING typing-practice session by selecting and sending the next article. Requires a session currently in progress in this chat for this person. If it answers that there is no article in progress, that is NOT a limitation of FM: immediately call fm_library_start to open one, in the same turn, and never report the absence as something the system cannot do. Never use this tool to open the first article. Typically used right after a typing score is submitted. A requested difficulty selects another article strictly inside that same interval."
+  withDescription "Continue an ALREADY RUNNING typing-practice session by sending the next article. Requires a session in progress for this person in this chat; if told there is none, call fm_library_start immediately in the same turn instead of reporting it as impossible. Never used for the first article. A difficulty selects another article inside the same interval."
   $ tool "fm_library_continue" noArguments do
       context <- askToolContext
       withCapability context "library" do
@@ -760,7 +760,7 @@ fmLiveCompetitionRankTool :: (Chat.Chat :> es, HTTP.HTTP :> es) => Tool (Eff es)
 fmLiveCompetitionRankTool =
   allowWhen hasExplicitContestIntent
   . noisy
-  . withDescription "Query and send a complete live public typing-contest leaderboard as one PNG image. Use this autonomously when natural language asks for the current or dated leaderboard of 虎杯, a supported group, 极速杯, or 锦标赛. The source may be 虎杯, a group name, group number, 极速杯, or 锦标赛; when omitted in a supported QQ group, that current group is used. The tool sends the complete image itself, so do not repeat the rows in the final response."
+  . withDescription "Query and send a complete live public typing-contest leaderboard as one PNG. Use it when asked for the current or dated leaderboard of 虎杯, a supported group, 极速杯 or 锦标赛. When the source is omitted in a supported QQ group, that group is used. The tool sends the image itself; do not repeat the rows."
   $ tool "fm_live_competition_rank"
       ( optionalText "source" "Optional public contest source: 虎杯, supported QQ group name/number, 极速杯, or 锦标赛."
       , optionalText "date" "Optional date in YYYY-MM-DD format; defaults to today in China."
@@ -1006,7 +1006,7 @@ fmCompetitionScoreSummaryTool =
 
 fmScoreAnalysisTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmScoreAnalysisTool =
-  withDescription "赛文相关（群赛文/本群赛文/虎杯/锦标赛/极速杯/极速联赛/mb/666/777/groupmatch）的近一个月成绩、排行、曲线、趋势，一律用 **fm_chart**（它的数据每天更新到最近一天）；本工具读的是已经停更的旧归档，只适合查更早的历史。Analyze the current user's typing performance from live public contest leaderboards and FM's archived typing scores. Use for natural-language questions such as today's contest results, today's typing results, all scores together, comparisons, averages, best results, accuracy below 95%, or a recent date range. The tool resolves the current sender by QQ ID, keeps contest and ordinary typing results separate, and never treats a missing leaderboard row as a zero score. Do not use this for merely sending a leaderboard image."
+  withDescription "赛文相关（群赛文/虎杯/锦标赛/极速杯/极速联赛/mb/666/777/groupmatch）的近一个月成绩、排行、曲线一律用 fm_chart（数据每天更新）；本工具只适合查更早的历史。其余用途：从公开榜与归档成绩分析当前用户的打字表现（今天成绩、全部成绩、对比、平均、最好、键准<95%、日期区间）。按 QQ 号解析本人；赛文与普通跟打分开统计；缺席不等于 0 分。不用于发排行榜图片。"
   $ tool "fm_score_analysis"
       ( optionalText "scope" "Optional scope: all, contest, or typing. Defaults to all."
       , optionalText "start_date" "Optional start date in YYYY-MM-DD format."
@@ -1247,7 +1247,7 @@ fmAdminStatusTool =
 fmSelfReviewTool :: HTTP.HTTP :> es => Tool (Eff es)
 fmSelfReviewTool =
   allowWhen superuserOnly
-  . withDescription "Look at FM's own recent behaviour. action=messages returns what FM recently said, together with the message it was replying to and who sent it; action=runs returns FM's recent agent runs with elapsed time, turns, tool-call count, tokens and status. Use this when the owner asks how FM has been doing, why it replied strangely, what it said, or which of its own runs were slow or failed -- and use it to check FM's own behaviour before changing how it works. This is FM's own record, not the group's chat log; to read other people's messages use chat_log instead."
+  . withDescription "Look at FM's own recent behaviour. action=messages: what FM recently said plus the message it replied to; action=runs: recent agent runs with elapsed time, turns, tool calls, tokens and status. Use when the owner asks how FM has been doing, why a reply was odd, or which runs were slow. This is FM's own record; for other people's messages use chat_log."
   $ tool "fm_self_review"
       ( requiredText "action" "messages (what FM said) or runs (FM's own runs with timing and status)."
       , optionalInt "limit" "Maximum rows, from 1 to 200. Defaults to 40 for messages and 20 for runs."
@@ -1332,7 +1332,7 @@ readFileUtf8 path = Text.pack <$> readFile path
 -- 写操作限定 superuser：这是它的自我认知，不该被别人改。
 fmSelfNoteTool :: IOE :> es => Tool (Eff es)
 fmSelfNoteTool =
-  withDescription "FM's own working note: what it is currently looking into, what is still unfinished, what to pick up next time. action=read shows it; action=set replaces it (owner only). Read it when a request seems to continue earlier work, or when unsure what you were doing. Set it after finishing or starting something that should carry across conversations. Keep it short -- a few lines. Do not put facts about other people here (use chat_memory or sender_memory), and do not put personality or style here (those live in the persona files)."
+  withDescription "FM's own working note: what it is investigating, what is unfinished, what to pick up next. action=read/set (owner only). Read it when a request seems to continue earlier work; set it after starting or finishing something that should carry across conversations. Keep it a few lines. No facts about other people (use chat_memory/sender_memory) and no personality (persona files)."
     $ tool "fm_self_note"
       ( requiredText "action" "read, or set (owner only)."
       , optionalText "content" "For action=set: the new note, a few lines at most. Empty clears it."

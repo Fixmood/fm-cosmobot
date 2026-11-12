@@ -31,7 +31,7 @@ triggerManageTool :: (IOE :> es) => Tool (Eff es)
 triggerManageTool =
   allowWhen superuserOnly
   . noisy
-  . withDescription "Manage trigger modes. Actions: status, set, add, remove, reset. Without a target, manage the current chat. For cross-chat management, provide target_platform (qq or matrix), target_kind (group or private), and target_id (QQ group/user number or full Matrix room ID). Modes may include prefix (FM + space), mention (@FM), reply, name, keyword, image, file, audio, sticker, and all. Only the owner may change another chat."
+  . withDescription "Manage chat trigger modes. Actions: status, set, add, remove, reset. Defaults to the current chat; for other chats pass target_platform, target_kind and target_id. Modes include prefix, mention, reply, name, keyword, image, file, audio, sticker, all. Only the owner may change another chat."
   $ tool "trigger_manage"
       (parsedArguments triggerSchema parseTriggerArgs)
       runTriggerManage

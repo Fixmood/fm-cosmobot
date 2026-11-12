@@ -157,7 +157,7 @@ fmBridgeTestTool =
 fmRelayToOwnerTool :: Chat.Chat :> es => Tool (Eff es)
 fmRelayToOwnerTool =
   allowWhen superuserOnly
-  . withDescription "Send a single private QQ message to the FM owner (Fix哥) when the owner asks for it. The message is delivered privately to the fixed owner account, not posted in the current group or Matrix room. Only the owner may use this tool, so do not call it for another member's request. Do not call it for ordinary conversation or an implied request: if you are not sure the owner really wants a private message, ask him in the conversation first instead of guessing. Private delivery can fail because some groups forbid starting a private chat without a friend request; when that happens say plainly that the message did not go out and why, and put the content in the current conversation. Never tell the user which wording to use, and do not drop character to deliver that news."
+  . withDescription "Send one private QQ message to FM's owner when the owner asks for it. Owner only; never for another member's request. Not for ordinary or implied requests -- if unsure he really wants a private message, ask him in the conversation first. Delivery can fail (some groups require a friend request); say so plainly and put the content in the conversation instead."
   $ tool "fm_relay_to_owner"
       (requiredText "content" "The message to tell Fix哥, without adding interpretation.")
       \content -> do
@@ -206,7 +206,7 @@ ownerPrivateTarget message =
 fmRelayMessageTool :: Chat.Chat :> es => Tool (Eff es)
 fmRelayMessageTool =
   allowWhen superuserOnly
-  . withDescription "Send one private QQ message to another person when the owner asks FM to relay something to them. target may be a positive QQ number or a unique nickname/card in the current QQ group. Resolve nicknames from the current group only; if there are zero or multiple matches, do not send. Never post the relay in the current chat. Ordinarily the group does not need FM to private-message anyone, so only reach for this when the owner clearly wants a private message sent; when it is unclear -- a joke, an offhand remark, or no clear recipient -- ask the owner in the conversation first rather than guessing. Private delivery can fail because some groups forbid starting a private chat without a friend request; when that happens say plainly that it did not go out and why, and put the content in the current conversation. Never tell the user which wording to use, and do not drop character to deliver that news."
+  . withDescription "Send one private QQ message to another person when the owner asks FM to relay something. target is a QQ number or a nickname/card resolved only from the current group; on zero or multiple matches send nothing. Never post the relay in the current chat. Only when the owner clearly wants a private message; if it is a joke or the recipient is unclear, ask him first. Private delivery can fail (some groups require a friend request); say plainly that it did not go out and why."
   $ tool "fm_relay_message"
       ( requiredText "target" "Positive QQ number, or a unique nickname/card in the current QQ group."
       , requiredText "content" "The exact message to relay, without adding interpretation."

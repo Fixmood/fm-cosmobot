@@ -72,7 +72,7 @@ normalizedName =
 fmTellMemberTool :: Chat.Chat :> es => Tool (Eff es)
 fmTellMemberTool =
   allowWhen tellMemberGuard
-  . withDescription "Tell a person something in the QQ group they were talking in, when the owner asks for it from somewhere else such as a private chat. Only the owner may use this tool (and only from a private chat), so it cannot be reached on another member's behalf. target is a nickname, group card, or QQ number. If the name matches several people, or one person in several groups, this reports the candidates and sends nothing, because delivering to the wrong person is worse than not delivering. Set dry_run to true to see exactly what would be sent, and where, without sending it. When it is unclear whether the owner really wants this delivered, ask him first rather than guessing. Delivery can fail; when it does, say plainly that it did not go out and why, and never tell the user which wording to use."
+  . withDescription "Tell someone something in the QQ group they were talking in, when the owner asks for it from elsewhere (such as private chat). Owner only, and only from a private chat. target is a nickname, group card or QQ number; on several matches it reports candidates and sends nothing. dry_run=true previews what would be sent and where. If it is unclear the owner really wants this delivered, ask first. Delivery can fail; say so plainly."
   $ tool "fm_tell_member"
       ( requiredText "target" "Nickname, group card, or QQ number of the person to tell."
       , requiredText "content" "The exact message to deliver, without adding interpretation."

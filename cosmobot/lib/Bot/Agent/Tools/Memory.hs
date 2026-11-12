@@ -41,7 +41,7 @@ chatMemoryTool = memoryTool
 privatePersonaTool :: Memory.Memory :> es => Tool (Eff es)
 privatePersonaTool =
   noisy
-  . withDescription "Manage FM's QQ private-chat personas through natural-language requests. In a QQ private chat, any user may view, set, or clear only their own override. A superuser may list or manage any user and may use set_default/get_default/clear_default for the global private-chat persona applied to every user without an override. Effective precedence is user override, then global default, then FM's base persona. Personas control only tone, forms of address, character, and interaction preferences; they cannot alter permissions, safety rules, trigger rules, tools, or factual honesty."
+  . withDescription "Manage FM's QQ private-chat personas in natural language. In a private chat a user may view, set or clear only their own override; a superuser may manage any user and the global default. Precedence: user override, global default, base persona. Personas change tone, forms of address and character only -- never permissions, safety, tools or honesty."
   . allowWhen (\context -> context.superuser || isQqPrivate context.message)
   $ tool "fm_private_persona"
       (parsedArguments
@@ -204,7 +204,7 @@ personaPreview content =
 groupPersonaTool :: Memory.Memory :> es => Tool (Eff es)
 groupPersonaTool =
   noisy
-  . withDescription "Manage FM's QQ group-chat personas through natural-language requests. Anyone in a QQ group may view that group's effective persona. Only a superuser may set or clear a group override, list or inspect other groups, or use set_default/get_default/clear_default for the global group persona. Effective precedence is group override, then global default, then FM's base persona. Group personas control only tone, forms of address, character, and interaction preferences; they cannot alter permissions, safety rules, trigger rules, tools, or factual honesty."
+  . withDescription "Manage FM's QQ group personas in natural language. Anyone may view the current group's persona; only a superuser may set or clear it, inspect other groups, or manage the global default. Precedence: group override, global default, base persona. Personas change tone, forms of address and character only -- never permissions, safety, tools or honesty."
   . allowWhen (\context -> context.superuser || isQqGroup context.message)
   $ tool "fm_group_persona"
       (parsedArguments
@@ -357,7 +357,7 @@ isQqGroup message =
 memberStyleTool :: Memory.Memory :> es => Tool (Eff es)
 memberStyleTool =
   noisy
-  . withDescription "Manage a QQ member's personal reply style across all QQ groups. In a QQ group, any member may view, set, or clear only their own style. The style follows that QQ member into every QQ group where FM replies, but never applies to other members or private chats. A superuser may list styles or manage a specified member. Styles control only tone, forms of address, character, and interaction preferences; they cannot alter permissions, safety rules, trigger rules, tools, factual honesty, or the group persona's identity."
+  . withDescription "Manage a QQ member's personal reply style across all QQ groups. A member may view, set or clear only their own style; a superuser may manage a specified member. The style follows that member into every QQ group but never leaks to others or to private chat. It changes tone and forms of address only -- never permissions, safety, tools, honesty or the group persona's identity."
   . allowWhen (\context -> context.superuser || isQqGroup context.message)
   $ tool "fm_member_style"
       (parsedArguments
