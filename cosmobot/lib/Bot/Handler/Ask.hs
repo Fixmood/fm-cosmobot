@@ -519,7 +519,8 @@ startDrawThread label cfg threads message prompt = do
   let contextPrompt = promptWithCurrentFiles (promptWithReferencedContext prompt referenced contextImages) message.files
   let input = inputWithAttachments contextPrompt contextImages contextFiles
   let transcript = startWithIncomingMessage message input
-  systemPrompt <- askSystemPrompt cfg message
+  -- 画图路径不是聊天，按非拟人模式拼提示词。
+  systemPrompt <- askSystemPrompt cfg False message
   answer <- drawTranscript systemPrompt transcript
   responseId <- listToMaybe . rights <$> Chat.replyTo message answer
   -- Carry the id the platform returned, so the recorded row can be found again

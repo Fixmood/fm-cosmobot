@@ -122,7 +122,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
   humanlike <- humanlikeContext message
-  systemPrompt <- askSystemPrompt cfg humanlike message
+  systemPrompt <- askSystemPrompt cfg humanlike.enabled message
   humanlikePersona <- Humanlike.loadHumanlikePersonaText message
   humanlikeRecord <- HumanlikeArchive.loadHumanlikeRecordText message
   -- 这个人的回复风格：直接注入，不靠模型自己想起来调 fm_member_style。
@@ -444,16 +444,16 @@ agentContext toolCfg cfg message input systemPrompt =
 askSystemPrompt
   :: (Memory.Memory :> es, Skills.Skills :> es, FileSystem :> es, IOE :> es)
   => AskHandlerConfig
-  -> Humanlike.HumanlikeState
+  -> Bool
   -> IncomingMessage
   -> Eff es Text
-askSystemPrompt cfg humanlike message = do
+askSystemPrompt cfg humanlikeEnabled message = do
   skillsPrompt <- Skills.skillsSystemPrompt
   senderMemory <- loadScopedMemory (MemoryStore.senderMemoryScope message)
   chatMemory <- loadScopedMemory (MemoryStore.chatMemoryScope message)
-  privatePersona <- if humanlike.enabled then pure Nothing else loadPrivatePersona message
-  groupPersona <- if humanlike.enabled then pure Nothing else loadGroupPersona message
-  memberStyle <- if humanlike.enabled then pure Nothing else loadMemberStyle message
+  privatePersona <- if humanlikeEnabled then pure Nothing else loadPrivatePersona message
+  groupPersona <- if humanlikeEnabled then pure Nothing else loadGroupPersona message
+  memberStyle <- if humanlikeEnabled then pure Nothing else loadMemberStyle message
   selfMemory <- selfMemoryLayers
   pure . Text.intercalate "\n\n" $
     [ LLM.contextSystemPrompt cfg.systemPrompt skillsPrompt senderMemory chatMemory

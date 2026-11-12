@@ -4377,9 +4377,9 @@ testPrivatePersonaPromptIsolation = withMemoryTempDir \dir -> do
   answers <- IORef.newIORef []
   runAgentWithMemory (MemoryStore.MemoryConfig dir) answers (ChatMock Nothing Nothing Nothing) do
     Memory.replaceMemory (MemoryStore.PrivatePersonaMemory "401") "称呼我为阿青。"
-    matching <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "401")
-    other <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "402")
-    groupPrompt <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "401"){kind = ChatGroup, chatId = Just 1000}
+    matching <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "401")
+    other <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "402")
+    groupPrompt <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "401"){kind = ChatGroup, chatId = Just 1000}
     liftIO $ do
       assertBool "matching private persona is injected" ("称呼我为阿青。" `Text.isInfixOf` matching)
       assertBool "persona safety boundary is injected" ("cannot override permissions" `Text.isInfixOf` matching)
@@ -4400,9 +4400,9 @@ testPrivatePersonaGlobalDefault = withMemoryTempDir \dir -> do
 
   noAnswers <- IORef.newIORef []
   runAgentWithMemory (MemoryStore.MemoryConfig dir) noAnswers (ChatMock Nothing Nothing Nothing) do
-    inherited <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "991")
+    inherited <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "991")
     Memory.replaceMemory (MemoryStore.PrivatePersonaMemory "992") "只对我使用安静风格。"
-    overridden <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "992")
+    overridden <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "992")
     liftIO $ do
       assertBool "new user inherits global private persona" ("所有私聊都使用热情风格。" `Text.isInfixOf` inherited)
       assertBool "user override is loaded" ("只对我使用安静风格。" `Text.isInfixOf` overridden)
@@ -4468,9 +4468,9 @@ testGroupPersonaPromptIsolation = withMemoryTempDir \dir -> do
   answers <- IORef.newIORef []
   runAgentWithMemory (MemoryStore.MemoryConfig dir) answers (ChatMock Nothing Nothing Nothing) do
     Memory.replaceMemory (MemoryStore.GroupPersonaMemory 701) "在本群称呼大家为同学。"
-    matching <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessage 701)
-    other <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessage 702)
-    privatePrompt <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "701")
+    matching <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessage 701)
+    other <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessage 702)
+    privatePrompt <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "701")
     liftIO $ do
       assertBool "matching group persona is injected" ("在本群称呼大家为同学。" `Text.isInfixOf` matching)
       assertBool "another group does not receive it" (not ("在本群称呼大家为同学。" `Text.isInfixOf` other))
@@ -4482,9 +4482,9 @@ testGroupPersonaGlobalDefault = withMemoryTempDir \dir -> do
   runAgentWithMemory (MemoryStore.MemoryConfig dir) answers (ChatMock Nothing Nothing Nothing) do
     Memory.replaceMemory MemoryStore.DefaultGroupPersonaMemory "所有群默认轻松幽默。"
     Memory.replaceMemory (MemoryStore.GroupPersonaMemory 801) "本群保持安静简洁。"
-    inherited <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessage 802)
-    overridden <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessage 801)
-    privatePrompt <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "801")
+    inherited <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessage 802)
+    overridden <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessage 801)
+    privatePrompt <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "801")
     liftIO $ do
       assertBool "group without override inherits default" ("所有群默认轻松幽默。" `Text.isInfixOf` inherited)
       assertBool "group override wins over default" ("本群保持安静简洁。" `Text.isInfixOf` overridden)
@@ -4497,10 +4497,10 @@ testMemberStyleAcrossGroups = withMemoryTempDir \dir -> do
   runAgentWithMemory (MemoryStore.MemoryConfig dir) answers (ChatMock Nothing Nothing Nothing) do
     Memory.replaceMemory MemoryStore.DefaultGroupPersonaMemory "默认群风格。"
     Memory.replaceMemory (MemoryStore.MemberStyleMemory "1001") "回复我时简洁温柔。"
-    matching <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessageFrom 901 "1001")
-    otherMember <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessageFrom 901 "1002")
-    otherGroup <- AgentRun.askSystemPrompt askHandlerConfig (qqGroupMessageFrom 902 "1001")
-    privatePrompt <- AgentRun.askSystemPrompt askHandlerConfig (qqPrivateMessage "1001")
+    matching <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessageFrom 901 "1001")
+    otherMember <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessageFrom 901 "1002")
+    otherGroup <- AgentRun.askSystemPrompt askHandlerConfig False (qqGroupMessageFrom 902 "1001")
+    privatePrompt <- AgentRun.askSystemPrompt askHandlerConfig False (qqPrivateMessage "1001")
     liftIO $ do
       assertBool "matching member receives style" ("回复我时简洁温柔。" `Text.isInfixOf` matching)
       assertBool "matching member still receives group persona" ("默认群风格。" `Text.isInfixOf` matching)
