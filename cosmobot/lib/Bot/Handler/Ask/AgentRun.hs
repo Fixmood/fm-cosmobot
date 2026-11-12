@@ -733,7 +733,7 @@ streamAgentReply humanlikeMode runtime activeReply message transcript triggers =
               then do
                 persona <- Humanlike.loadHumanlikePersonaText message
                 humanlikePlanAheadLine persona (headsUpAction triggered) message.text
-              else pure (normalModeHeadsUpLine triggered)
+              else normalModeHeadsUpLine (headsUpAction triggered) message.text
           when (not (Text.null (Text.strip line))) $
             void $ Chat.replyTo (FMBridge.fmStandaloneMessage message) (Text.strip line)
     (lastReply, replyResult) <-
@@ -1768,11 +1768,27 @@ withChatEffort complex action
       pure result
 
 -- | 正常模式的长任务预告（没有拟人人设时用一句固定的短话）。
-normalModeHeadsUpLine :: Text -> Text
-normalModeHeadsUpLine tool
-  | tool `elem` ["image_generate", "image_edit"] = "好，我去画一张，稍等～"
-  | tool `elem` ["command"] = "这个要跑一会儿，稍等～"
-  | tool `elem` ["typst_render"] = "这个要渲染一会儿，稍等～"
+-- | 正常模式的长任务预告：现场生成一句（不再固定），失败才用兜底句。
+normalModeHeadsUpLine :: LLM.LLM :> es => Text -> Text -> Eff es Text
+normalModeHeadsUpLine action request = do
+  generated <-
+    humanlikePlanAheadLine normalModeHeadsUpPersona action request
+      `catchSync` \_ -> pure ""
+  pure $
+    if Text.null (Text.strip generated)
+      then fallbackHeadsUpLine action
+      else Text.strip generated
+
+-- | 正常模式用的通用人设（只用于生成这一句预告，不注入对话）。
+normalModeHeadsUpPersona :: Text
+normalModeHeadsUpPersona =
+  "你是 FM，一个在 QQ 群里帮忙的伙伴：说话自然、简短、口语化，像群里随手发的一条消息，不用客服腔。"
+
+fallbackHeadsUpLine :: Text -> Text
+fallbackHeadsUpLine action
+  | action == "画一张图" = "好，我去画一张，稍等～"
+  | action == "跑一段命令或脚本" = "这个要跑一会儿，稍等～"
+  | action == "渲染一张图" = "这个要渲染一会儿，稍等～"
   | otherwise = "这个要查一会儿，我先去办，稍等～"
 
 -- | 给拟人模式的预告提示：这次是去做什么（画图 / 查资料 / 跑命令）。
