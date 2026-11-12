@@ -196,9 +196,10 @@ decide policy
       FreshFromReply msgId
 
   -- In an allowed private chat, any non-reply messages start a new thread.
+  -- 私聊里的纯图片/文件也算有内容：只认文本会让表情包、截图完全没人回。
   | isAllowedPrivate policy.msg
   , Nothing <- policy.msg.replyToMessageId
-  , policy.hasPrompt
+  , policy.hasPrompt || policy.hasImages || policy.hasFiles
   , policy.triggered =
       Fresh
 
