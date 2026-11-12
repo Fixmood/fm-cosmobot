@@ -44,6 +44,7 @@ import qualified Bot.Effect.HTTP as HTTP
 import qualified Bot.Effect.LLM as LLM
 import qualified Bot.Effect.Media as Media
 import qualified Bot.Effect.Memory as Memory
+import qualified Bot.Memory as MemoryStore
 import qualified Bot.Effect.Resource as Resource
 import qualified Bot.Effect.Scheduler as Scheduler
 import qualified Bot.Effect.Skills as Skills
@@ -124,6 +125,14 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   humanlike <- humanlikeContext message
   humanlikePersona <- Humanlike.loadHumanlikePersonaText message
   humanlikeRecord <- HumanlikeArchive.loadHumanlikeRecordText message
+  -- 这个人的回复风格：直接注入，不靠模型自己想起来调 fm_member_style。
+  memberStyle <- if humanlike.enabled
+    then case message.senderId of
+           Nothing -> pure ""
+           Just senderId -> do
+             record <- Memory.loadMemory (MemoryStore.MemberStyleMemory senderId)
+             pure (fromMaybe "" record)
+    else pure ""
   logInfo [i|humanlike state: enabled=#{humanlike.enabled} persona_chars=#{Text.length humanlikePersona} record_chars=#{Text.length humanlikeRecord} kind=#{show message.kind :: String}|]
   -- 拟人模式下要表情，或短句闲聊命中主动配图概率时，由代码直接把库存里的那张发出去。
   -- 交给模型选工具试过三轮：它宁可 typst_render 现画、被收走后再用
@@ -162,7 +171,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
             , "- 现在只要回一句很短的话（十来个字），不要描述那张图，也不要说「已发送」。"
             ]
         | otherwise = ""
-      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, humanlikeInstruction humanlike humanlikePersona])
+      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, memberStylePrompt memberStyle, humanlikeInstruction humanlike humanlikePersona])
       requestTranscript = if isImageTask message then startWithUserInput input else transcript
       context = agentContext toolCfg cfg outputMessage input effectiveSystemPrompt
       selectedTools = humanlikeSelectTools humanlike input.text (AgentTools.selectToolsForMessage context tools)
@@ -172,7 +181,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
       contextMessageCount = length requestTranscript.messages
       recentContextChars = Text.length recentChatContext
       recentContextTokens = (recentContextChars + 3) `div` 4
-  logInfo [i|humanlike prompt: enabled=#{humanlike.enabled} persona_chars=#{Text.length humanlikePersona} injected=#{personaInjected humanlikePersona effectiveSystemPrompt} system_chars=#{Text.length effectiveSystemPrompt}|]
+  logInfo [i|humanlike prompt: enabled=#{humanlike.enabled} persona_chars=#{Text.length humanlikePersona} style_chars=#{Text.length memberStyle} injected=#{personaInjected humanlikePersona effectiveSystemPrompt} system_chars=#{Text.length effectiveSystemPrompt}|]
   logInfo [i|FM ask started: platform=#{platformText} kind=#{kindText} tool_mode=#{toolMode} tools=#{length selectedTools}/#{length tools} category=#{toolCategory} context_messages=#{contextMessageCount} recent_chat_messages=#{recentContextMessages} recent_chat_chars=#{recentContextChars} recent_chat_tokens_estimate=#{recentContextTokens} compaction_threshold_ktokens=#{compactionThresholdTokens cfg `div` 1000}|]
   -- 复杂任务：先发一句「我打算怎么做」，做完再给完整结论
   -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
@@ -248,6 +257,15 @@ humanlikeSelectTools state _requestText
 -- the speaking style must not hide it: that is the "two styles, one memory"
 -- rule. Empty when this conversation has no record yet, which keeps every chat
 -- that never used the mode byte-identical.
+-- | 这个人自己的说话风格记录。自动带上，模型不用先调工具才看得到。
+--
+-- 用户定过：风格要跟着人走，但不能靠"硬规则"逼模型去查；直接把已存的那条
+-- 放进提示里，比再写一句"你必须记得"有效。
+memberStylePrompt :: Text -> Text
+memberStylePrompt style
+  | Text.null (Text.strip style) = ""
+  | otherwise = "（这个人的说话风格记录，参考用：" <> Text.strip style <> "）"
+
 humanlikeRecordPrompt :: Text -> Text
 humanlikeRecordPrompt record
   | Text.null (Text.strip record) = ""
