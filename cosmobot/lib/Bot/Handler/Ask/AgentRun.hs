@@ -190,7 +190,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   when (isComplexRequest input.text && not (isImageTask message)) $ do
     line <-
       if humanlike.enabled
-        then pure (humanlikePlanAheadLine input.text)
+        then humanlikePlanAheadLine humanlikePersona input.text
         else do
           plan <- quickPlan input.text
           pure (if Text.null (Text.strip plan) then "" else "😻 FM：" <> Text.strip plan)
@@ -274,24 +274,25 @@ memberStylePrompt style
         <> Text.strip style
         <> "）"
 
--- | 拟人模式的长任务预告：不列步骤，只说一句人设口吻的「等我一下」。
+-- | 拟人模式的长任务预告：让模型自己按当下的请求说一句。
 --
--- 正常模式那句「我先确认…再查相关记录后回复」是助手腔，和人设相反；但长任务
--- 期间完全没声音又会让人以为掉线了，所以换成一句短的口语，按请求内容确定性
--- 选一句（不引入随机数依赖，同一句话不会每天都一样）。
-humanlikePlanAheadLine :: Text -> Text
-humanlikePlanAheadLine request =
-  fromMaybe "" (viaNonEmpty head (drop index planAheadLines))
-  where
-    digest = Text.foldl' (\acc char -> (acc * 31 + fromEnum char) `mod` 100003) 7 request
-    index = digest `mod` length planAheadLines
-    planAheadLines =
-      [ "等我一下，我去瞅瞅"
-      , "这个得查一会儿，别急哈"
-      , "稍等，我翻翻资料"
-      , "我看看哈，一会儿回你"
-      , "让我先摸一圈，回来跟你说"
-      ]
+-- 先写成一池固定台词，被否了——那还是硬编码，说的是"台词"不是"人话"。
+-- 这里带上人设，用当前的请求内容现场生成一句：话该长该短、该撒娇还是该
+-- 正经，由人设和语境决定，不由代码决定。
+humanlikePlanAheadLine :: LLM.LLM :> es => Text -> Text -> Eff es Text
+humanlikePlanAheadLine persona request = do
+  answer <- LLM.ask (Text.unlines
+    [ "你正在扮演下面这个人设。"
+    , ""
+    , persona
+    , ""
+    , "对方刚提了个需要花点时间的请求：" <> Text.take 200 (Text.strip request)
+    , ""
+    , "用你自己的口吻，说一句很短的话告诉他你要去办了（像随手发的一条消息，不超过 15 个字，一行）。"
+    , "不要列步骤，不要说「我先确认」「查相关记录」这类助手话，不要解释你在干什么。"
+    , "只输出这一句话，不要引号。"
+    ])
+  pure (Text.strip answer)
 
 humanlikeRecordPrompt :: Text -> Text
 humanlikeRecordPrompt record
