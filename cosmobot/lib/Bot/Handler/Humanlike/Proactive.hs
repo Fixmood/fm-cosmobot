@@ -22,6 +22,8 @@ module Bot.Handler.Humanlike.Proactive
   , lifeActivities
   , parseScopeTarget
   , inQuietHours
+  , moodPrompt
+  , currentMood
   , Activity (..)
   ) where
 
@@ -309,6 +311,37 @@ proactiveTick now
                       let entry = ProactiveState scope today (count + 1) nowEpoch
                           rest = filter (\candidate -> candidate.stateScope /= scope) states
                       pure (spoken + 1, entry : rest)
+
+-- | 此刻的心情与精力。
+--
+-- 按时段推演、按会话+日期加种子：同一天里稳定，不同会话不同，重启也不变。
+-- 只作为上下文注入（"你现在有点困"），不下命令。
+currentMood :: Text -> UTCTime -> (Text, Int)
+currentMood scope now = (moodLabel, energy)
+  where
+    local = utcToLocalTime chinaTimeZone now
+    hour = todHour (localTimeOfDay local)
+    seed = daySeed scope local
+    block = hour `div` 3
+    moods = ["有点困","挺精神","懒懒的","心情不错","有点烦","平静","想撒个娇","莫名其妙地开心"]
+    moodLabel = fromMaybe "平静" (viaNonEmpty head (drop ((seed + block * 3) `mod` length moods) moods))
+    energy = case hour of
+      h | h < 6 -> 2
+        | h < 9 -> 4
+        | h < 12 -> 7
+        | h < 15 -> 6
+        | h < 18 -> 8
+        | h < 21 -> 7
+        | h < 23 -> 5
+        | otherwise -> 3
+
+-- | 注入拟人模式提示词；空 scope 返回空串。
+moodPrompt :: Text -> UTCTime -> Text
+moodPrompt scope now
+  | Text.null (Text.strip scope) = ""
+  | otherwise = [i|（你现在的心情：#{moodLabel}；精力 #{energy}/10。这是此刻的状态，说话会自然带出来，不用专门说明。）|]
+  where
+    (moodLabel, energy) = currentMood scope now
 
 proactiveTickMicroseconds :: Int
 proactiveTickMicroseconds = 5 * 60 * 1_000_000

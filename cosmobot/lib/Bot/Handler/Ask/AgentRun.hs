@@ -53,6 +53,7 @@ import qualified Bot.Effect.Typst as Typst
 import Bot.Handler.Ask.Config
 import qualified Bot.Handler.Humanlike as Humanlike
 import qualified Bot.Handler.Humanlike.Archive as HumanlikeArchive
+import qualified Bot.Handler.Humanlike.Proactive as HumanlikeProactive
 import qualified Bot.Memory as MemoryStore
 import Bot.Prelude
 import Bot.Storage.Thread
@@ -171,7 +172,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
             , "- 现在只要回一句很短的话（十来个字），不要描述那张图，也不要说「已发送」。"
             ]
         | otherwise = ""
-      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, humanlikeInstruction humanlike humanlikePersona, memberStylePrompt memberStyle])
+      effectiveSystemPrompt = Text.intercalate "\n\n" (filter (not . Text.null) [systemPrompt, recentChatContext, crossPrompt, aiContestConstraint, openingConstraint, imageTaskConstraint, imageSearchConstraint, stickerRequestConstraint, humanlikeRecordPrompt humanlikeRecord, HumanlikeProactive.moodPrompt (fromMaybe "" (Humanlike.humanlikeScope message)) startedAt, humanlikeInstruction humanlike humanlikePersona, memberStylePrompt memberStyle])
       requestTranscript = if isImageTask message then startWithUserInput input else transcript
       context = agentContext toolCfg cfg outputMessage input effectiveSystemPrompt
       selectedTools = humanlikeSelectTools humanlike input.text (AgentTools.selectToolsForMessage context tools)
