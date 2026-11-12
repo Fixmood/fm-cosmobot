@@ -63,7 +63,7 @@ statePath :: FilePath
 statePath = humanlikeDir </> "proactive.txt"
 
 proactiveDailyLimit :: Int
-proactiveDailyLimit = 8
+proactiveDailyLimit = 20
 
 proactiveMinGapSeconds :: Integer
 proactiveMinGapSeconds = 35 * 60
