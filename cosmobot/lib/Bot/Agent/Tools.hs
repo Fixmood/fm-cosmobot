@@ -317,13 +317,10 @@ selectToolsForMessage context tools =
     compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) normalized
 
     selection value
-      | explicitAdmin value = ToolSubset Admin
-      | explicitImage value = ToolSubset Image
-      | explicitScores value = ToolSubset Scores
-      | explicitContest value = ToolSubset Contest
-      | explicitLibrary value = ToolSubset Library
+      -- 2026-11-12：所有领域子集都取消了（所有者反馈「没工具/做不到」频繁）。
+      -- 除了纯闲聊（不给工具）以外，一律给全部工具；代价是提示词更长、略慢。
       | simpleChat value = SimpleChat
-      | otherwise = ToolSubset General
+      | otherwise = FullTools
 
     simpleChat value =
       Text.length value <= 48
@@ -361,16 +358,10 @@ selectToolsForMessage context tools =
         , "555赛文", "ai赛文", "排行榜", "榜单", "群赛文", "晴分身", "groupmatch"
         , "1916996679", "1847992065", "mb赛文" ]
     explicitScores value =
-      -- 成绩类：明确说成绩的，或说了曲线/条数/去重等明确的成绩词（2026-11-06 扩展）
-      or
-        [ "成绩" `Text.isInfixOf` value
-            && any (`Text.isInfixOf` value) [ "查", "看", "我的", "怎么样", "如何", "分析", "曲线", "排行" ]
-        , any (`Text.isInfixOf` value)
-            [ "曲线", "折线", "走势", "趋势", "排行", "排名", "最高分", "最快", "均速"
-            , "键准", "击键", "条数", "几条", "多少条", "去重", "重复", "统计", "记录数" ]
-            && any (`Text.isInfixOf` value)
-                [ "成绩", "分数", "速度", "记录", "我的", "我", "他", "她", "谁", "多少" ]
-        ]
+      -- 2026-11-12 回退：扩展版会把含糊消息误判成成绩请求、隐藏其它工具，
+      -- 导致 FM 频繁说「没工具」。恢复窄条件：明确说「成绩」才进成绩子集。
+      "成绩" `Text.isInfixOf` value
+        && any (`Text.isInfixOf` value) [ "查", "看", "我的", "怎么样", "如何", "分析", "曲线", "排行" ]
 
 data ToolSelection
   = SimpleChat
@@ -406,7 +397,7 @@ toolSelectionSummary context _tools =
       | any (`Text.isInfixOf` value) ["文来", "发文", "发文章", "来一篇", "来篇", "练一篇", "练文", "开始跟打", "继续打", "上一篇", "下一篇", "这篇文", "继续"] = ToolSubset Library
       | Text.length value <= 48 && any (`Text.isInfixOf` value)
           ["你好", "您好", "嗨", "嘿", "谢谢", "感谢", "辛苦了", "早安", "晚安", "哈哈", "笑死", "在吗", "好的", "好啊", "嗯嗯", "收到", "明白了"] = SimpleChat
-      | otherwise = ToolSubset General
+      | otherwise = FullTools
     domainName = \case
       Library -> "library"
       Contest -> "contest"

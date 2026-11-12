@@ -339,7 +339,7 @@ main =
       , testCase "agent hard-limits immediate tool results" testAgentHardLimitsImmediateToolResults
       , testCase "agent audit records structured tool failure category" testAgentAuditRecordsStructuredToolFailureCategory
       , testCase "explicit FM domain requests expose only relevant tools" testSelectToolsForExplicitDomainRequest
-      , testCase "ambiguous FM requests fall back to the General subset" testSelectToolsForAmbiguousRequest
+      , testCase "ambiguous FM requests keep the complete tool set" testSelectToolsForAmbiguousRequest
       , testCase "chat answer JSON remains object compatible" testChatAnswerJsonRemainsObjectCompatible
       , testCase "reply body parses structured content" testReplyBodyParsesStructuredContent
       , testCase "LLM tool request content streams immediately when enabled" testLLMToolRequestContentStreamsImmediatelyWhenEnabled
@@ -5443,9 +5443,8 @@ testSelectToolsForAmbiguousRequest = do
       selected = AgentTools.selectToolsForMessage
         (agentContext{Agent.input = inputWithImages "你最近怎么样" []})
         tools
-  -- 2026-11-09：含糊/普通消息不再给全部工具，而是 General 常用子集（101→45）。
-  -- run_bash 这类不常用工具不再暴露；General 名单内的工具保留。
-  map AgentTool.toolName selected @?= ["fm_library_start", "fm_score_analysis"]
+  -- 2026-11-12 回退：General 白名单隐藏了大量工具、FM 频繁说「没工具」，默认改回全部工具。
+  map AgentTool.toolName selected @?= map AgentTool.toolName tools
 
 superuserContext :: Agent.Context
 superuserContext =
