@@ -181,7 +181,8 @@ setTypingQQ driver message _timeoutMillis =
             -- quasiquote 里不能写类型注解（#{show (x :: Maybe Integer)} 会炸），
             -- 先算成 Text 再插值 —— 早上在 likeActionResult 那里踩过同一次。
             let rc = maybe "-" (Text.pack . show) (response.retcode :: Maybe Integer)
-            logDebug [i|QQ set_input_status failed: retcode=#{rc}|]
+            -- 提到 info：debug 级别看不到，私聊「正在输入」不亮时无法定位。
+            logInfo [i|QQ set_input_status failed: retcode=#{rc}|]
     _ ->
       pure ()
 
