@@ -725,11 +725,16 @@ streamAgentReply humanlikeMode runtime activeReply message transcript triggers =
           )
             runtime
     -- B 方案：不猜意图，等 agent 真的调了慢工具再发一句预告（每轮最多一次）。
+    -- 2026-11-12 所有者要求：正常模式也要发（以前只有拟人模式有）。
     let headsUp = do
-          persona <- Humanlike.loadHumanlikePersonaText message
-          line <- humanlikePlanAheadLine persona message.text
-          when (not (Text.null line)) $
-            void $ Chat.replyTo (FMBridge.fmStandaloneMessage message) line
+          line <-
+            if humanlikeMode
+              then do
+                persona <- Humanlike.loadHumanlikePersonaText message
+                humanlikePlanAheadLine persona message.text
+              else pure normalModeHeadsUpLine
+          when (not (Text.null (Text.strip line))) $
+            void $ Chat.replyTo (FMBridge.fmStandaloneMessage message) (Text.strip line)
     (lastReply, replyResult) <-
       S.mapM_
         (recordReplyUpdate activeReply)
@@ -937,7 +942,7 @@ agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp effortRa
                 else go retryUsed openingHandled earlyFlushed pieceIndex answer (appendReplyText chunk pending) rest
         Right (Agent.ToolCallNotification toolCalls, rest) -> do
           -- 真的调用了慢工具 = 这一轮确实要花时间，这时才发预告（B 方案）。
-          when humanlikeMode do
+          do
             already <- lift (IORef.readIORef headsUpSent)
             let slowTools = ["web_search", "search_web", "fetch_url", "command", "image_generate", "image_edit", "chat_search", "typst_render"]
             when (not already && any ((`elem` slowTools) . (.name)) (toList toolCalls)) do
@@ -1758,3 +1763,7 @@ withChatEffort complex action
       result <- action
       _ <- LLM.selectChatModelVolatile "deepseek-flash"
       pure result
+
+-- | 正常模式的长任务预告（没有拟人人设时用一句固定的短话）。
+normalModeHeadsUpLine :: Text
+normalModeHeadsUpLine = "😻 FM：这个要查一会儿，我先去办，稍等～"
