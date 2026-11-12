@@ -324,12 +324,16 @@ loadRecentChatContext cfg humanlike message now
   | message.kind == ChatGroup && maybe False (`elem` cfg.recentChatContextDisabledGroups) message.chatId = pure (0, "")
   | message.kind `notElem` [ChatGroup, ChatPrivate] = pure (0, "")
   | otherwise = do
-      let since = addUTCTime (negate (fromIntegral (cfg.recentChatContextMinutes * 60))) now
+      -- 拟人模式的「记不住」大多不是没有记忆，是喂给模型的窗口太短（默认只覆盖
+      -- 十几分钟）。这里在拟人模式下把窗口和条数都按 3 倍取，正常模式不变。
+      let boost = if humanlike.enabled then 3 else 1
+          since = addUTCTime (negate (fromIntegral (cfg.recentChatContextMinutes * 60 * boost))) now
           -- Group chats keep the bot's own earlier turns as background too;
           -- otherwise the bot cannot see what it just said.
           includeBotMessages = True
           timeRange = ChatLog.ChatLogTimeRange (Just since) Nothing
-      entries <- ChatLog.queryChat message Nothing (cfg.recentChatContextLimit + 1) includeBotMessages timeRange
+          limit = cfg.recentChatContextLimit * boost
+      entries <- ChatLog.queryChat message Nothing (limit + 1) includeBotMessages timeRange
       let usable = filter (isUsefulRecentEntry message) entries
           rendered = map (renderRecentEntry humanlike) usable
           body = Text.takeEnd cfg.recentChatContextMaxChars (Text.intercalate "\n" rendered)
