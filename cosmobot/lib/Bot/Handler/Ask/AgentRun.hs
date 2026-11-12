@@ -187,7 +187,7 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
   -- 拟人模式下不发计划预告：那句「我先确认…再查相关记录后回复」是助手腔，
   -- 和这个人设正相反，用户实测一眼就看出"味道不对"。
-  withChatEffort (isComplexRequest input.text && not (isImageTask message)) $ Agent.withAgentMetadata
+  Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
       , originRunId = runId
@@ -862,8 +862,9 @@ agentReplyTextSegments
   -> Stream (Stream (Of Text) (Eff es)) (Eff es) (Text, Agent.Result)
 agentReplyTextSegments humanlikeMode request triggers headsUp stream = do
   headsUpSent <- lift (IORef.newIORef False)
+  effortRaised <- lift (IORef.newIORef False)
   S.maps (S.mapMaybe id)
-    (S.breaks isNothing (agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp stream))
+    (S.breaks isNothing (agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp effortRaised stream))
 
 agentReplyTextEvents
   :: (Prim :> es, LLM.LLM :> es, KatipE :> es, Concurrency.Concurrency :> es)
@@ -872,9 +873,10 @@ agentReplyTextEvents
   -> [Text]
   -> IORef.IORef Bool
   -> Eff es ()
+  -> IORef.IORef Bool
   -> Stream (Of Agent.Output) (Eff es) Agent.Result
   -> Stream (Of (Maybe Text)) (Eff es) (Text, Agent.Result)
-agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp stream = do
+agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp effortRaised stream = do
   retryUsed <- lift (IORef.newIORef False)
   openingHandled <- lift (IORef.newIORef False)
   earlyFlushed <- lift (IORef.newIORef False)
@@ -884,6 +886,8 @@ agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp stream =
       next <- lift (S.next currentStream)
       case next of
         Left result -> do
+          raised <- lift (IORef.readIORef effortRaised)
+          when raised (lift (void (LLM.selectChatModelVolatile "deepseek-flash")))
           flushed <- lift (IORef.readIORef earlyFlushed)
           finalChunk <- lift (correctVisibleReply retryUsed openingHandled request (renderReplyText pending))
           let
@@ -938,6 +942,11 @@ agentReplyTextEvents humanlikeMode request triggers headsUpSent headsUp stream =
             let slowTools = ["web_search", "search_web", "fetch_url", "command", "image_generate", "image_edit", "chat_search", "typst_render"]
             when (not already && any ((`elem` slowTools) . (.name)) (toList toolCalls)) do
               lift (IORef.writeIORef headsUpSent True)
+              -- 换掉关键词表：真的调了慢工具才升到高思考档位。
+              raised <- lift (IORef.readIORef effortRaised)
+              unless raised do
+                lift (IORef.writeIORef effortRaised True)
+                lift (void (LLM.selectChatModelVolatile "deepseek-flash-high"))
               lift headsUp
           -- message_break 是模型自己标记的换气点：它什么都不做，只表示"这条到此为止"。
           let breakRequested =
