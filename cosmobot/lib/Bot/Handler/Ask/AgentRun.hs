@@ -187,10 +187,15 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
   -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
   -- 拟人模式下不发计划预告：那句「我先确认…再查相关记录后回复」是助手腔，
   -- 和这个人设正相反，用户实测一眼就看出"味道不对"。
-  when (isComplexRequest input.text && not (isImageTask message) && not humanlike.enabled) $ do
-    plan <- quickPlan input.text
-    when (not (Text.null (Text.strip plan))) $
-      void $ Chat.replyTo outputMessage ("😻 FM：" <> Text.strip plan)
+  when (isComplexRequest input.text && not (isImageTask message)) $ do
+    line <-
+      if humanlike.enabled
+        then pure (humanlikePlanAheadLine input.text)
+        else do
+          plan <- quickPlan input.text
+          pure (if Text.null (Text.strip plan) then "" else "😻 FM：" <> Text.strip plan)
+    when (not (Text.null line)) $
+      void $ Chat.replyTo outputMessage line
   withChatEffort (isComplexRequest input.text && not (isImageTask message)) $ Agent.withAgentMetadata
     (\runId -> Agent.ToolCallMetadata
       { agentRunId = runId
@@ -268,6 +273,25 @@ memberStylePrompt style
       "（只对这个人生效的说话风格，优先于上面的通用语气："
         <> Text.strip style
         <> "）"
+
+-- | 拟人模式的长任务预告：不列步骤，只说一句人设口吻的「等我一下」。
+--
+-- 正常模式那句「我先确认…再查相关记录后回复」是助手腔，和人设相反；但长任务
+-- 期间完全没声音又会让人以为掉线了，所以换成一句短的口语，按请求内容确定性
+-- 选一句（不引入随机数依赖，同一句话不会每天都一样）。
+humanlikePlanAheadLine :: Text -> Text
+humanlikePlanAheadLine request =
+  fromMaybe "" (viaNonEmpty head (drop index planAheadLines))
+  where
+    digest = Text.foldl' (\acc char -> (acc * 31 + fromEnum char) `mod` 100003) 7 request
+    index = digest `mod` length planAheadLines
+    planAheadLines =
+      [ "等我一下，我去瞅瞅"
+      , "这个得查一会儿，别急哈"
+      , "稍等，我翻翻资料"
+      , "我看看哈，一会儿回你"
+      , "让我先摸一圈，回来跟你说"
+      ]
 
 humanlikeRecordPrompt :: Text -> Text
 humanlikeRecordPrompt record
