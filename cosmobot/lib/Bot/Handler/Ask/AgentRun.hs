@@ -270,14 +270,14 @@ autoMemoryPrompt
   -> UTCTime
   -> Eff es Text
 autoMemoryPrompt message now = do
-  let terms = take 4 (memorySearchTerms message.text)
+  let terms = take 6 (memorySearchTerms message.text)
   if null terms
     then pure ""
     else do
-      let since = addUTCTime (negate (fromIntegral (30 * 24 * 3600))) now
-          before = addUTCTime (-5) now
-      entries <- ChatLog.searchAllChatLog message ChatLogTypes.SenderChatLogChat
-        (map (: []) terms) 8 (ChatLog.ChatLogTimeRange (Just since) (Just before))
+      -- 不设时间下限、不限定会话：所有者要求「越全面越好」，历史全量参与检索。
+      let before = addUTCTime (-5) now
+      entries <- ChatLog.searchAllChatLog message ChatLogTypes.SenderChatLogGlobal
+        (map (: []) terms) 12 (ChatLog.ChatLogTimeRange Nothing (Just before))
       let rendered =
             [ (if entry.isBot then "FM: " else "对方: ")
                 <> Text.take 80 (Text.unwords (Text.words entry.text))
@@ -287,7 +287,7 @@ autoMemoryPrompt message now = do
       pure $
         if null rendered
           then ""
-          else Text.unlines ("（你记得这个会话里相关的旧对话，供参考）：" : take 6 rendered)
+          else Text.unlines ("（你记得的、和现在话题相关的旧对话，供参考）：" : take 8 rendered)
 
 -- | 机械切词：ASCII 单词（>=3 字符）+ 中文二元组。
 memorySearchTerms :: Text -> [Text]
