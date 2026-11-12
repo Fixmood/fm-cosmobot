@@ -12,6 +12,7 @@ module Bot.Storage.ChatLog
   , lookupStoredMessage
   , queryCurrentSenderStored
   , searchAllStored
+  , lookupMemberStored
   , queryBySenders
   )
 where
@@ -239,6 +240,30 @@ timeRangeMatches :: forall (backend :: Type). ChatLogTimeRange -> Row backend Ch
 timeRangeMatches timeRange row =
   maybe true (\since -> row ! #recorded_at .> literal (Just since)) timeRange.since
     .&& maybe true (\before -> row ! #recorded_at .< literal (Just before)) timeRange.before
+
+-- | 按昵称片段或 QQ 号反查：返回该账号（们）的历史消息行，用来列全部曾用昵称。
+-- 所有者 2026-11-12：群友改名片后 FM 就认不出来，其实 chat_log 里存着完整改名历史。
+lookupMemberStored :: Storage.Storage :> es => IncomingMessage -> Text -> Int -> Eff es [ChatLogEntry]
+lookupMemberStored _message queryText limitCount = do
+  ensureChatLogTable
+  let trimmed = Text.strip queryText
+  if Text.null trimmed
+    then pure []
+    else do
+      -- Selda 的 like 不支持可空列，这里先取最近 N 条再在 Haskell 里按昵称片段过滤。
+      -- N 默认 30000（可在工具里调大），覆盖最近几个月的活跃成员。
+      rows <- runSelda $
+        query $
+          queryLimit 0 (max 1 (min 60000 limitCount)) do
+            row <- select chatLogRows
+            restrict (botVisibilityMatches False row)
+            order (row ! #id) descending
+            pure row
+      let entries = map chatLogEntryFromStoredRow rows
+          matches entry =
+            maybe False (Text.isInfixOf trimmed) entry.senderUsername
+              || maybe False (== trimmed) entry.senderId
+      pure (filter matches entries)
 
 -- | 全成员关键字搜索（所有者 2026-11-11：要能翻所有聊天记录，不只是自己发的）。
 searchAllStored :: Storage.Storage :> es => IncomingMessage -> SenderChatLogScope -> [[Text]] -> Int -> ChatLogTimeRange -> Eff es [ChatLogEntry]

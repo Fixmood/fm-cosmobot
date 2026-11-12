@@ -118,6 +118,7 @@ defaultToolsWith extraTools = tools
       , queryChatLogTool
       , queryCurrentSenderChatLogTool
       , chatSearchTool
+      , memberLookupTool
       , recallRecentSelfMessagesTool
       , webSearchTool
       , webFetchTool

@@ -8,6 +8,7 @@ module Bot.Agent.Tools.Chat
   ( queryChatLogTool
   , queryCurrentSenderChatLogTool
   , chatSearchTool
+  , memberLookupTool
   , downloadNovelTool
   , novelStatusTool
   , selfMessagesTool
@@ -110,6 +111,54 @@ queryCurrentSenderChatLogTool =
                 entries <- ChatLog.queryCurrentSenderChatLog context.message scope keywords limit timeRange
                 humanlike <- Humanlike.humanlikeScopeStateOrDisabled context.message
                 pure (toolText (jsonText (map (chatLogToolEntry humanlike) entries)))
+
+-- | 昵称/QQ 号 → 账号 + 全部历史昵称（所有者 2026-11-12）。
+--
+-- 群友改了群名片，FM 用 member_info 只能查到当前昵称，于是认不出是同一个人。
+-- chat_log 里存着每次发言时的昵称，这里按昵称片段或 QQ 号反查，列出该账号用过的
+-- 所有昵称、消息数、最近发言时间。
+memberLookupTool :: ChatLog.ChatLog :> es => Tool (Eff es)
+memberLookupTool =
+  tagged [chatTag]
+    . withDescription
+      "Look up who a nickname belongs to. Give a name fragment or a platform user id; returns the matching accounts with every nickname they have used in the recorded chat, message counts and last-seen time. Use when asked who someone is, or when a member changed their group card and the new name is not recognised. Read-only."
+    $ tool "member_lookup"
+        ( requiredText "query" "Name fragment or platform user id (QQ number)."
+        , optionalInt "limit" "How many recent matching messages to scan. Defaults to 3000."
+        )
+        \query maybeLimit -> do
+          context <- askToolContext
+          let scan = max 1 (min 3000 (fromMaybe 3000 maybeLimit))
+          firstPass <- ChatLog.lookupMemberAliases context.message query scan
+          -- 先用「昵称片段」找到账号，再按账号各查一次，把这个账号换过的所有昵称都带出来
+          -- （2026-11-12：群友改名后只按旧名查，列表里就只有旧名，认不出现在的名字）。
+          let idsRaw = [fromMaybe "" entry.senderId | entry <- firstPass]
+              dedupeRaw = foldr (\item acc -> if item `elem` acc then acc else item : acc) []
+              foundIds = take 5 [sid | sid <- dedupeRaw idsRaw, not (Text.null sid)]
+          entries <-
+            if null foundIds
+              then pure firstPass
+              else concat <$> mapM (\sid -> ChatLog.lookupMemberAliases context.message sid scan) foundIds
+          let dedupe :: Eq a => [a] -> [a]
+              dedupe = foldr (\item acc -> if item `elem` acc then acc else item : acc) []
+              latest :: [UTCTime] -> Maybe UTCTime
+              latest = foldr (\stamp acc -> Just (maybe stamp (max stamp) acc)) Nothing
+              rows =
+                [ (fromMaybe "" entry.senderId, fromMaybe "" entry.senderUsername, entry.recordedAt)
+                | entry <- entries
+                ]
+              ids = dedupe [sender | (sender, _, _) <- rows]
+              summarise sender =
+                let mine = [row | row@(s, _, _) <- rows, s == sender]
+                    aliases = dedupe [name | (_, name, _) <- mine, not (Text.null name)]
+                    lastSeen = latest [stamp | (_, _, Just stamp) <- mine]
+                 in Aeson.object
+                      [ "user_id" Aeson..= sender
+                      , "aliases" Aeson..= aliases
+                      , "messages" Aeson..= length mine
+                      , "last_seen" Aeson..= fmap (Text.pack . show) lastSeen
+                      ]
+          pure (toolText (jsonText (map summarise ids)))
 
 -- | 全成员聊天记录全文搜索（所有者 2026-11-11）。
 --

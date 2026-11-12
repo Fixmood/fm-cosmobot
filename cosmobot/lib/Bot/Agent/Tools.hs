@@ -139,6 +139,7 @@ defaultToolsWith extraTools = tools
       , queryChatLogTool
       , queryCurrentSenderChatLogTool
       , chatSearchTool
+      , memberLookupTool
       , messageBreakTool
       , stickerListTool
       , stickerSendTool
@@ -259,6 +260,7 @@ selectToolsForMessage context tools =
       -- 不加进来就会被子集过滤掉（2026-10-25 实测：工具在二进制里但模型看不到）。
       , "search_quota"
        , "chat_search"
+       , "member_lookup"
        , "fanqie_reading"
        , "typing_stats"
       ]
