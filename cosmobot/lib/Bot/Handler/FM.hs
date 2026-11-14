@@ -821,17 +821,13 @@ allCompetitionRankQuickHandler =
             groupValue = case message.kind of
               ChatGroup -> fromMaybe "" (show <$> message.chatId)
               _ -> ""
+            -- 2026-11-15 所有者：全部排行榜 = 官网能查的赛事 + 555，其它不列。
             contests =
               [ ("100000" :: Text, "锦标赛" :: Text)
               , ("HB", "虎杯")
               , ("99999", "极速杯")
               , ("100004", "极速联赛")
               , ("555", "555赛文")
-              , ("666", "666")
-              , ("mb", "mb赛文")
-              , ("999", "群赛文")
-              , ("777", "777")
-              , ("groupmatch", "groupmatch")
               ]
             urls =
               [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
