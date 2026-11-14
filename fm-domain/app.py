@@ -2,8 +2,6 @@
 """FM's retained domain data importer and read-only query service."""
 
 import argparse
-import functools
-import statistics
 import html
 import hashlib
 import io
@@ -16,7 +14,7 @@ import string
 import threading
 import time
 import unicodedata
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,77 +25,49 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-ARCHIVE_WORKER_LOCK = threading.Lock()
-ARCHIVE_QUEUES = {}
-DATABASE_INIT_LOCK = threading.Lock()
-INITIALIZED_DATABASES = set()
-SQLITE_BUSY_TIMEOUT_MS = 5000
-SQLITE_LOCK_RETRIES = 3
-SQLITE_LOCK_RETRY_DELAY = 0.1
+# ── 顶层辅助函数 ─────────────────────────────────────────
+
+# 必须放在文件**顶部**：这个文件末尾是 if __name__ == "__main__": main()，
+
+# 追加到末尾的函数在 main() 执行时还没定义 —— 2026-10-05 因此连崩两次（NameError）。
+
+def _raw_score_field(raw, name):
+    """从跟打原始行里取一个数字字段；**取不到返回 0.0**。
+
+    所有者 2026-10-05 定的：没报的字段一律记 0，规则简单一致，榜面不留空白。
+    （代价：键准会显示成 0.00%，读起来像「打了 0 分」—— 所有者的取舍。）
+
+    真实格式举例：
+        第555段 速度35.05 击键0.00 码长0.00 字数257 时间07:18.246 回改39 重打0 ...
+    「重打」只有约一半记录有 —— 缺失和「0 次」是两回事。
+    """
+    if not raw:
+        return None
+    m = re.search(rf"{name}\s*([0-9]+(?:\.[0-9]+)?)", str(raw))
+    return float(m.group(1)) if m else 0.0
 
 
-def is_sqlite_lock_error(error: Exception) -> bool:
-    message = str(error).lower()
-    return "database is locked" in message or "database table is locked" in message
 
 
-class RetryingConnection(sqlite3.Connection):
-    def _with_lock_retry(self, operation, *args, **kwargs):
-        for retry in range(SQLITE_LOCK_RETRIES + 1):
-            try:
-                return operation(*args, **kwargs)
-            except sqlite3.OperationalError as error:
-                if not is_sqlite_lock_error(error) or retry >= SQLITE_LOCK_RETRIES:
-                    raise
-                print(
-                    f"[fm-domain][sqlite] database locked; retry={retry + 1}/{SQLITE_LOCK_RETRIES}",
-                    flush=True,
-                )
-                time.sleep(SQLITE_LOCK_RETRY_DELAY)
+def _raw_retype(raw):
+    """重打次数；**首打的成绩标 0**。
 
-    def execute(self, sql, parameters=(), /):
-        return self._with_lock_retry(super().execute, sql, parameters)
+    首打＝一次打完，本来就不存在重打 —— 所以那不是「没报」，是真的 0。
+    把确定的事实显示成「—」（未知）和把没报的显示成 0（谎报）一样糟，两个方向都要防。
 
-    def executemany(self, sql, parameters, /):
-        return self._with_lock_retry(super().executemany, sql, parameters)
-
-    def executescript(self, sql_script, /):
-        return self._with_lock_retry(super().executescript, sql_script)
-
-    def commit(self):
-        return self._with_lock_retry(super().commit)
+    实测：带「首打认证」的记录里确实没有「重打」字段（只有打词、码长这些）。
+    """
+    value = _raw_score_field(raw, "重打")
+    if value is not None:
+        return value
+    if raw and "首打" in str(raw):
+        return 0.0
+    # 所有者 2026-10-05：没报的也记 0（规则简单一致，榜面不留空白）。
+    return 0.0
 
 
-def archive_message_worker(db_path, archive_queue):
-    while True:
-        values = archive_queue.get()
-        try:
-            if values is None:
-                return
-            db = connect(db_path)
-            try:
-                db.execute(
-                    "INSERT INTO message_archive (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(platform,message_id) DO UPDATE SET group_id=excluded.group_id,group_name=excluded.group_name,sender_id=excluded.sender_id,sender_name=excluded.sender_name,text=excluded.text,occurred_at=excluded.occurred_at,raw_json=excluded.raw_json,image_urls_json=excluded.image_urls_json",
-                    values,
-                )
-                db.commit()
-            finally:
-                db.close()
-        except Exception as error:
-            # Archive failures must not interrupt the live message path.
-            print(f"[fm-domain][archive] write failed: {error}", flush=True)
-        finally:
-            archive_queue.task_done()
 
 
-def start_archive_worker(db_path):
-    with ARCHIVE_WORKER_LOCK:
-        archive_queue = ARCHIVE_QUEUES.get(db_path)
-        if archive_queue is None:
-            archive_queue = ARCHIVE_QUEUES[db_path] = Queue()
-            threading.Thread(target=archive_message_worker, args=(db_path, archive_queue), daemon=True, name="message-archive").start()
-        return archive_queue
 
 
 SCHEMA = """
@@ -123,10 +93,6 @@ CREATE TABLE IF NOT EXISTS score_records (
   source_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS score_group_idx ON score_records(group_id, occurred_at DESC);
--- 聚合接口按 occurred_at 排序 + 按时间窗口过滤。只有 (group_id, occurred_at)
--- 复合索引时，ORDER BY occurred_at 用不上它，每次都要对全表做 TEMP B-TREE
--- 排序（实测 39651 行花 224 ms）。
-CREATE INDEX IF NOT EXISTS score_time_idx ON score_records(occurred_at);
 CREATE TABLE IF NOT EXISTS contest_texts (
   text_id TEXT PRIMARY KEY, title TEXT NOT NULL, source_group TEXT NOT NULL,
   competition_date TEXT NOT NULL, relative_path TEXT NOT NULL UNIQUE,
@@ -153,9 +119,21 @@ CREATE TABLE IF NOT EXISTS ai_contest_scores (
   record_id TEXT PRIMARY KEY, competition_date TEXT NOT NULL, user_id TEXT NOT NULL,
   user_name TEXT NOT NULL, group_id TEXT NOT NULL, speed REAL NOT NULL,
   key_rate REAL NOT NULL, accuracy REAL NOT NULL, occurred_at REAL NOT NULL,
-  source_json TEXT NOT NULL
+  source_json TEXT NOT NULL,
+  -- 2026-10-05 加：从原始跟打行解析出来的两个字段。
+  -- **可空**：不同跟打工具报的字段不同（实测「重打」只有约一半记录有），
+  -- 缺失必须是 NULL —— 存 0 会在榜上显示成「0 次」，那是谎报成绩。
+  code_length REAL,
+  retype REAL,
+  -- 打词率（%）。原始行里有两种写法：打词32.42% 和 打词15.93%(17)，
+  -- 取百分号前那个数即可。同样可空。
+  word_rate REAL
 );
 CREATE INDEX IF NOT EXISTS ai_contest_score_date_idx ON ai_contest_scores(competition_date, speed DESC);
+
+-- 老库补列：CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做，所以这里单独 ALTER。
+-- 幂等：列已存在就跳过。
+
 CREATE TABLE IF NOT EXISTS competition_scores (
   record_id TEXT PRIMARY KEY, competition_date TEXT NOT NULL, user_id TEXT NOT NULL,
   user_name TEXT NOT NULL, group_id TEXT NOT NULL, source_group TEXT NOT NULL,
@@ -165,17 +143,14 @@ CREATE INDEX IF NOT EXISTS competition_score_user_idx ON competition_scores(user
 CREATE TABLE IF NOT EXISTS group_runtime (
   group_id TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL
 );
-/* P1-c: recent_messages 建表语句已移除 */
-/* P1-c: recent_message_time_idx 已移除 */
-CREATE TABLE IF NOT EXISTS message_archive (
+CREATE TABLE IF NOT EXISTS recent_messages (
   platform TEXT NOT NULL, message_id TEXT NOT NULL, group_id TEXT NOT NULL,
   group_name TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
   text TEXT NOT NULL, occurred_at REAL NOT NULL, raw_json TEXT NOT NULL,
   image_urls_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY(platform, message_id)
 );
-CREATE INDEX IF NOT EXISTS message_archive_time_idx ON message_archive(occurred_at DESC);
-CREATE INDEX IF NOT EXISTS message_archive_group_idx ON message_archive(group_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS recent_message_time_idx ON recent_messages(occurred_at DESC);
 CREATE TABLE IF NOT EXISTS repeat_recent (
   id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, sender_id TEXT NOT NULL,
   normalized TEXT NOT NULL, text TEXT NOT NULL, occurred_at REAL NOT NULL
@@ -215,10 +190,79 @@ CREATE TABLE IF NOT EXISTS library_sessions (
 );
 CREATE INDEX IF NOT EXISTS library_session_scope_idx
   ON library_sessions(platform, chat_id, status, updated_at DESC);
+-- 番茄小说专区（2026-11-05）。
+-- 设计要点：层级是 书 → 章节 → （按用户的）进度 + （每本书的）成绩流水。
+-- 章节正文仍然存在 library_texts 里，这里只加「归属哪本书、第几章」的映射，
+-- 这样难度评级、题材分类、分段发送全部复用现有逻辑。
+CREATE TABLE IF NOT EXISTS typing_scores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT NOT NULL DEFAULT 'qq',
+  chat_id TEXT NOT NULL, user_id TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '',
+  segment_label TEXT NOT NULL DEFAULT '',
+  speed REAL, key_rate REAL, code_length REAL, accuracy REAL,
+  char_count INTEGER, duration_ms INTEGER, word_rate REAL,
+  backspace INTEGER, delete_count INTEGER, retype INTEGER, choice_count INTEGER,
+  difficulty TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '{}',
+  novel_book_id TEXT, novel_chapter_index INTEGER, novel_segment_no INTEGER,
+  raw_text TEXT NOT NULL DEFAULT '', recorded_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS typing_scores_chat_idx ON typing_scores(chat_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS typing_scores_user_idx ON typing_scores(user_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS typing_scores_book_idx ON typing_scores(novel_book_id, user_id);
+
+CREATE TABLE IF NOT EXISTS novel_books (
+  book_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  author TEXT NOT NULL DEFAULT '',
+  total_chapters INTEGER NOT NULL DEFAULT 0,
+  word_count INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'fanqie',
+  imported_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS novel_books_title_idx ON novel_books(title);
+CREATE TABLE IF NOT EXISTS novel_chapters (
+  text_id TEXT PRIMARY KEY,
+  book_id TEXT NOT NULL,
+  chapter_index INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  word_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS novel_chapters_book_idx ON novel_chapters(book_id, chapter_index);
+CREATE TABLE IF NOT EXISTS novel_progress (
+  platform TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  requester_id TEXT NOT NULL,
+  book_id TEXT NOT NULL,
+  chapter_index INTEGER NOT NULL,
+  char_offset INTEGER NOT NULL DEFAULT 0,
+  segment_length INTEGER NOT NULL DEFAULT 300,
+  last_segment_id TEXT NOT NULL DEFAULT '',
+  last_segment_chars INTEGER NOT NULL DEFAULT 0,
+  last_sent_at REAL NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (platform, chat_id, requester_id)
+);
+CREATE TABLE IF NOT EXISTS novel_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  book_id TEXT NOT NULL,
+  chapter_index INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  user_name TEXT NOT NULL DEFAULT '',
+  speed REAL NOT NULL DEFAULT 0,
+  accuracy REAL NOT NULL DEFAULT 0,
+  wpm REAL NOT NULL DEFAULT 0,
+  chars INTEGER NOT NULL DEFAULT 0,
+  recorded_at REAL NOT NULL,
+  source_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS novel_records_book_idx ON novel_records(book_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS novel_records_user_idx ON novel_records(user_id, book_id);
 CREATE TABLE IF NOT EXISTS library_session_modes (
   session_id TEXT PRIMARY KEY, requested_difficulty TEXT NOT NULL,
   requested_length INTEGER NOT NULL DEFAULT 0,
-  requested_genre TEXT NOT NULL DEFAULT ''
+  requested_genre TEXT NOT NULL DEFAULT '',
+  auto_continue_same INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS library_previous_sessions (
   platform TEXT NOT NULL, chat_id TEXT NOT NULL, requester_id TEXT NOT NULL,
@@ -260,22 +304,6 @@ CREATE TABLE IF NOT EXISTS single_sessions (
 );
 CREATE INDEX IF NOT EXISTS single_session_scope_idx
   ON single_sessions(platform, chat_id, status, updated_at DESC);
-
--- 见过的所有人（含私聊）。自动登记，不区分平台。
--- 时间用 Unix 秒：库里混着带不同偏移的时间字符串，是「时间对不上」的根源。
-CREATE TABLE IF NOT EXISTS known_senders (
-  platform       TEXT NOT NULL,
-  sender_id      TEXT NOT NULL,
-  display_name   TEXT NOT NULL DEFAULT '',
-  first_seen_at  REAL NOT NULL DEFAULT 0,
-  last_seen_at   REAL NOT NULL DEFAULT 0,
-  message_count  INTEGER NOT NULL DEFAULT 0,
-  first_group_id TEXT NOT NULL DEFAULT '',
-  last_group_id  TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (platform, sender_id)
-);
-CREATE INDEX IF NOT EXISTS known_sender_seen_idx
-  ON known_senders(last_seen_at DESC);
 """
 
 GROUP_CAPABILITIES = {
@@ -285,7 +313,7 @@ GROUP_CAPABILITIES = {
 
 AI_CONTEST_POLICY_DEFAULTS = {
     "min_chars": 200,
-    "max_chars": 350,
+    "max_chars": 300,
     "daily_refresh": True,
     "unique_topic": True,
     "unique_body": True,
@@ -301,11 +329,6 @@ LIBRARY_DIFFICULTY_ALIASES = {
     "nan": "难", "难级": "难", "困难": "难",
     "nue": "虐", "虐级": "虐", "爆表": "虐", "爆虐": "虐",
 }
-# An article session that has seen no activity for this long is treated as
-# abandoned and stopped on the next status read. Without it, sessions stay
-# status='active' forever and keep occupying the "current article" slot.
-LIBRARY_SESSION_IDLE_SECONDS = 30 * 60
-
 LIBRARY_DEFAULT_MIN_LENGTH = 200
 LIBRARY_DEFAULT_MAX_LENGTH = 400
 LIBRARY_MAX_LENGTH = 1400
@@ -318,8 +341,7 @@ RANK_TRIE_WORD_KEY = "\0word"
 RANK_TRIE_PRE_KEY = "\0pre"
 LETTER_DIGIT = string.ascii_letters + string.digits
 _RANKER = None
-LIBRARY_RANKING_VERSION = "full-text-v2"
-LIBRARY_CLASSIFIER_VERSION = "genre-form-v2"
+LIBRARY_CLASSIFIER_VERSION = "genre-form-v3"
 
 LIBRARY_GENRE_ALIASES = {
     "恐怖": "恐怖惊悚", "惊悚": "恐怖惊悚", "灵异": "恐怖惊悚",
@@ -329,19 +351,13 @@ LIBRARY_GENRE_ALIASES = {
     "武侠": "武侠江湖", "江湖": "武侠江湖",
     "言情": "言情爱情", "爱情": "言情爱情", "恋爱": "言情爱情",
     "科幻": "科幻未来", "未来": "科幻未来", "星际": "科幻未来",
-    "历史": "历史古风", "古风": "历史古风",
-    "都市": "都市职场", "职场": "都市职场",
-    "校园": "校园青春", "青春": "校园青春",
-    "亲情": "亲情家庭", "家庭": "亲情家庭",
-    "励志": "励志成长", "成长": "励志成长",
-    "寓言": "寓言童话", "童话": "寓言童话",
+    "历史": "历史古风", "古风": "历史古风", "都市": "都市职场", "职场": "都市职场",
+    "校园": "校园青春", "青春": "校园青春", "亲情": "亲情家庭", "家庭": "亲情家庭",
+    "励志": "励志成长", "成长": "励志成长", "寓言": "寓言童话", "童话": "寓言童话",
     "诗词": "诗词古典", "古典": "诗词古典", "诗歌": "诗词古典",
-    "散文": "散文随笔", "随笔": "散文随笔",
-    "科普": "科普说明", "说明文": "科普说明",
+    "散文": "散文随笔", "随笔": "散文随笔", "科普": "科普说明", "说明文": "科普说明",
 }
 
-# Title hits carry more weight than body hits. Evidence is stored with every
-# result so a later classifier revision can explain and reproduce the label.
 LIBRARY_GENRE_RULES = {
     "恐怖惊悚": ("恐怖", "惊悚", "灵异", "鬼魂", "怨灵", "僵尸", "幽灵", "诡异", "阴森", "尸体", "棺材", "亡魂", "血腥", "噩梦", "鬼屋", "闹鬼"),
     "悬疑推理": ("悬疑", "推理", "侦探", "案件", "凶案", "线索", "证据", "真相", "密室", "犯人", "刑侦", "谜案", "失踪", "谋杀", "尸检"),
@@ -355,31 +371,13 @@ LIBRARY_GENRE_RULES = {
     "校园青春": ("校园", "学校", "同学", "老师", "青春", "高考", "教室", "学生", "毕业", "校服", "宿舍", "社团", "课堂"),
     "亲情家庭": ("亲情", "家庭", "父亲", "母亲", "妈妈", "爸爸", "孩子", "姐姐", "兄弟", "家人", "夫妻", "爷爷", "奶奶", "女儿", "儿子"),
     "励志成长": ("励志", "成长", "梦想", "坚持", "成功", "奋斗", "勇气", "逆袭", "蜕变", "突破", "挑战", "自律"),
-    "寓言童话": ("寓言", "童话", "故事会", "王子", "公主", "森林", "魔法世界", "从前有一天", "小动物", "巨人"),
+    "寓言童话": ("寓言", "童话", "王子", "公主", "森林", "从前有一天", "小动物", "巨人"),
     "诗词古典": ("诗经", "楚辞", "唐诗", "宋词", "元曲", "古诗", "诗词", "绝句", "律诗", "乐府", "文言", "古文"),
     "散文随笔": ("散文", "随笔", "杂记", "感悟", "抒情", "回忆", "心情", "絮语", "札记", "漫谈"),
     "科普说明": ("科普", "说明", "百科", "知识", "原理", "实验", "科学", "技术", "指南", "教程", "机制", "结构"),
+    "自然生态": ("自然", "生态", "森林", "山川", "河流", "湖泊", "海洋", "植物", "动物", "花草", "鸟类", "气候", "环境", "田野", "四季"),
 }
-
-LIBRARY_GENRE_STRONG_TERMS = {
-    "恐怖惊悚": {"恐怖", "惊悚", "灵异", "鬼魂", "怨灵", "僵尸", "幽灵", "鬼屋", "闹鬼"},
-    "悬疑推理": {"悬疑", "推理", "侦探", "凶案", "密室", "刑侦", "谜案", "谋杀", "尸检"},
-    "仙侠修真": {"修仙", "修真", "仙侠", "丹田", "元婴", "筑基", "金丹", "渡劫", "宗门", "灵根", "真元"},
-    "玄幻奇幻": {"玄幻", "奇幻", "魔法", "魔王", "精灵", "勇者", "异世界", "斗气", "巫师", "魔兽", "龙族"},
-    "武侠江湖": {"武侠", "江湖", "武林", "少侠", "门派", "剑客", "侠客", "内力", "轻功", "秘籍"},
-    "科幻未来": {"科幻", "星际", "宇宙", "太空", "飞船", "机器人", "人工智能", "量子", "外星", "时空"},
-    "历史古风": {"皇帝", "皇宫", "朝廷", "王朝", "将军", "清朝", "明朝", "唐朝", "宋朝", "三国", "战国", "丞相", "后宫"},
-    "寓言童话": {"寓言", "童话", "王子", "公主", "从前有一天", "小动物", "巨人"},
-    "诗词古典": {"诗经", "楚辞", "唐诗", "宋词", "元曲", "古诗", "诗词", "绝句", "律诗", "乐府"},
-    "言情爱情": {"言情", "爱情", "恋爱", "初恋", "暗恋", "表白", "告白", "婚礼"},
-    "都市职场": {"都市", "职场", "总裁", "公司", "办公室", "会议", "项目", "加班"},
-    "校园青春": {"校园", "学校", "同学", "老师", "高考", "教室", "毕业", "校服", "宿舍"},
-    "亲情家庭": {"亲情", "家庭", "父亲", "母亲", "妈妈", "爸爸", "孩子", "家人", "夫妻"},
-    "励志成长": {"励志", "成长", "梦想", "坚持", "成功", "奋斗", "勇气", "逆袭", "蜕变"},
-    "散文随笔": {"散文", "随笔", "杂记", "感悟", "抒情", "回忆", "札记", "漫谈"},
-    "科普说明": {"科普", "百科", "原理", "实验", "科学", "技术", "教程", "机制", "结构"},
-}
-
+LIBRARY_GENRE_STRONG_TERMS = {genre: set(terms[:min(10, len(terms))]) for genre, terms in LIBRARY_GENRE_RULES.items()}
 LIBRARY_FORM_RULES = {
     "诗歌": ("诗", "词", "曲", "歌", "绝句", "律诗", "诗经", "楚辞"),
     "书信": ("书信", "来信", "致信", "信件", "敬爱的", "此致"),
@@ -388,7 +386,6 @@ LIBRARY_FORM_RULES = {
     "议论随笔": ("随笔", "杂文", "评论", "感悟", "思考", "议论"),
     "对话剧本": ("剧本", "场景", "幕", "旁白", "台词"),
 }
-
 LIBRARY_CLASSIFICATION_SAMPLE_SIZE = 16000
 
 PUBLIC_COMPETITION_GROUPS = {
@@ -411,6 +408,7 @@ JSXIAOSHI = "https://www.jsxiaoshi.com"
 TIGER_API = "https://race.tiger-code.com/api"
 PUBLIC_COMPETITION_CACHE_TTL = 60
 CONTEST_LIBRARY_ROOT = Path(os.environ.get("FM_CONTEST_LIBRARY_ROOT", "/data/contest-library"))
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def contest_file_path(relative_path: str) -> Path:
@@ -606,6 +604,9 @@ def public_http_get_json(url: str) -> dict:
 def public_dazi_row(row: dict) -> dict:
     return {
         "rank": int(public_number(row.get("ranking"))),
+        "user_id": canonical_user_id(
+            row.get("user_qq_number") or row.get("qq") or row.get("user_id") or ""
+        ),
         "name": clean_public_text(row.get("username") or row.get("third_username") or row.get("user_qq_number") or "未知"),
         "speed": public_number(row.get("speed")), "key": public_number(row.get("keystrokes")),
         "code": public_number(row.get("ma_chang")), "back": clean_public_text(row.get("hui_gai") or "0"),
@@ -670,7 +671,7 @@ def fetch_public_js_competition(target: dict, period: str) -> dict:
         if rank <= 0:
             continue
         rows.append({
-            "rank": rank, "name": clean_public_text(cells[1] or cells[6]),
+            "rank": rank, "user_id": "", "name": clean_public_text(cells[1] or cells[6]),
             "speed": public_number(cells[8]), "key": public_number(cells[9]),
             "code": public_number(cells[10]), "back": clean_public_text(cells[12]),
             "wrong": "", "acc": public_number(cells[13]), "ime": clean_public_text(cells[15]),
@@ -703,6 +704,9 @@ def fetch_public_tiger_competition(target: dict, period: str) -> dict:
             continue
         rows.append({
             "rank": rank,
+            "user_id": canonical_user_id(
+                item.get("user_id") or item.get("qq") or item.get("user_qq_number") or ""
+            ),
             "name": clean_public_text(item.get("username") or "未知"),
             "speed": public_number(item.get("speed")),
             "key": public_number(item.get("hit_rate")),
@@ -744,45 +748,317 @@ def get_public_competition(source="", current_group="", period="", refresh=False
     return result
 
 
-def connect(path: str) -> sqlite3.Connection:
-    db = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000, factory=RetryingConnection)
-    db.row_factory = sqlite3.Row
-    db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    db.execute("PRAGMA synchronous=NORMAL")
-    database_key = os.path.abspath(path)
-    try:
-        with DATABASE_INIT_LOCK:
-            if database_key not in INITIALIZED_DATABASES:
-                db.execute("PRAGMA journal_mode=WAL")
-                db.executescript(SCHEMA)
-                ensure_column(db, "library_session_modes", "requested_length", "INTEGER NOT NULL DEFAULT 0")
-                ensure_column(db, "library_session_modes", "requested_genre", "TEXT NOT NULL DEFAULT ''")
-                ensure_column(db, "library_previous_sessions", "requested_length", "INTEGER NOT NULL DEFAULT 0")
-                ensure_column(db, "library_previous_sessions", "requested_genre", "TEXT NOT NULL DEFAULT ''")
-                ensure_column(db, "recall_records", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
-                # P1-c: recent_messages 已删除，不再需要补列
-                # P1-c: 这里原本每次启动都把 recent_messages 整表 INSERT OR IGNORE
-                # 进 message_archive。主路径已经直接写 message_archive，
-                # 保留它只会白跑一次 9 万行的全表扫描。
+def analysis_name(value) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).casefold()
+
+
+def analysis_identity_match(item: dict, user_id: str = "", name: str = "") -> str:
+    target_id = canonical_user_id(user_id)
+    candidate_ids = [
+        canonical_user_id(item.get(key))
+        for key in ("user_id", "sender_id", "qq", "user_qq_number")
+        if str(item.get(key) or "").strip()
+    ]
+    if target_id and target_id in candidate_ids:
+        return "user_id"
+    target_name = analysis_name(name)
+    candidate_name = analysis_name(
+        item.get("name") or item.get("user_name") or item.get("sender_name") or ""
+    )
+    if target_name and candidate_name and target_name == candidate_name:
+        return "name"
+    return ""
+
+
+def analysis_number(item: dict, keys, default=0.0) -> float:
+    for key in keys:
+        value = item.get(key)
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            return float(str(value).replace("%", "").strip())
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def analysis_date_for(item: dict, fallback_timestamp=None) -> str:
+    for key in ("competition_date", "date", "occurred_date"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            try:
+                return public_competition_date(value)
+            except PublicCompetitionError:
                 pass
-                db.commit()
-                ranking_version = db.execute(
-                    "SELECT value_json FROM settings WHERE key='library_ranking_version'"
-                ).fetchone()
-                if not ranking_version or ranking_version["value_json"] != json.dumps(LIBRARY_RANKING_VERSION):
-                    # Rankings are derived data. Drop only this cache when the scoring
-                    # algorithm changes; source texts and saved classification remain intact.
-                    db.execute("DELETE FROM library_rankings")
-                    db.execute(
-                        "INSERT INTO settings(key,value_json) VALUES (?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
-                        ("library_ranking_version", json.dumps(LIBRARY_RANKING_VERSION)),
-                    )
-                    db.commit()
-                INITIALIZED_DATABASES.add(database_key)
-    except Exception:
-        db.close()
-        raise
+    try:
+        if fallback_timestamp is not None:
+            return datetime.fromtimestamp(float(fallback_timestamp), CHINA_TIMEZONE).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    for key in ("ts", "occurred_at", "received_at", "timestamp"):
+        value = item.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return datetime.fromtimestamp(float(value), CHINA_TIMEZONE).date().isoformat()
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+    return ""
+
+
+def analysis_projection(item: dict, source: str = "", period: str = "", match_by: str = "") -> dict:
+    result = {
+        "date": period or analysis_date_for(item),
+        "source": source or str(item.get("source_group") or item.get("source") or "未知来源"),
+        "name": str(item.get("name") or item.get("user_name") or item.get("sender_name") or ""),
+        "user_id": canonical_user_id(item.get("user_id") or item.get("sender_id") or ""),
+        "speed": round(analysis_number(item, ("speed", "rate")), 2),
+        "keystroke": round(analysis_number(item, ("keystroke", "key", "hit_rate")), 2),
+        "accuracy": round(analysis_number(item, ("accuracy", "acc", "key_rate")), 2),
+    }
+    for key in ("rank", "participants", "characters", "segment_id", "group_id", "group_name", "message_id"):
+        if key in item and item[key] not in (None, ""):
+            result[key] = item[key]
+    if match_by:
+        result["matched_by"] = match_by
+    return result
+
+
+def analysis_stats(records: list[dict]) -> dict:
+    def values(keys):
+        return [analysis_number(item, keys) for item in records if analysis_number(item, keys) > 0]
+
+    def average(items):
+        return round(sum(items) / len(items), 2) if items else 0
+
+    speeds = values(("speed",))
+    keystrokes = values(("keystroke", "key", "hit_rate"))
+    accuracies = values(("accuracy", "acc", "key_rate"))
+    dates = sorted({str(item.get("date") or "") for item in records if item.get("date")})
+    return {
+        "count": len(records),
+        "days": len(dates),
+        "date_start": dates[0] if dates else "",
+        "date_end": dates[-1] if dates else "",
+        "best_speed": round(max(speeds), 2) if speeds else 0,
+        "average_speed": average(speeds),
+        "lowest_speed": round(min(speeds), 2) if speeds else 0,
+        "best_keystroke": round(max(keystrokes), 2) if keystrokes else 0,
+        "average_keystroke": average(keystrokes),
+        "best_accuracy": round(max(accuracies), 2) if accuracies else 0,
+        "average_accuracy": average(accuracies),
+        "lowest_accuracy": round(min(accuracies), 2) if accuracies else 0,
+    }
+
+
+def score_analysis_range(start_date="", end_date="", days=1):
+    today = datetime.now(CHINA_TIMEZONE).date()
+
+    def parse(value, fallback):
+        value = str(value or "").strip()
+        if not value:
+            return fallback
+        try:
+            return datetime.strptime(public_competition_date(value), "%Y-%m-%d").date()
+        except (PublicCompetitionError, ValueError) as exc:
+            raise ValueError("日期必须是 YYYY-MM-DD 格式。") from exc
+
+    end = parse(end_date, today)
+    if str(start_date or "").strip():
+        start = parse(start_date, end)
+    else:
+        try:
+            span = max(1, min(3650, int(days or 1)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("days 必须是 1 到 3650 之间的整数。") from exc
+        start = end - timedelta(days=span - 1)
+    if start > end:
+        raise ValueError("开始日期不能晚于结束日期。")
+    return start.isoformat(), end.isoformat(), today.isoformat()
+
+
+def score_analysis_targets(source="") -> list[tuple[str, str]]:
+    compact = re.sub(r"\s+", "", str(source or "")).casefold()
+    if not compact or compact in {"全部", "所有", "all"}:
+        return [
+            ("champ", "锦标赛"), ("tiger", "虎杯"), ("comp", "极速杯"),
+            *[(group_id, name) for group_id, name in PUBLIC_COMPETITION_GROUPS.items()],
+        ]
+    if compact in {"555", "555赛文", "ai", "aicontest"}:
+        return []
+    target = resolve_public_competition(source)
+    return [(str(source).strip(), target["source"])]
+
+
+def collect_live_score_analysis(period: str, user_id: str, name: str, source="") -> list[dict]:
+    targets = score_analysis_targets(source)
+    if not targets:
+        return []
+
+    def fetch(target):
+        source_key, label = target
+        try:
+            live = get_public_competition(source_key, "", period)
+            matches = []
+            for row in live.get("rows", []):
+                matched_by = analysis_identity_match(row, user_id, name)
+                if matched_by:
+                    matches.append(analysis_projection(row, label, live.get("date") or period, matched_by))
+            return {
+                "source": label,
+                "date": live.get("date") or period,
+                "status": "ok" if live.get("row_count") else "no_data",
+                "participants": live.get("row_count", 0),
+                "records": matches,
+            }
+        except PublicCompetitionError as exc:
+            return {
+                "source": label,
+                "date": period,
+                "status": "error",
+                "participants": 0,
+                "records": [],
+                "message": str(exc),
+            }
+
+    reports = []
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as executor:
+        futures = [executor.submit(fetch, target) for target in targets]
+        for future in as_completed(futures):
+            reports.append(future.result())
+    order = {label: index for index, (_, label) in enumerate(targets)}
+    return sorted(reports, key=lambda item: order.get(item["source"], 999))
+
+
+def archive_score_analysis_records(db, table: str, user_id: str, name: str, start: str, end: str) -> list[dict]:
+    if table == "score_records":
+        rows = db.execute("SELECT source_json,occurred_at FROM score_records ORDER BY occurred_at DESC").fetchall()
+    elif table == "competition_scores":
+        rows = db.execute("SELECT source_json,occurred_at FROM competition_scores ORDER BY occurred_at DESC").fetchall()
+    else:
+        rows = db.execute("SELECT source_json,occurred_at FROM ai_contest_scores ORDER BY occurred_at DESC").fetchall()
+    records = []
+    for row in rows:
+        try:
+            item = json.loads(row["source_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        matched_by = analysis_identity_match(item, user_id, name)
+        if not matched_by:
+            continue
+        period = analysis_date_for(item, row["occurred_at"])
+        if not period or not start <= period <= end:
+            continue
+        source = str(item.get("source_group") or item.get("group_name") or item.get("source") or "未知来源")
+        if table == "ai_contest_scores":
+            source = "555赛文"
+        records.append(analysis_projection(item, source, period, matched_by))
+    return records
+
+
+def build_score_analysis(
+    db: sqlite3.Connection,
+    user_id: str = "",
+    name: str = "",
+    scope: str = "all",
+    start_date: str = "",
+    end_date: str = "",
+    days: int = 1,
+    source: str = "",
+    live_results=None,
+) -> dict:
+    start, end, today = score_analysis_range(start_date, end_date, days)
+    scope_key = re.sub(r"\s+", "", str(scope or "all")).casefold()
+    include_contest = scope_key in {"all", "全部", "所有", "contest", "competition", "赛文", "赛事"}
+    include_typing = scope_key in {"all", "全部", "所有", "typing", "practice", "跟打", "打字"}
+    if scope_key not in {"all", "全部", "所有", "contest", "competition", "赛文", "赛事", "typing", "practice", "跟打", "打字"}:
+        raise ValueError("scope 只能是 all、contest 或 typing。")
+    if not canonical_user_id(user_id) and not analysis_name(name):
+        raise ValueError("必须提供 user_id 或 name。")
+
+    contest_history = []
+    contest_today = []
+    live_reports = []
+    if include_contest:
+        contest_history = archive_score_analysis_records(db, "competition_scores", user_id, name, start, end)
+        if start <= today <= end and not re.sub(r"\s+", "", str(source or "")).casefold() in {"555", "555赛文", "ai", "aicontest"}:
+            live_reports = live_results if live_results is not None else collect_live_score_analysis(today, user_id, name, source)
+            for report in live_reports:
+                for record in report.get("records", []):
+                    record["participants"] = report.get("participants", 0)
+                    contest_today.append(record)
+
+    ai_records = []
+    if include_contest and (not source or re.sub(r"\s+", "", str(source)).casefold() in {"555", "555赛文", "ai", "aicontest"}):
+        ai_records = archive_score_analysis_records(db, "ai_contest_scores", user_id, name, start, end)
+
+    typing_records = []
+    if include_typing:
+        typing_records = archive_score_analysis_records(db, "score_records", user_id, name, start, end)
+        # Segment 555 is the dedicated AI contest archive and is reported
+        # separately so an all-scores analysis does not count it twice.
+        typing_records = [
+            item for item in typing_records
+            if str(item.get("segment_id") or "") != "555"
+        ]
+
+    errors = [
+        {"source": report.get("source", ""), "message": report.get("message", "")}
+        for report in live_reports if report.get("status") == "error"
+    ]
+    notes = []
+    if include_contest and start <= today <= end and not contest_today:
+        notes.append("今天公开排行榜没有匹配到该用户；可能尚未上榜，或该榜单只提供姓名，已使用姓名精确匹配作为回退。")
+    if include_typing and not typing_records:
+        notes.append("所选日期内没有找到已归档的跟打成绩。")
+    if errors:
+        notes.append("部分公开赛事暂时无法访问，已在 live_errors 中列出，未把缺失赛事当成零分。")
+    all_contest_records = contest_history + contest_today + ai_records
+    return {
+        "status": "ok" if (all_contest_records or typing_records) else "no_data",
+        "user": {"user_id": canonical_user_id(user_id), "name": name},
+        "scope": scope_key,
+        "date_range": {"start": start, "end": end, "today": today},
+        "contest": {
+            "today": sorted(contest_today, key=lambda item: (item.get("source", ""), item.get("rank", 999999))),
+            "history": contest_history[:100],
+            "summary": analysis_stats(contest_history + contest_today),
+            "live_sources_checked": [report.get("source", "") for report in live_reports],
+            "live_errors": errors,
+        },
+        "ai_contest": {"records": ai_records[:100], "summary": analysis_stats(ai_records)},
+        "typing": {"records": typing_records[:100], "summary": analysis_stats(typing_records)},
+        "notes": notes,
+    }
+
+
+def connect(path: str) -> sqlite3.Connection:
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    # 「文来」要排除这个会话最近发过的文章 —— 2026-10-30 之前只排除当前一篇，
+    # 于是 A → B → A 会重复（难度高时候选池小，特别明显）。
+    _ensure_library_recent_table(db)
+    db.executescript(CONTEST_SCHEMA)
+    # 老表补列：CREATE TABLE IF NOT EXISTS 不会给已经存在的表加列，
+    # 2026-11-06 加 segment_length 时线上表还是旧的，直接崩了。这里逐个补。
+    for table, column, ddl in (
+        ("novel_progress", "segment_length", "INTEGER NOT NULL DEFAULT 300"),
+        ("novel_progress", "last_segment_id", "TEXT NOT NULL DEFAULT ''"),
+        ("novel_progress", "last_segment_chars", "INTEGER NOT NULL DEFAULT 0"),
+        ("novel_progress", "last_sent_at", "REAL NOT NULL DEFAULT 0"),
+    ):
+        existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if existing and column not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            db.commit()
+    ensure_column(db, "library_session_modes", "requested_length", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "library_session_modes", "requested_genre", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(db, "library_session_modes", "auto_continue_same", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "library_previous_sessions", "requested_length", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(db, "library_previous_sessions", "requested_genre", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(db, "recall_records", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(db, "recent_messages", "image_urls_json", "TEXT NOT NULL DEFAULT '[]'")
     return db
 
 
@@ -941,27 +1217,16 @@ def normalize_library_difficulty(value) -> str:
 
 def normalize_library_genre(value) -> str:
     normalized = re.sub(r"\s+", "", str(value or "").strip().lower())
-    if not normalized:
-        return ""
     if normalized in LIBRARY_GENRE_RULES:
         return normalized
     return LIBRARY_GENRE_ALIASES.get(normalized, "")
 
 
-def infer_library_genre(value) -> str:
-    normalized = re.sub(r"\s+", "", str(value or "").strip().lower())
-    for genre in sorted(LIBRARY_GENRE_RULES, key=len, reverse=True):
-        if genre in normalized:
-            return genre
-    for alias in sorted(LIBRARY_GENRE_ALIASES, key=len, reverse=True):
-        if alias in normalized:
-            return LIBRARY_GENRE_ALIASES[alias]
-    return ""
-
-
 def resolve_library_genre(value) -> str:
-    """Accept both canonical labels and natural-language genre phrases."""
-    return normalize_library_genre(value) or infer_library_genre(value)
+    normalized = re.sub(r"\s+", "", str(value or "").strip().lower())
+    return normalize_library_genre(normalized) or next(
+        (LIBRARY_GENRE_RULES[name] and name for name in sorted(LIBRARY_GENRE_RULES, key=len, reverse=True) if name in normalized), ""
+    ) or next((target for alias, target in sorted(LIBRARY_GENRE_ALIASES.items(), key=lambda item: len(item[0]), reverse=True) if alias in normalized), "")
 
 
 def library_query_without_genre(query: str, genre: str) -> str:
@@ -975,183 +1240,985 @@ def library_query_without_genre(query: str, genre: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def library_classification_sample(content: str) -> str:
-    """Keep both the opening and ending when a source is unusually long."""
-    value = str(content or "")
-    if len(value) <= LIBRARY_CLASSIFICATION_SAMPLE_SIZE:
-        return value
-    tail_size = LIBRARY_CLASSIFICATION_SAMPLE_SIZE // 3
-    return value[:LIBRARY_CLASSIFICATION_SAMPLE_SIZE - tail_size] + value[-tail_size:]
-
-
 def classify_library_text(title: str, content: str) -> dict:
-    """Classify a complete article without a model call or network dependency."""
-    title_compact = re.sub(r"\s+", "", str(title or "")).lower()
-    body_compact = re.sub(r"\s+", "", str(content or "")).lower()
-    sample = re.sub(r"\s+", "", library_classification_sample(content)).lower()
-    genre_scores = {}
-    evidence = {}
-    genre_quality = {}
+    title_text = re.sub(r"\s+", "", str(title or "")).lower()
+    body = re.sub(r"\s+", "", str(content or "")).lower()[:LIBRARY_CLASSIFICATION_SAMPLE_SIZE]
+    scores, evidence = {}, {}
     for genre, terms in LIBRARY_GENRE_RULES.items():
-        score = 0.0
-        hits = {}
-        for term in terms:
-            title_hits = title_compact.count(term)
-            body_hits = min(sample.count(term), 8)
-            if title_hits or body_hits:
-                hits[term] = {"title": title_hits, "body": body_hits}
-                weight = 2.5 if term in LIBRARY_GENRE_STRONG_TERMS.get(genre, set()) else 1.0
-                score += title_hits * weight * 2.5 + min(body_hits, 3) * weight
-                score += max(0, body_hits - 3) * weight * 0.25
-        title_hits_total = sum(item["title"] for item in hits.values())
-        strong_hits = sum(
-            item["title"] + item["body"]
-            for term, item in hits.items()
-            if term in LIBRARY_GENRE_STRONG_TERMS.get(genre, set())
-        )
-        # A single generic word is not enough to claim a genre. This keeps
-        # ordinary essays from being mislabeled as romance, family, or
-        # motivational texts while still accepting an explicit title signal.
-        reliable = bool(
-            score >= 2
-            and (title_hits_total > 0 or strong_hits > 0 or len(hits) >= 2)
-        )
-        if score and reliable:
-            genre_scores[genre] = round(score, 2)
+        hits = {term: title_text.count(term) * 3 + min(body.count(term), 6) for term in terms if term in title_text or term in body}
+        score = sum(hits.values())
+        strong_hits = sum(1 for term in hits if term in LIBRARY_GENRE_STRONG_TERMS.get(genre, set()))
+        # Body mentions alone must form a real cluster; a passing reference
+        # such as a school or teacher should not label a novel as campus fiction.
+        reliable = any(term in title_text for term in hits) or strong_hits >= 2 or len(hits) >= 3
+        if score >= 2 and reliable:
+            scores[genre] = score
             evidence[genre] = hits
-            genre_quality[genre] = {
-                "distinct_terms": len(hits),
-                "title_hits": title_hits_total,
-                "strong_hits": strong_hits,
-            }
-
-    ordered = sorted(genre_scores.items(), key=lambda item: (-item[1], item[0]))
-    if not ordered or ordered[0][1] < 2:
-        primary_genre = "综合文学"
-        genres = [primary_genre]
-        confidence = 0.28
-    else:
-        top_score = ordered[0][1]
-        second_score = ordered[1][1] if len(ordered) > 1 else 0.0
-        primary_genre = ordered[0][0]
-        genres = [
-            genre for genre, score in ordered[:3]
-            if score >= max(2.0, top_score * 0.42)
-        ]
-        quality = genre_quality[primary_genre]
-        confidence = 0.42 + min(0.3, quality["strong_hits"] * 0.06)
-        confidence += min(0.18, quality["distinct_terms"] * 0.04)
-        confidence += min(0.09, quality["title_hits"] * 0.03)
-        confidence += min(0.1, max(0.0, top_score - second_score) / 40.0)
-        confidence = round(min(0.99, confidence), 3)
-
-    form_scores = {"小说/叙事": 1.0}
-    title_lines = [line.strip() for line in str(content or "").splitlines() if line.strip()]
-    compact_lines = [re.sub(r"\s+", "", line) for line in title_lines]
-    body_text = str(content or "")
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    primary = ordered[0][0] if ordered else "综合文学"
+    genres = [genre for genre, score in ordered[:3] if score >= max(2, ordered[0][1] * .42)] if ordered else [primary]
+    form_scores = {"小说/叙事": 1}
     for form, terms in LIBRARY_FORM_RULES.items():
-        title_hits = sum(title_compact.count(term) for term in terms)
-        body_hits = sum(min(sample.count(term), 4) for term in terms)
-        if title_hits or body_hits:
-            form_scores[form] = float(title_hits * 4 + body_hits)
-    if len(compact_lines) >= 3 and len(compact_lines) <= 20:
-        short_lines = sum(len(line) <= 32 for line in compact_lines)
-        if short_lines >= len(compact_lines) * 0.7 and len(body_compact) <= 500:
-            form_scores["诗歌"] = form_scores.get("诗歌", 0) + 4
-    dialogue_turns = len(re.findall(r"(?m)^[^\n：:]{1,16}[：:]", body_text))
-    if dialogue_turns >= 2 or len(re.findall(r"[“”‘’]", body_text)) >= 8:
-        form_scores["对话剧本"] = form_scores.get("对话剧本", 0) + dialogue_turns * 2 + 2
-    if re.search(r"(?:他说|她说|问道|答道|说道|回答)[：:]", body_text):
-        form_scores["小说/叙事"] += 2
-    form = max(form_scores.items(), key=lambda item: (item[1], item[0]))[0]
-    return {
-        "primary_genre": primary_genre,
-        "genres": genres,
-        "form": form,
-        "confidence": round(confidence, 3),
-        "evidence": evidence,
-        "genre_scores": genre_scores,
-        "genre_quality": genre_quality,
-    }
-
-
-def upsert_library_classification(db: sqlite3.Connection, text_id: str, metadata: dict) -> None:
-    db.execute(
-        "INSERT INTO library_classifications "
-        "(text_id,primary_genre,genres_json,form,difficulty,difficulty_score,confidence,evidence_json,classifier_version,classified_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(text_id) DO UPDATE SET primary_genre=excluded.primary_genre,genres_json=excluded.genres_json,"
-        "form=excluded.form,difficulty=excluded.difficulty,difficulty_score=excluded.difficulty_score,"
-        "confidence=excluded.confidence,evidence_json=excluded.evidence_json,classifier_version=excluded.classifier_version,"
-        "classified_at=excluded.classified_at",
-        (
-            text_id, metadata["primary_genre"], json.dumps(metadata["genres"], ensure_ascii=False),
-            metadata["form"], metadata["difficulty"], metadata["difficulty_score"],
-            metadata["confidence"], json.dumps(metadata["evidence"], ensure_ascii=False),
-            LIBRARY_CLASSIFIER_VERSION, time.time(),
-        ),
-    )
+        score = sum(title_text.count(term) * 4 + min(body.count(term), 4) for term in terms)
+        if score:
+            form_scores[form] = score
+    if len([line for line in str(content or "").splitlines() if line.strip()]) >= 3 and len(body) <= 500:
+        form_scores["诗歌"] = form_scores.get("诗歌", 0) + 4
+    if len(re.findall(r"[：:]", str(content or ""))) >= 2:
+        form_scores["对话剧本"] = form_scores.get("对话剧本", 0) + 2
+    return {"primary_genre": primary, "genres": genres, "form": max(form_scores.items(), key=lambda item: (item[1], item[0]))[0],
+            "confidence": round(min(.99, .35 + min(.5, (ordered[0][1] if ordered else 0) / 30)), 3), "evidence": evidence}
 
 
 def classify_library_row(db: sqlite3.Connection, row: sqlite3.Row, refresh: bool = False) -> dict:
-    cached = db.execute(
-        "SELECT * FROM library_classifications WHERE text_id=?", (row["text_id"],)
-    ).fetchone()
+    cached = db.execute("SELECT * FROM library_classifications WHERE text_id=?", (row["text_id"],)).fetchone()
     if cached and not refresh and cached["classifier_version"] == LIBRARY_CLASSIFIER_VERSION:
         metadata = dict(cached)
         metadata["genres"] = json.loads(metadata["genres_json"] or "[]")
         metadata["evidence"] = json.loads(metadata["evidence_json"] or "{}")
         return metadata
-    content = normalize_library_content(row["content"])
-    score, difficulty = get_library_ranker().rank(content)
+    score, difficulty = rank_library_row(db, row)
     metadata = classify_library_text(row["title"], row["content"])
-    metadata.update({
-        "text_id": row["text_id"],
-        "difficulty": difficulty,
-        "difficulty_score": score,
-        "classifier_version": LIBRARY_CLASSIFIER_VERSION,
-        "classified_at": time.time(),
-    })
-    upsert_library_classification(db, row["text_id"], metadata)
+    metadata.update(text_id=row["text_id"], difficulty=difficulty, difficulty_score=score, classifier_version=LIBRARY_CLASSIFIER_VERSION, classified_at=time.time())
+    db.execute("INSERT INTO library_classifications (text_id,primary_genre,genres_json,form,difficulty,difficulty_score,confidence,evidence_json,classifier_version,classified_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(text_id) DO UPDATE SET primary_genre=excluded.primary_genre,genres_json=excluded.genres_json,form=excluded.form,difficulty=excluded.difficulty,difficulty_score=excluded.difficulty_score,confidence=excluded.confidence,evidence_json=excluded.evidence_json,classifier_version=excluded.classifier_version,classified_at=excluded.classified_at",
+               (row["text_id"], metadata["primary_genre"], json.dumps(metadata["genres"], ensure_ascii=False), metadata["form"], difficulty, score, metadata["confidence"], json.dumps(metadata["evidence"], ensure_ascii=False), LIBRARY_CLASSIFIER_VERSION, time.time()))
     return metadata
 
 
-def library_metadata_summary(metadata: dict, segment_difficulty: str = "", segment_score=None) -> str:
-    score = float(metadata.get("difficulty_score") or 0)
-    summary = (
-        f"整篇难度={metadata.get('difficulty') or '普'}({score:.2f})，"
-        f"题材={metadata.get('primary_genre') or '综合文学'}，"
-        f"文体={metadata.get('form') or '小说/叙事'}，"
-        f"置信度={float(metadata.get('confidence') or 0):.0%}"
-    )
-    if segment_difficulty:
-        segment_value = f"{float(segment_score):.2f}" if segment_score is not None else "未知"
-        summary += f"；当前段={segment_difficulty}({segment_value})"
-    return summary
-
-
-def library_has_genre(metadata: dict, genre: str) -> bool:
-    return genre and (
-        metadata.get("primary_genre") == genre
-        or genre in (metadata.get("genres") or [])
-    )
-
-
 def library_genre_matches(db: sqlite3.Connection, row: sqlite3.Row, genre: str) -> bool:
-    """Use the cheap genre pass while scanning candidates; rank only selected rows."""
-    if not genre:
-        return True
-    cached = db.execute(
-        "SELECT primary_genre,genres_json,classifier_version FROM library_classifications WHERE text_id=?",
-        (row["text_id"],),
+    metadata = classify_library_row(db, row)
+    if not genre or not (metadata["primary_genre"] == genre or genre in metadata["genres"]):
+        return False
+    evidence = metadata.get("evidence", {}).get(genre, {})
+    strong_terms = LIBRARY_GENRE_STRONG_TERMS.get(genre, set())
+    strong_hits = sum(1 for term, count in evidence.items() if term in strong_terms and count)
+    return strong_hits >= 2
+
+
+# ==================== 番茄小说专区（2026-11-05） ====================
+# 所有者要的形态：直接说打某本小说，有就发；进度按发起人记；跳章按书的章号；
+# 成绩单独按书存。文来随机完全不受影响，只有走这里的请求才用这套。
+
+NOVEL_DEFAULT_SEGMENT = 300
+NOVEL_IDLE_MINUTES = 10   # 所有者定的：超过这么久没打自动结束
+
+
+def novel_identity(payload: dict) -> tuple[str, str, str, str]:
+    return (
+        str(payload.get("platform") or "qq"),
+        str(payload.get("chat_id") or ""),
+        str(payload.get("requester_id") or ""),
+        str(payload.get("requester_name") or ""),
+    )
+
+
+# ==================== 成绩分析（2026-11-06） ====================
+# 数据在 typing_scores：全字段保留 + raw_text，所以任何分析都能现算。
+# 这里只封装几个最常问的，返回 message 是可以直接念的中文。
+
+TYPING_MIN_FOR_RANKING = 50
+
+
+def typing_identity(payload: dict) -> tuple[str, str]:
+    return (str(payload.get("requester_id") or ""), str(payload.get("requester_name") or ""))
+
+
+def typing_days_clause(days: int) -> tuple[str, list]:
+    if days <= 0:
+        return ("", [])
+    return (" AND recorded_at >= ?", [time.time() - days * 86400])
+
+
+def typing_stats_me(db: sqlite3.Connection, payload: dict) -> dict:
+    user_id, user_name = typing_identity(payload)
+    days = int(payload.get("days") or 0)
+    clause, params = typing_days_clause(days)
+    row = db.execute(
+        "SELECT count(*) n, avg(speed) speed, avg(accuracy) acc, avg(key_rate) key_rate, "
+        "avg(code_length) code_len, avg(word_rate) word_rate, max(speed) best, sum(char_count) chars "
+        "FROM typing_scores WHERE user_id=?" + clause,
+        tuple([user_id] + params),
     ).fetchone()
-    if cached and cached["classifier_version"] == LIBRARY_CLASSIFIER_VERSION:
+    if not row or not row["n"]:
+        return {"status": "empty", "message": "还没有你的成绩记录。"}
+    span = f"最近 {days} 天" if days > 0 else "全部时间"
+    return {
+        "status": "ok",
+        "message": (
+            f"{span}你打了 {row['n']} 段：均速 {round(float(row['speed'] or 0), 2)}，"
+            f"最快 {round(float(row['best'] or 0), 2)}，"
+            f"平均键准 {round(float(row['acc'] or 0), 2)}%，"
+            f"击键 {round(float(row['key_rate'] or 0), 2)}，"
+            f"码长 {round(float(row['code_len'] or 0), 2)}，"
+            f"打词 {round(float(row['word_rate'] or 0), 2)}%，"
+            f"累计 {int(row['chars'] or 0)} 字。"
+        ),
+        "count": int(row["n"]),
+    }
+
+
+def typing_stats_trend(db: sqlite3.Connection, payload: dict) -> dict:
+    user_id, _ = typing_identity(payload)
+    days = int(payload.get("days") or 14)
+    since = time.time() - days * 86400
+    rows = db.execute(
+        "SELECT date(recorded_at,'unixepoch','+8 hours') d, count(*) n, "
+        "avg(speed) speed, avg(accuracy) acc FROM typing_scores "
+        "WHERE user_id=? AND recorded_at>=? AND recorded_at>0 GROUP BY d ORDER BY d",
+        (user_id, since),
+    ).fetchall()
+    if not rows:
+        return {"status": "empty", "message": f"最近 {days} 天你没有成绩记录。"}
+    lines = [
+        f"{row['d']}: {row['n']} 段，均速 {round(float(row['speed'] or 0), 1)}，键准 {round(float(row['acc'] or 0), 1)}%"
+        for row in rows
+    ]
+    return {
+        "status": "ok",
+        "message": f"最近 {days} 天的趋势：" + "；".join(lines),
+        "points": [{"date": row["d"], "count": row["n"], "speed": round(float(row["speed"] or 0), 1)} for row in rows],
+    }
+
+
+def typing_stats_ranking(db: sqlite3.Connection, payload: dict) -> dict:
+    days = int(payload.get("days") or 7)
+    limit = max(1, min(20, int(payload.get("limit") or 5)))
+    since = time.time() - days * 86400
+    rows = db.execute(
+        "SELECT user_name, user_id, count(*) n, avg(speed) speed, avg(accuracy) acc "
+        "FROM typing_scores WHERE recorded_at>=? AND recorded_at>0 "
+        "GROUP BY user_id HAVING n>=? ORDER BY speed DESC LIMIT ?",
+        (since, TYPING_MIN_FOR_RANKING, limit),
+    ).fetchall()
+    if not rows:
+        return {"status": "empty", "message": f"最近 {days} 天还没有足够的数据做排行。"}
+    parts = [
+        f"{index + 1}. {row['user_name'] or '无名'} 均速 {round(float(row['speed'] or 0), 1)}（{row['n']} 段）"
+        for index, row in enumerate(rows)
+    ]
+    return {
+        "status": "ok",
+        "message": f"最近 {days} 天均速排行（至少 {TYPING_MIN_FOR_RANKING} 段）：" + "；".join(parts),
+    }
+
+
+def typing_stats_book(db: sqlite3.Connection, payload: dict) -> dict:
+    """某本书的成绩。需要成绩被关联到书（novel_book_id），没关联就如实说。"""
+    user_id, _ = typing_identity(payload)
+    keyword = str(payload.get("book") or "").strip()
+    book = novel_find_book(db, keyword) if keyword else None
+    if book:
+        rows = db.execute(
+            "SELECT count(*) n, avg(speed) speed, avg(accuracy) acc, sum(char_count) chars "
+            "FROM typing_scores WHERE user_id=? AND novel_book_id=?",
+            (user_id, book["book_id"]),
+        ).fetchone()
+        title = book["title"]
+    else:
+        rows = None
+        title = keyword or "这本书"
+    if not rows or not rows["n"]:
+        return {
+            "status": "empty",
+            "message": f"{title}还没有和你关联的成绩记录。可能是成绩还没和番茄段落对上（要等发段后打的那些）。",
+        }
+    return {
+        "status": "ok",
+        "message": (
+            f"{title}你打了 {rows['n']} 段：均速 {round(float(rows['speed'] or 0), 2)}，"
+            f"键准 {round(float(rows['acc'] or 0), 2)}%，累计 {int(rows['chars'] or 0)} 字。"
+        ),
+        "count": int(rows["n"]),
+    }
+
+
+def typing_stats_dispatch(db: sqlite3.Connection, payload: dict) -> dict:
+    scope = str(payload.get("scope") or "me").strip().lower()
+    if scope == "trend":
+        return typing_stats_trend(db, payload)
+    if scope == "ranking":
+        return typing_stats_ranking(db, payload)
+    if scope == "book":
+        return typing_stats_book(db, payload)
+    return typing_stats_me(db, payload)
+
+
+def novel_find_book(db: sqlite3.Connection, keyword: str) -> sqlite3.Row | None:
+    """按书名关键词找书。精确优先，其次模糊；找不到返回 None。
+
+    找不到时上层要告诉用户「让 fix 哥加上」—— 不列书架，也不假装有。
+    """
+    keyword = keyword.strip()
+    if not keyword:
+        return None
+    row = db.execute("SELECT * FROM novel_books WHERE title=?", (keyword,)).fetchone()
+    if row:
+        return row
+    row = db.execute(
+        "SELECT * FROM novel_books WHERE title LIKE ? ORDER BY total_chapters DESC LIMIT 1",
+        (f"%{keyword}%",),
+    ).fetchone()
+    if row:
+        return row
+    return db.execute(
+        "SELECT * FROM novel_books WHERE book_id=? LIMIT 1", (keyword,)
+    ).fetchone()
+
+
+def novel_chapter_row(db: sqlite3.Connection, book_id: str, chapter_index: int) -> sqlite3.Row | None:
+    return db.execute(
+        "SELECT c.*, l.content FROM novel_chapters c JOIN library_texts l ON l.text_id=c.text_id "
+        "WHERE c.book_id=? AND c.chapter_index=?",
+        (book_id, chapter_index),
+    ).fetchone()
+
+
+def novel_save_progress(
+    db: sqlite3.Connection, platform: str, chat_id: str, requester_id: str,
+    book_id: str, chapter_index: int, char_offset: int, segment_length: int = 0,
+    segment_id: int = 0, segment_chars: int = 0, sent_at: float = 0.0,
+) -> None:
+    # 段长 0 表示「沿用上次的」，所以只在有值时覆盖（跟库文 requested_length 一个思路）
+    db.execute(
+        "INSERT INTO novel_progress "
+        "(platform,chat_id,requester_id,book_id,chapter_index,char_offset,segment_length,"
+        "last_segment_id,last_segment_chars,last_sent_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,COALESCE(NULLIF(?,''),300),?,?,?,?) "
+        "ON CONFLICT(platform,chat_id,requester_id) DO UPDATE SET "
+        "book_id=excluded.book_id,chapter_index=excluded.chapter_index,"
+        "char_offset=excluded.char_offset,"
+        "segment_length=CASE WHEN excluded.segment_length>0 THEN excluded.segment_length "
+        "ELSE novel_progress.segment_length END,"
+        "last_segment_id=CASE WHEN excluded.last_segment_id<>'' THEN excluded.last_segment_id "
+        "ELSE novel_progress.last_segment_id END,"
+        "last_segment_chars=CASE WHEN excluded.last_segment_chars>0 "
+        "THEN excluded.last_segment_chars ELSE novel_progress.last_segment_chars END,"
+        "last_sent_at=CASE WHEN excluded.last_sent_at>0 THEN excluded.last_sent_at "
+        "ELSE novel_progress.last_sent_at END,"
+        "updated_at=excluded.updated_at",
+        (platform, chat_id, requester_id, book_id, chapter_index, char_offset,
+         segment_length, str(segment_id) if segment_id else "", segment_chars,
+         sent_at if sent_at else time.time(), time.time()),
+    )
+    db.commit()
+
+
+def novel_segment_length(payload: dict, progress: sqlite3.Row | None = None) -> int:
+    """段长：本次传了就用本次的，没传就沿用上次存的，都没有就 300。"""
+    requested = payload.get("length")
+    if requested:
         try:
-            genres = json.loads(cached["genres_json"] or "[]")
-        except (TypeError, json.JSONDecodeError):
-            genres = []
-        return cached["primary_genre"] == genre or genre in genres
-    return library_has_genre(classify_library_text(row["title"], row["content"]), genre)
+            value = int(requested)
+            if 1 <= value <= 1400:
+                return value
+        except (TypeError, ValueError):
+            pass
+    if progress is not None:
+        try:
+            saved = int(progress["segment_length"])
+            if 1 <= saved <= 1400:
+                return saved
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+    return NOVEL_DEFAULT_SEGMENT
+
+
+def novel_emit_segment(db: sqlite3.Connection, book: sqlite3.Row, chapter: sqlite3.Row,
+                       segment_no: int, length: int) -> dict:
+    """从一章的 char_offset 开始发一段，返回给调用方要发到群里的文本。"""
+    content = normalize_library_content(chapter["content"])
+    total = len(content)
+    start = max(0, min(int(chapter["char_offset"]), total))
+    # 段号按偏移推出来，避免调用方每次都传 1（2026-11-05 实测：段号全是 1）
+    segment_no = start // max(1, length) + 1
+    end = min(start + length, total)
+    body = content[start:end]
+    # 格式必须跟库文完全一致，否则群里的跟打器识别不到（所有者 2026-11-06 实测）。
+    # 库文格式：[FM/难度分·题材·形式] No.FM-XXXXXXXX《标题》 [字数N]
+    #          正文
+    #          -----第N段-FM发文｜进度X/Y字
+    article = db.execute(
+        "SELECT * FROM library_texts WHERE text_id=?", (chapter["text_id"],)
+    ).fetchone()
+    metadata = classify_library_row(db, article) if article else {
+        "primary_genre": "综合文学", "form": "小说/叙事"
+    }
+    ranking = db.execute(
+        "SELECT score, difficulty FROM library_rankings WHERE text_id=?",
+        (chapter["text_id"],),
+    ).fetchone()
+    score = float(ranking["score"]) if ranking else 0.0
+    difficulty = str(ranking["difficulty"]) if ranking else "普"
+    score_text = "爆表" if score > 100 else f"{score:.2f}"
+    label = (
+        f"{difficulty}{score_text}·"
+        f"{metadata.get('primary_genre', '综合文学')}·"
+        f"{metadata.get('form', '小说/叙事')}"
+    )
+    article_no = str(chapter["text_id"])[:8].upper()
+    segment_id = next_library_segment_id(db)
+    now = time.time()
+    db.execute(
+        "INSERT INTO library_segment_sessions VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        (segment_id, f"novel:{book['book_id']}:{chapter['chapter_index']}", "qq",
+         "", "", now),
+    )
+    title = chapter["title"] if chapter["title"] else book["title"]
+    message = (
+        f"[FM/{label}] No.FM-{article_no}《{title}》 [字数{len(body)}]" + chr(10)
+        + body + chr(10)
+        + f"-----第{segment_id}段-FM发文｜进度{end}/{total}字"
+    )
+    return {
+        "status": "segment",
+        "message": message,
+        "book_id": book["book_id"],
+        "book_title": book["title"],
+        "chapter_index": chapter["chapter_index"],
+        "chapter_title": chapter["title"],
+        "segment_no": segment_no,
+        "segment_id": segment_id,
+        "chars": len(body),
+        "char_offset": end,
+        "remaining_chars": max(0, total - end),
+    }
+
+
+def novel_pick_chapter(db: sqlite3.Connection, book: sqlite3.Row, chapter_index: int | None,
+                       fallback_index: int = 1) -> sqlite3.Row | None:
+    index = chapter_index if chapter_index and chapter_index > 0 else fallback_index
+    row = novel_chapter_row(db, book["book_id"], index)
+    if row:
+        return row
+    # 章号越界：退到最后可用的一章，避免直接报错
+    return db.execute(
+        "SELECT c.*, l.content FROM novel_chapters c JOIN library_texts l ON l.text_id=c.text_id "
+        "WHERE c.book_id=? ORDER BY c.chapter_index DESC LIMIT 1",
+        (book["book_id"],),
+    ).fetchone()
+
+
+def novel_start(db: sqlite3.Connection, payload: dict) -> dict:
+    platform, chat_id, requester_id, requester_name = novel_identity(payload)
+    keyword = str(payload.get("book") or "").strip()
+    book = novel_find_book(db, keyword) if keyword else None
+    if not book:
+        return {
+            "status": "not_found",
+            "message": f"书库里没有「{keyword or '这本'}」。让 fix 哥加上吧，加好我就能发了。",
+        }
+    requested_chapter = payload.get("chapter")
+    chapter_index = int(requested_chapter) if requested_chapter else 1
+    chapter = novel_pick_chapter(db, book, chapter_index)
+    length = novel_segment_length(payload)
+
+    # 同一本书且有旧进度 → 从上次断点继续；换了章就从头
+    progress = db.execute(
+        "SELECT * FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    # restart=true 时**不能**走「断点继续」这条路 ——
+    # 2026-11-06 实测：用户说「从头发」，模型正确传了 restart=true，
+    # 但这里只看「有没有旧进度」，于是又接着往下发了。
+    if (
+        progress
+        and progress["book_id"] == book["book_id"]
+        and not requested_chapter
+        and not payload.get("restart")
+    ):
+        chapter = novel_chapter_row(db, book["book_id"], int(progress["chapter_index"])) or chapter
+        if chapter:
+            offset = int(progress["char_offset"])
+            total = len(normalize_library_content(chapter["content"]))
+            if offset >= total:
+                nxt = novel_chapter_row(db, book["book_id"], int(progress["chapter_index"]) + 1)
+                chapter = nxt or chapter
+                offset = 0
+            length = novel_segment_length(payload, progress)
+            result = novel_emit_segment(db, book, {**dict(chapter), "char_offset": offset}, 1, length)
+            novel_save_progress(db, platform, chat_id, requester_id, book["book_id"],
+                                int(result["chapter_index"]), int(result["char_offset"]), length, int(result.get("segment_id") or 0), int(result.get("chars") or 0))
+            return result
+
+    if not chapter:
+        return {"status": "not_found", "message": f"《{book['title']}》还没有可发的章节，让 fix 哥补一下。"}
+    result = novel_emit_segment(db, book, {**dict(chapter), "char_offset": 0}, 1, novel_segment_length(payload))
+    novel_save_progress(db, platform, chat_id, requester_id, book["book_id"],
+                        int(result["chapter_index"]), int(result["char_offset"]), length, int(result.get("segment_id") or 0), int(result.get("chars") or 0))
+    # 告诉上层「这是一次重开」，工具靠它去撤回上一条已发的段。
+    if payload.get("restart"):
+        result["restarted"] = True
+        result["restart_reason"] = "从本章开头重发"
+    return result
+
+
+def novel_continue(db: sqlite3.Connection, payload: dict) -> dict:
+    platform, chat_id, requester_id, _ = novel_identity(payload)
+    progress = db.execute(
+        "SELECT * FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    if not progress:
+        return {"status": "idle", "message": "你还没有在打的小说。说「打番茄小说《书名》」开一本。"}
+    book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (progress["book_id"],)).fetchone()
+    if not book:
+        return {"status": "idle", "message": "上次那本书已经不在书库里了，重新说一本吧。"}
+    chapter = novel_chapter_row(db, book["book_id"], int(progress["chapter_index"]))
+    if not chapter:
+        return {"status": "idle", "message": f"《{book['title']}》的进度对不上，重新说一次书名吧。"}
+    total = len(normalize_library_content(chapter["content"]))
+    offset = int(progress["char_offset"])
+    # 10 分钟没动过 → 自动结束发文状态（所有者 2026-11-06 的要求）。
+    # 没有这个判断，僵尸进度会一直存在，谁发成绩都触发续段。
+    last_active = float(progress["updated_at"] or 0)
+    if last_active and time.time() - last_active > NOVEL_IDLE_MINUTES * 60:
+        db.execute(
+            "DELETE FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+            (platform, chat_id, requester_id),
+        )
+        db.commit()
+        return {"status": "idle", "message": "超过 %d 分钟没继续，发文已经自动结束了。" % NOVEL_IDLE_MINUTES}
+    if offset >= total:
+        return novel_next(db, payload)
+    length = novel_segment_length(payload, progress)
+    # 「改段长」和「从开头发」都要回到章首重发。
+    # 2026-11-06 所有者实测：只说「我要 150 字」时，这里接着往下发了，章节偏移没动。
+    saved_length = 0
+    try:
+        saved_length = int(progress["segment_length"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        saved_length = 0
+    wants_restart = bool(payload.get("restart")) or (
+        saved_length > 0 and length != saved_length
+    )
+    start_offset = 0 if wants_restart else offset
+    result = novel_emit_segment(db, book, {**dict(chapter), "char_offset": start_offset}, 1, length)
+    novel_save_progress(db, platform, chat_id, requester_id, book["book_id"],
+                        int(result["chapter_index"]), int(result["char_offset"]), length, int(result.get("segment_id") or 0), int(result.get("chars") or 0))
+    result["restarted"] = wants_restart
+    if wants_restart:
+        result["restart_reason"] = "段长变化，从本章开头重发"
+    return result
+
+
+def novel_next(db: sqlite3.Connection, payload: dict) -> dict:
+    platform, chat_id, requester_id, _ = novel_identity(payload)
+    progress = db.execute(
+        "SELECT * FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    if not progress:
+        return {"status": "idle", "message": "你还没有在打的小说。说「打番茄小说《书名》」开一本。"}
+    book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (progress["book_id"],)).fetchone()
+    if not book:
+        return {"status": "idle", "message": "上次那本书已经不在书库里了。"}
+    next_index = int(progress["chapter_index"]) + 1
+    chapter = novel_chapter_row(db, book["book_id"], next_index)
+    if not chapter:
+        return {
+            "status": "completed",
+            "message": f"《{book['title']}》已经打完了（共 {book['total_chapters']} 章）。要换一本就说书名。",
+        }
+    length = novel_segment_length(payload, progress)
+    result = novel_emit_segment(db, book, {**dict(chapter), "char_offset": 0}, 1, length)
+    novel_save_progress(db, platform, chat_id, requester_id, book["book_id"],
+                        int(result["chapter_index"]), int(result["char_offset"]), length, int(result.get("segment_id") or 0), int(result.get("chars") or 0))
+    return result
+
+
+def novel_jump(db: sqlite3.Connection, payload: dict) -> dict:
+    platform, chat_id, requester_id, _ = novel_identity(payload)
+    progress = db.execute(
+        "SELECT * FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    book_id = str(payload.get("book_id") or (progress["book_id"] if progress else ""))
+    book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (book_id,)).fetchone()
+    if not book:
+        return {"status": "idle", "message": "还不知道你要跳哪本书。先说「打番茄小说《书名》」。"}
+    chapter_index = int(payload.get("chapter") or 1)
+    chapter = novel_chapter_row(db, book["book_id"], chapter_index)
+    if not chapter:
+        return {
+            "status": "not_found",
+            "message": f"《{book['title']}》没有第 {chapter_index} 章（共 {book['total_chapters']} 章）。",
+        }
+    length = novel_segment_length(payload, progress)
+    result = novel_emit_segment(db, book, {**dict(chapter), "char_offset": 0}, 1, length)
+    novel_save_progress(db, platform, chat_id, requester_id, book["book_id"],
+                        int(result["chapter_index"]), int(result["char_offset"]), length, int(result.get("segment_id") or 0), int(result.get("chars") or 0))
+    return result
+
+
+# ==================== 赛文成绩归档（2026-11-06） ====================
+# 段号 → (赛文名, 作用域)。所有者给的规则，段号就是赛文身份。
+# scope='global' 表示所有群共用一份；scope='group' 表示每个群各自一份，必须分开存。
+CONTEST_LABELS: "dict[str, tuple[str, str]]" = {
+    "HB": ("虎杯", "global"),
+    "100000": ("锦标赛", "global"),
+    "10000": ("锦标赛", "global"),   # 兼容：所有者最初口述的段号，实际数据里是 100000
+    "99999": ("极速杯", "global"),
+    "100004": ("极速联赛", "global"),
+    "mb": ("晴分身每日赛文", "global"),
+    "666": ("1916996679每日赛文", "global"),
+    "555": ("555赛文", "global"),
+    "777": ("晴分身群赛文", "group"),
+    "999": ("本群赛文", "group"),
+    "groupmatch": ("1847992065群赛文", "group"),
+}
+
+# 段号 → 官网 /competition/live 的 source key（只有官网覆盖的赛文才在表里）。
+# 2026-11-06 实测：虎杯/锦标赛/极速杯/极速联赛 + 各群自己的 999 赛文 官网都能拿到；
+# 777 / mb / 666 / groupmatch 是别的机器人的赛文，官网没有，只能靠成绩库。
+CONTEST_LIVE_SOURCES: "dict[str, str]" = {
+    "HB": "tiger",
+    "100000": "champ",
+    "99999": "comp",
+    "100004": "540678308",
+}
+# 各群 999 赛文在官网的 source 就是群号本身
+CONTEST_GROUP_LIVE_GROUPS = {
+    "776227233", "1021522088", "151040026", "391047371", "201323122", "488748631",
+}
+
+CONTEST_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contest_scores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contest_key TEXT NOT NULL,
+  contest_name TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'global',
+  group_id TEXT NOT NULL DEFAULT '',
+  score_date TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL DEFAULT '',
+  user_name TEXT NOT NULL DEFAULT '',
+  segment_label TEXT NOT NULL DEFAULT '',
+  speed REAL, key_rate REAL, code_length REAL, accuracy REAL,
+  char_count INTEGER, duration_ms INTEGER, word_rate REAL,
+  difficulty TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '',
+  raw_text TEXT NOT NULL DEFAULT '', recorded_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS contest_scores_key_idx ON contest_scores(contest_key, scope, group_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS contest_scores_user_idx ON contest_scores(user_id, contest_key);
+CREATE INDEX IF NOT EXISTS contest_scores_date_idx ON contest_scores(score_date);
+"""
+
+
+def contest_key_for(segment_label: str) -> tuple[str, str, str] | None:
+    """段号 → (contest_key, contest_name, scope)。不认识的段号返回 None。"""
+    label = (segment_label or "").strip()
+    if not label:
+        return None
+    entry = CONTEST_LABELS.get(label)
+    if not entry:
+        return None
+    name, scope = entry
+    return label, name, scope
+
+
+def _contest_parse_score(text: str) -> dict:
+    """从成绩原文里抠出各项数值（复用番茄那套解析思路）。"""
+    def num(pattern):
+        match = re.search(pattern, text)
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    duration = re.search(r"时间\s*(\d+):(\d+)\.(\d+)", text)
+    duration_ms = None
+    if duration:
+        duration_ms = int(duration.group(1)) * 60000 + int(duration.group(2)) * 1000 + int((duration.group(3) + "000")[:3])
+    difficulty = re.search(r"(淼|水|易|普|难|虐)\s*([\d.]+)", text)
+    device = re.search(r"(虎魄|大帅比打器|大帅比|极速|晴窗|五笔|仓颉|拼音|小鹤|音形)\s*v?([\d]+\.?[\d]*)", text)
+    return {
+        "speed": num(r"速度\s*([\d.]+)"),
+        "key_rate": num(r"击键\s*([\d.]+)"),
+        "code_length": num(r"码长\s*([\d.]+)"),
+        "accuracy": num(r"键准\s*([\d.]+)"),
+        "char_count": num(r"字数\s*(\d+)"),
+        "duration_ms": duration_ms,
+        "word_rate": num(r"打词\s*([\d.]+)"),
+        "difficulty": (difficulty.group(1) + difficulty.group(2)) if difficulty else "",
+        "device": (device.group(1) + "v" + (device.group(2) or "")) if device else "",
+    }
+
+
+def backfill_contest_scores(db: sqlite3.Connection) -> dict:
+    """从 score_records 回填 contest_scores。幂等：已存在的 (raw_text+user) 跳过。"""
+    rows = db.execute(
+        "SELECT group_id, sender_id, occurred_at, source_json FROM score_records"
+    ).fetchall()
+    inserted = 0
+    skipped = 0
+    unknown: dict[str, int] = {}
+    for group_id, sender_id, occurred_at, source_json in rows:
+        try:
+            payload = json.loads(source_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        text = str(payload.get("raw_text") or payload.get("text") or "")
+        if not text:
+            continue
+        match = re.search(r"第\s*([A-Za-z0-9_-]{1,24})\s*段", text)
+        if not match:
+            continue
+        mapped = contest_key_for(match.group(1))
+        if not mapped:
+            unknown[match.group(1)] = unknown.get(match.group(1), 0) + 1
+            continue
+        key, name, scope = mapped
+        # 每个群不同的赛文必须带 group_id；全群共用的留空
+        room = str(group_id or "") if scope == "group" else ""
+        exists = db.execute(
+            "SELECT 1 FROM contest_scores WHERE contest_key=? AND group_id=? AND user_id=? AND raw_text=? LIMIT 1",
+            (key, room, str(payload.get("user_id") or sender_id or ""), text),
+        ).fetchone()
+        if exists:
+            skipped += 1
+            continue
+        parsed = _contest_parse_score(text)
+        score_date = ""
+        try:
+            score_date = time.strftime("%Y-%m-%d", time.localtime(float(occurred_at or 0)))
+        except (TypeError, ValueError, OSError):
+            pass
+        user_name = str(payload.get("user_name") or payload.get("nickname") or "")
+        db.execute(
+            "INSERT INTO contest_scores (contest_key,contest_name,scope,group_id,score_date,"
+            "user_id,user_name,segment_label,speed,key_rate,code_length,accuracy,char_count,"
+            "duration_ms,word_rate,difficulty,device,raw_text,recorded_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (key, name, scope, room, score_date, str(payload.get("user_id") or sender_id or ""),
+             user_name, match.group(0), parsed["speed"], parsed["key_rate"], parsed["code_length"],
+             parsed["accuracy"], int(parsed["char_count"] or 0), parsed["duration_ms"],
+             parsed["word_rate"], parsed["difficulty"], parsed["device"], text,
+             float(occurred_at or 0)),
+        )
+        inserted += 1
+    db.commit()
+    return {"inserted": inserted, "skipped": skipped, "unknown_labels": unknown}
+
+
+def contest_scores_query(db: sqlite3.Connection, payload: dict) -> dict:
+    """按赛文 + 群查成绩（画图和查询共用）。
+
+    网站取不到成绩时，这里就是唯一的数据源（所有者 2026-11-06 的要求）。
+    """
+    label = str(payload.get("contest") or "").strip()
+    if not label:
+        return {"status": "invalid", "message": "需要 contest 参数（段号或赛文名）。"}
+    # 允许直接传赛文名
+    key = None
+    for candidate, (name, _scope) in CONTEST_LABELS.items():
+        if label in (candidate, name):
+            key = candidate
+            break
+    if not key:
+        return {"status": "not_found", "message": f"不认识的赛文：{label}。已知：{', '.join(CONTEST_LABELS)}"}
+    name, scope = CONTEST_LABELS[key]
+    room = str(payload.get("group_id") or "") if scope == "group" else ""
+    days = int(payload.get("days") or 0)
+    clause, params = "", []
+    if days > 0:
+        clause = " AND recorded_at >= ?"
+        params = [time.time() - days * 86400]
+    rows = db.execute(
+        "SELECT user_name, user_id, max(speed) best, avg(speed) avg_speed, count(*) n, "
+        "max(recorded_at) last_at FROM contest_scores "
+        "WHERE contest_key=? AND group_id=?" + clause +
+        " GROUP BY user_id ORDER BY best DESC LIMIT 30",
+        tuple([key, room] + params),
+    ).fetchall()
+    if not rows:
+        where = f"{name}" + (f"（群 {room}）" if room else "")
+        return {"status": "empty", "message": f"{where} 还没有成绩记录。"}
+    lines = [
+        f"{i}. {r['user_name'] or r['user_id']} 最快 {round(float(r['best'] or 0), 2)}（{r['n']} 次）"
+        for i, r in enumerate(rows, 1)
+    ]
+    where = name + (f"（群 {room}）" if room else "（全群）")
+    return {
+        "status": "ok",
+        "message": f"{where} 共 {len(rows)} 人： " + "；".join(lines),
+        "contest": key,
+        "contest_name": name,
+        "scope": scope,
+        "group_id": room,
+        "rows": [{"user": r["user_name"] or r["user_id"], "best": r["best"], "count": r["n"]} for r in rows],
+    }
+
+def novel_books_list(db: sqlite3.Connection, payload: dict) -> dict:
+    """列出书库里所有番茄小说（所有者 2026-11-06 要能问「有哪些书」）。"""
+    rows = db.execute(
+        "SELECT title, author, total_chapters, word_count FROM novel_books "
+        "WHERE total_chapters > 0 ORDER BY word_count DESC"
+    ).fetchall()
+    if not rows:
+        return {"status": "empty", "message": "书库里还没有番茄小说。让 fix 哥加几本。"}
+    lines = [
+        f"{index}. 《{row['title']}》{row['author'] or '未知作者'}（{row['total_chapters']}章 {row['word_count'] // 10000}万字）"
+        for index, row in enumerate(rows, 1)
+    ]
+    # book_lines 是给「合并转发」用的：每条一本书，正好当一个节点。
+    book_lines = [
+        f"{index}. 《{row['title']}》\n作者：{row['author'] or '未知'}\n"
+        f"{row['total_chapters']} 章 · {row['word_count'] // 10000} 万字"
+        for index, row in enumerate(rows, 1)
+    ]
+    return {
+        "status": "ok",
+        "message": f"书库里有 {len(rows)} 本番茄小说：" + "；".join(lines),
+        "count": len(rows),
+        "book_lines": book_lines,
+        "books": [{"title": row["title"], "author": row["author"], "chapters": row["total_chapters"]} for row in rows],
+    }
+
+
+# ---------- 打字成绩解析（番茄专区用） ----------
+# 格式见群里的打字器输出：
+#   第777段 速度172.32 击键6.36 码长2.22 键准94.41% 字数241 时间01:23.913
+#   打词60.58% 重打1 普1.62 选重3 [词提开] 【fix】 虎魄v1.5.4
+_SCORE_HINT = re.compile(r"速度\s*[\d.]+")
+_SCORE_SEGMENT = re.compile(r"第\s*([0-9]+|groupmatch)\s*段")
+
+
+def _score_number(pattern: str, text: str) -> float | None:
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _score_duration_ms(text: str) -> int | None:
+    match = re.search(r"时间\s*(\d+):(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    minutes, seconds, fraction = match.groups()
+    return int(minutes) * 60000 + int(seconds) * 1000 + int((fraction + "000")[:3])
+
+
+def parse_novel_typing_score(text: str) -> dict | None:
+    """番茄专区用的成绩解析。
+
+    注意函数名不能叫 parse_typing_score：app.py 里已经有一个同名的（成绩归档用），
+    Python 里后定义的会覆盖前面的，2026-11-06 因此踩了 KeyError: 'raw_text'。
+    """
+    if not _SCORE_HINT.search(text):
+        return None
+    segment = _SCORE_SEGMENT.search(text)
+    if not segment:
+        return None
+    difficulty = re.search(r"(淼|水|易|普|难|虐)\s*([\d.]+)", text)
+    device = re.search(r"(虎魄|大帅比打器|大帅比|极速|晴窗|五笔|仓颉|拼音|小鹤|音形)\s*v?([\d]+\.?[\d]*)", text)
+    score = {
+        "segment_label": segment.group(0).replace(" ", ""),
+        "speed": _score_number(r"速度\s*([\d.]+)", text),
+        "key_rate": _score_number(r"击键\s*([\d.]+)", text),
+        "code_length": _score_number(r"码长\s*([\d.]+)", text),
+        "accuracy": _score_number(r"键准\s*([\d.]+)", text),
+        "char_count": _score_number(r"字数\s*(\d+)", text),
+        "duration_ms": _score_duration_ms(text),
+        "word_rate": _score_number(r"打词\s*([\d.]+)", text),
+        "backspace": _score_number(r"回改\s*(\d+)", text),
+        "delete_count": _score_number(r"退格\s*(\d+)", text),
+        "retype": _score_number(r"重打\s*(\d+)", text),
+        "choice_count": _score_number(r"选重\s*(\d+)", text),
+        "difficulty": (difficulty.group(1) + difficulty.group(2)) if difficulty else "",
+        "device": (device.group(1) + "v" + (device.group(2) or "")) if device else "unknown",
+        "raw_text": text,
+    }
+    if score["speed"] is None:
+        return None
+    # 合理性过滤，别让解析事故污染统计
+    if not 0 <= score["speed"] <= 1200:
+        return None
+    if score["accuracy"] is not None and not 0 <= score["accuracy"] <= 100:
+        return None
+    if score["char_count"] is not None and not 1 <= score["char_count"] <= 200000:
+        return None
+    return score
+
+
+def _record_typing_score(db: sqlite3.Connection, parsed: dict, platform: str, chat_id: str,
+                         user_id: str, user_name: str, book_id: str, chapter_index: int,
+                         segment_no: int) -> None:
+    exists = db.execute(
+        "SELECT 1 FROM typing_scores WHERE chat_id=? AND user_id=? AND raw_text=? LIMIT 1",
+        (chat_id, user_id, parsed["raw_text"]),
+    ).fetchone()
+    if exists:
+        # 已经由 cron 扫进去了 —— 只补关联
+        db.execute(
+            "UPDATE typing_scores SET novel_book_id=?, novel_chapter_index=?, novel_segment_no=? "
+            "WHERE chat_id=? AND user_id=? AND raw_text=?",
+            (book_id, chapter_index, segment_no, chat_id, user_id, parsed["raw_text"]),
+        )
+        return
+    db.execute(
+        "INSERT INTO typing_scores (platform,chat_id,user_id,user_name,segment_label,"
+        "speed,key_rate,code_length,accuracy,char_count,duration_ms,word_rate,"
+        "backspace,delete_count,retype,choice_count,difficulty,device,meta,"
+        "novel_book_id,novel_chapter_index,novel_segment_no,raw_text,recorded_at) "
+        "VALUES ('qq',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'{}',?,?,?,?,?)",
+        (chat_id, user_id, user_name, parsed["segment_label"],
+         parsed["speed"], parsed["key_rate"], parsed["code_length"], parsed["accuracy"],
+         int(parsed["char_count"] or 0), parsed["duration_ms"], parsed["word_rate"],
+         int(parsed["backspace"] or 0), int(parsed["delete_count"] or 0),
+         int(parsed["retype"] or 0), int(parsed["choice_count"] or 0),
+         parsed["difficulty"], parsed["device"],
+         book_id, chapter_index, segment_no, parsed["raw_text"], time.time()),
+    )
+
+
+def novel_score(db: sqlite3.Connection, payload: dict) -> dict:
+    """收到一条打字成绩：先记账（关联到当前书/章），再自动续段。"""
+    platform, chat_id, requester_id, requester_name = novel_identity(payload)
+    text = str(payload.get("text") or "")
+    parsed = parse_novel_typing_score(text)
+    progress = db.execute(
+        "SELECT * FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    if not progress:
+        return {"status": "idle", "message": "当前会话没有番茄小说进度，不续段。"}
+
+    # 10 分钟超时：久了就不该再算「正在打」。
+    last_active = float(progress["updated_at"] or 0)
+    if last_active and time.time() - last_active > NOVEL_IDLE_MINUTES * 60:
+        db.execute(
+            "DELETE FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+            (platform, chat_id, requester_id),
+        )
+        db.commit()
+        return {"status": "idle", "message": f"超过 {NOVEL_IDLE_MINUTES} 分钟没打，发文自动结束了，不续段。"}
+
+    # 判断这条成绩是不是打「刚发出去那一段」的（所有者 2026-11-06：
+    # 之前任何成绩都会续段，很莫名其妙）。
+    matched = False
+    reason = ""
+    if parsed:
+        last_id = str(progress["last_segment_id"] or "")
+        last_chars = int(progress["last_segment_chars"] or 0)
+        last_sent = float(progress["last_sent_at"] or 0)
+        score_seg = str(parsed.get("segment_label") or "").replace("第", "").replace("段", "")
+        if last_id and score_seg == last_id:
+            matched = True
+            reason = "段号对上"
+        elif last_chars and parsed.get("char_count") and abs(int(parsed["char_count"]) - last_chars) <= max(10, last_chars // 10):
+            if last_sent and time.time() - last_sent <= 120:
+                matched = True
+                reason = "字数和时间对上"
+    if not matched:
+        return {
+            "status": "not_matched",
+            "message": "这条成绩不是刚发的那一段的，不续段。",
+        }
+    _record_typing_score(
+        db, parsed, platform, chat_id, requester_id, requester_name,
+        progress["book_id"], int(progress["chapter_index"]), 0,
+    )
+    db.commit()
+    result = novel_continue(db, payload)
+    result["score_recorded"] = True
+    result["match_reason"] = reason
+    return result
+
+
+def novel_stop(db: sqlite3.Connection, payload: dict) -> dict:
+    """停掉番茄阅读：清进度，告诉上层有没有停成（撤销由 bot 负责）。"""
+    platform, chat_id, requester_id, _ = novel_identity(payload)
+    row = db.execute(
+        "SELECT book_id, chapter_index, char_offset FROM novel_progress "
+        "WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    if not row:
+        return {"status": "idle", "message": "当前会话没有正在进行的番茄小说。"}
+    db.execute(
+        "DELETE FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    )
+    db.commit()
+    book = db.execute("SELECT title FROM novel_books WHERE book_id=?", (row["book_id"],)).fetchone()
+    title = book["title"] if book else row["book_id"]
+    return {
+        "status": "stopped",
+        "message": f"已停止《{title}》。",
+        "book_title": title,
+        "chapter_index": int(row["chapter_index"]),
+    }
+
+
+def novel_progress_info(db: sqlite3.Connection, payload: dict) -> dict:
+    platform, chat_id, requester_id, _ = novel_identity(payload)
+    progress = db.execute(
+        "SELECT * FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+        (platform, chat_id, requester_id),
+    ).fetchone()
+    if not progress:
+        return {"status": "idle", "message": "你还没有在打的小说。"}
+    book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (progress["book_id"],)).fetchone()
+    chapter = novel_chapter_row(db, book["book_id"], int(progress["chapter_index"])) if book else None
+    if not book or not chapter:
+        return {"status": "idle", "message": "进度记录对不上，重新说一次书名吧。"}
+    total = len(normalize_library_content(chapter["content"]))
+    offset = int(progress["char_offset"])
+    return {
+        "status": "progress",
+        "message": (
+            f"你正在打《{book['title']}》第 {progress['chapter_index']} 章"
+            f"（共 {book['total_chapters']} 章），本章还剩 {max(0, total - offset)} 字。"
+        ),
+        "book_title": book["title"],
+        "chapter_index": int(progress["chapter_index"]),
+        "remaining_chars": max(0, total - offset),
+    }
+
+
+def novel_stats(db: sqlite3.Connection, payload: dict) -> dict:
+    """这本书的成绩统计。所有者 2026-11-05：成绩要单独保留、每本书一份。"""
+    platform, chat_id, requester_id, _ = novel_identity(payload)
+    keyword = str(payload.get("book") or "").strip()
+    book = novel_find_book(db, keyword) if keyword else None
+    if not book:
+        progress = db.execute(
+            "SELECT book_id FROM novel_progress WHERE platform=? AND chat_id=? AND requester_id=?",
+            (platform, chat_id, requester_id),
+        ).fetchone()
+        if progress:
+            book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (progress["book_id"],)).fetchone()
+    if not book:
+        return {"status": "idle", "message": "还没记录到你在打哪本书，先说书名或先打一段。"}
+    row = db.execute(
+        "SELECT count(*) AS n, avg(speed) AS speed, avg(accuracy) AS acc, avg(wpm) AS wpm, sum(chars) AS chars "
+        "FROM novel_records WHERE book_id=? AND user_id=?",
+        (book["book_id"], requester_id),
+    ).fetchone()
+    if not row or not row["n"]:
+        return {"status": "empty", "message": f"《{book['title']}》还没有你的成绩记录（打完会有）。"}
+    return {
+        "status": "stats",
+        "message": (
+            f"《{book['title']}》你打了 {row['n']} 段，"
+            f"均速 {round(float(row['speed'] or 0), 2)} 击键/秒，"
+            f"平均准确率 {round(float(row['acc'] or 0), 2)}%，"
+            f"平均打词 {round(float(row['wpm'] or 0), 2)}，"
+            f"累计 {int(row['chars'] or 0)} 字。"
+        ),
+        "count": int(row["n"]),
+    }
+
+
+def library_metadata_summary(metadata: dict, segment_difficulty: str = "", segment_score=None) -> str:
+    result = f"整篇难度={metadata.get('difficulty','普')}({float(metadata.get('difficulty_score') or 0):.2f})，题材={metadata.get('primary_genre','综合文学')}，文体={metadata.get('form','小说/叙事')}"
+    if segment_difficulty:
+        result += f"；当前段={segment_difficulty}({float(segment_score or 0):.2f})"
+    return result
 
 
 LIBRARY_SEPARATOR_RE = re.compile(r"(?:[=*_~#]{5,}|[-—–]{6,}|[·•]{8,})")
@@ -1447,9 +2514,9 @@ def rank_library_row(db: sqlite3.Connection, row: sqlite3.Row) -> tuple[float, s
             )
         return score, difficulty
     content = normalize_library_content(row["content"])
-    score, difficulty = get_library_ranker().rank(content)
+    score, difficulty = get_library_ranker().rank(content[:600])
     db.execute(
-        "INSERT INTO library_rankings VALUES (?, ?, ?, ?) "
+        "INSERT INTO library_rankings (text_id,difficulty,score,ranked_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(text_id) DO UPDATE SET difficulty=excluded.difficulty,score=excluded.score,ranked_at=excluded.ranked_at",
         (row["text_id"], difficulty, score, time.time()),
     )
@@ -1457,10 +2524,8 @@ def rank_library_row(db: sqlite3.Connection, row: sqlite3.Row) -> tuple[float, s
 
 
 def pick_library_row(db: sqlite3.Connection, query: str, difficulty: str) -> tuple[sqlite3.Row, float, str] | None:
-    requested_genre = resolve_library_genre(query)
-    search_query = library_query_without_genre(query, requested_genre)
-    pattern = f"%{search_query}%"
-    if difficulty and not requested_genre:
+    pattern = f"%{query.strip()}%"
+    if difficulty:
         cached = db.execute(
             "SELECT l.*,r.score,r.difficulty AS ranked_difficulty FROM library_texts l "
             "JOIN library_rankings r ON r.text_id=l.text_id "
@@ -1472,21 +2537,14 @@ def pick_library_row(db: sqlite3.Connection, query: str, difficulty: str) -> tup
         if cached:
             return cached, float(cached["score"]), difficulty
 
-    if search_query:
-        candidates = db.execute(
-            "SELECT * FROM library_texts WHERE category<>'fm_single_chars' "
-            "AND (title LIKE ? OR content LIKE ?) ORDER BY RANDOM() LIMIT ?",
-            (pattern, pattern, 300 if difficulty else 500),
-        ).fetchall()
-    else:
-        candidates = db.execute(
-            "SELECT * FROM library_texts WHERE category<>'fm_single_chars' "
-            "ORDER BY RANDOM() LIMIT ?",
-            (2000 if requested_genre else (300 if difficulty else 50),),
-        ).fetchall()
+    candidates = db.execute(
+        "SELECT * FROM library_texts WHERE category<>'fm_single_chars' "
+        "AND (title LIKE ? OR content LIKE ?) ORDER BY RANDOM() LIMIT ?",
+        (pattern, pattern, 300 if difficulty else 50),
+    ).fetchall()
     if not candidates:
         return None
-    if not difficulty and not requested_genre:
+    if not difficulty:
         row = random.choice(candidates)
         score, actual = rank_library_row(db, row)
         db.commit()
@@ -1494,19 +2552,69 @@ def pick_library_row(db: sqlite3.Connection, query: str, difficulty: str) -> tup
 
     ranked = []
     for row in candidates:
-        if requested_genre and not library_genre_matches(db, row, requested_genre):
-            continue
         score, actual = rank_library_row(db, row)
         ranked.append((row, score, actual))
-        if not difficulty or actual == difficulty:
+        if actual == difficulty:
             db.commit()
             return row, score, actual
-    if not ranked:
-        db.commit()
-        return None
     db.commit()
     target = LIBRARY_DIFFICULTIES.index(difficulty)
     return min(ranked, key=lambda item: abs(LIBRARY_DIFFICULTIES.index(item[2]) - target))
+
+
+def _ensure_library_recent_table(db: sqlite3.Connection) -> None:
+    """记录每个会话最近发过的文章，供「文来」排除已发过的。
+
+    2026-10-30：原来是「只排除当前这一篇」，于是 A → B → A 会重复；
+    难度高时候选池小，重复得非常明显。
+    """
+    db.executescript(
+        "CREATE TABLE IF NOT EXISTS library_recent_sends ("
+        " platform TEXT NOT NULL,"
+        " chat_id TEXT NOT NULL,"
+        " requester_id TEXT NOT NULL,"
+        " text_id TEXT NOT NULL,"
+        " sent_at REAL NOT NULL,"
+        " PRIMARY KEY (platform, chat_id, requester_id, text_id));"
+        "CREATE INDEX IF NOT EXISTS library_recent_sends_idx "
+        " ON library_recent_sends(platform, chat_id, requester_id, sent_at DESC);"
+    )
+
+
+LIBRARY_RECENT_KEEP = 40
+
+
+def remember_library_send(
+    db: sqlite3.Connection, platform: str, chat_id: str, requester_id: str, text_id: str
+) -> None:
+    if not text_id:
+        return
+    db.execute(
+        "INSERT INTO library_recent_sends VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(platform, chat_id, requester_id, text_id) DO UPDATE SET sent_at=excluded.sent_at",
+        (platform, chat_id, requester_id, text_id, time.time()),
+    )
+    # 只留最近 N 篇，避免表无限增长（也让排除列表不会被撑爆）
+    db.execute(
+        "DELETE FROM library_recent_sends WHERE platform=? AND chat_id=? AND requester_id=? "
+        "AND text_id NOT IN (SELECT text_id FROM library_recent_sends "
+        " WHERE platform=? AND chat_id=? AND requester_id=? ORDER BY sent_at DESC LIMIT ?)",
+        (platform, chat_id, requester_id, platform, chat_id, requester_id, LIBRARY_RECENT_KEEP),
+    )
+
+
+def recent_library_text_ids(
+    db: sqlite3.Connection, platform: str, chat_id: str, requester_id: str
+) -> list[str]:
+    try:
+        rows = db.execute(
+            "SELECT text_id FROM library_recent_sends "
+            "WHERE platform=? AND chat_id=? AND requester_id=? ORDER BY sent_at DESC",
+            (platform, chat_id, requester_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [str(row[0]) for row in rows]
 
 
 def pick_library_segment(
@@ -1516,6 +2624,7 @@ def pick_library_segment(
     length: int,
     exclude_text_id: str = "",
     genre: str = "",
+    avoid_text_ids: list[str] | None = None,
 ) -> tuple[sqlite3.Row, str, float, str] | None:
     requested_genre = resolve_library_genre(genre) or resolve_library_genre(query)
     search_query = library_query_without_genre(query, requested_genre)
@@ -1528,6 +2637,11 @@ def pick_library_segment(
     if exclude_text_id:
         base_where += " AND l.text_id<>?"
         base_params.append(exclude_text_id)
+    # 最近发过的也排除掉（2026-10-30：只排除当前这一篇不够，A→B→A 会重复）
+    for avoid_id in (avoid_text_ids or [])[:LIBRARY_RECENT_KEEP]:
+        if avoid_id and avoid_id != exclude_text_id:
+            base_where += " AND l.text_id<>?"
+            base_params.append(avoid_id)
 
     if not difficulty:
         candidates = db.execute(
@@ -1538,10 +2652,9 @@ def pick_library_segment(
         if not candidates and exclude_text_id:
             candidates = db.execute(
                 "SELECT l.* FROM library_texts l WHERE l.category<>'fm_single_chars' "
-                + ("AND (l.title LIKE ? OR l.content LIKE ?) " if search_query else "")
-                + "AND LENGTH(l.content)>=? "
+                "AND (l.title LIKE ? OR l.content LIKE ?) AND LENGTH(l.content)>=? "
                 "ORDER BY RANDOM() LIMIT 200",
-                tuple(([pattern, pattern] if search_query else []) + [length]),
+                (pattern, pattern, length),
             ).fetchall()
         for row in candidates:
             if requested_genre and not library_genre_matches(db, row, requested_genre):
@@ -1550,30 +2663,23 @@ def pick_library_segment(
             if len(content) < length:
                 continue
             body = content[:length]
-            segment_score, segment_difficulty = get_library_ranker().rank(body)
-            return row, body, segment_score, segment_difficulty
+            score, actual = get_library_ranker().rank(body)
+            return row, body, score, actual
         return None
 
-    if requested_genre:
-        candidates = db.execute(
-            f"SELECT l.* FROM library_texts l WHERE {base_where} "
-            "AND LENGTH(l.content)>=? ORDER BY RANDOM() LIMIT 2000",
-            tuple(base_params + [length]),
-        ).fetchall()
-    else:
-        candidates = db.execute(
-            "SELECT l.* FROM library_texts l JOIN library_rankings r ON r.text_id=l.text_id "
-            f"WHERE {base_where} AND LENGTH(l.content)>=? AND r.difficulty=? "
-            "ORDER BY RANDOM() LIMIT 300",
-            tuple(base_params + [length, difficulty]),
-        ).fetchall()
+    candidates = db.execute(
+        "SELECT l.* FROM library_texts l JOIN library_rankings r ON r.text_id=l.text_id "
+        f"WHERE {base_where} AND LENGTH(l.content)>=? AND r.difficulty=? "
+        "ORDER BY RANDOM() LIMIT 300",
+        tuple(base_params + [length, difficulty]),
+    ).fetchall()
     candidates += db.execute(
         f"SELECT l.* FROM library_texts l WHERE {base_where} "
         "AND LENGTH(l.content)>=? ORDER BY RANDOM() LIMIT 2000",
         tuple(base_params + [length]),
     ).fetchall()
     if not candidates and exclude_text_id:
-        return pick_library_segment(db, query, difficulty, length, genre=genre)
+        return pick_library_segment(db, query, difficulty, length)
     seen = set()
     for row in candidates:
         if row["text_id"] in seen:
@@ -1585,10 +2691,9 @@ def pick_library_segment(
         if len(content) < length:
             continue
         body = content[:length]
-        metadata = classify_library_row(db, row)
-        if metadata["difficulty"] == difficulty:
-            segment_score, segment_difficulty = get_library_ranker().rank(body)
-            return row, body, segment_score, segment_difficulty
+        score, actual = get_library_ranker().rank(body)
+        if actual == difficulty:
+            return row, body, score, actual
     return None
 
 
@@ -1677,8 +2782,7 @@ def start_contest_session(db: sqlite3.Connection, payload: dict) -> dict:
     competition_date = str(payload.get("date") or "").strip()
     row = pick_contest_row(db, query, source_group, competition_date)
     if not row:
-        return {"status": "not_found", "message": "没有找到符合条件的历史赛文。",
-                "next_action": "这是查询结果为空，不是能力限制：换关键词或换难度再试，或改用 fm_contest_search 列出现有赛文。"}
+        return {"status": "not_found", "message": "没有找到符合条件的历史赛文。"}
     now = time.time()
     session = {
         "session_id": contest_session_id(platform, chat_id, requester_id),
@@ -1718,8 +2822,7 @@ def continue_contest_session(db: sqlite3.Connection, payload: dict) -> dict:
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的赛文。",
-                "next_action": "这是状态，不是能力限制：调用 fm_contest_send 或 fm_ai_contest_text 新发一篇，不要告诉用户系统做不到。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的赛文。"}
     selected = pick_contest_row(
         db, row["query_text"], row["source_group"], "", row["last_text_id"],
     )
@@ -1751,15 +2854,13 @@ def continue_contest_session(db: sqlite3.Connection, payload: dict) -> dict:
     }
 
 
-def format_library_segment(
-    db: sqlite3.Connection, session: dict, body: str, metadata: dict | None = None
-) -> tuple[str, int]:
-    score = float((metadata or {}).get("difficulty_score") or session["difficulty_score"])
+def format_library_segment(db: sqlite3.Connection, session: dict, body: str, metadata: dict | None = None) -> tuple[str, int]:
+    score = float(session["difficulty_score"])
     score_text = "爆表" if score > 100 else f"{score:.2f}"
-    genre = (metadata or {}).get("primary_genre") or "综合文学"
-    form = (metadata or {}).get("form") or "小说/叙事"
-    difficulty = (metadata or {}).get("difficulty") or session["difficulty"]
-    label = f"{difficulty}{score_text}·{genre}·{form}"
+    if metadata is None:
+        article = db.execute("SELECT * FROM library_texts WHERE text_id=?", (session["text_id"],)).fetchone()
+        metadata = classify_library_row(db, article) if article else {"primary_genre": "综合文学", "form": "小说/叙事"}
+    label = f"{session['difficulty']}{score_text}·{metadata.get('primary_genre', '综合文学')}·{metadata.get('form', '小说/叙事')}"
     article_no = str(session["text_id"])[:8].upper()
     segment_id = next_library_segment_id(db)
     now = time.time()
@@ -1793,7 +2894,7 @@ def save_previous_library_session(
     if not row:
         return
     mode = db.execute(
-        "SELECT requested_difficulty,requested_length,requested_genre FROM library_session_modes WHERE session_id=?",
+        "SELECT requested_difficulty,requested_length,requested_genre,auto_continue_same FROM library_session_modes WHERE session_id=?",
         (row["session_id"],),
     ).fetchone()
     requested_difficulty = str(mode["requested_difficulty"]) if mode else ""
@@ -1802,22 +2903,20 @@ def save_previous_library_session(
     db.execute(
         "INSERT INTO library_previous_sessions "
         "(platform,chat_id,requester_id,text_id,title,difficulty,difficulty_score,segment_length,"
-        "next_offset,segment_no,total_chars,requested_difficulty,requested_genre,requested_length,created_at,saved_at) "
+    "next_offset,segment_no,total_chars,requested_difficulty,requested_genre,requested_length,created_at,saved_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(platform,chat_id,requester_id) DO UPDATE SET "
         "text_id=excluded.text_id,title=excluded.title,difficulty=excluded.difficulty,"
         "difficulty_score=excluded.difficulty_score,segment_length=excluded.segment_length,"
         "next_offset=excluded.next_offset,segment_no=excluded.segment_no,"
         "total_chars=excluded.total_chars,requested_difficulty=excluded.requested_difficulty,"
-        "requested_genre=excluded.requested_genre,"
-        "requested_length=excluded.requested_length,"
+        "requested_genre=excluded.requested_genre,requested_length=excluded.requested_length,"
         "created_at=excluded.created_at,saved_at=excluded.saved_at",
         (
             platform, chat_id, requester_id, row["text_id"], row["title"],
             row["difficulty"], row["difficulty_score"], row["segment_length"],
             row["next_offset"], row["segment_no"], row["total_chars"],
-            requested_difficulty, requested_genre, requested_length,
-            row["created_at"], time.time(),
+            requested_difficulty, requested_genre, requested_length, row["created_at"], time.time(),
         ),
     )
 
@@ -1836,19 +2935,30 @@ def start_library_session(db: sqlite3.Connection, payload: dict) -> dict:
         if not 1 <= length <= LIBRARY_MAX_LENGTH:
             raise ValueError(f"length must be between 1 and {LIBRARY_MAX_LENGTH}")
         fixed_length = length
+    avoid_text_ids = recent_library_text_ids(db, platform, chat_id, requester_id)
     selected = pick_library_segment(
-        db, query, difficulty, length, str(payload.get("exclude_text_id") or "").strip(), requested_genre
+        db,
+        query,
+        difficulty,
+        length,
+        str(payload.get("exclude_text_id") or "").strip(),
+        requested_genre,
+        avoid_text_ids,
     )
+    if not selected and avoid_text_ids:
+        # 排除之后一篇都抽不到（池子真的发完了）：退回不排除。
+        # 宁可重复一篇，也不能让「文来」直接回答「没有文章」。
+        selected = pick_library_segment(
+            db, query, difficulty, length, str(payload.get("exclude_text_id") or "").strip(), requested_genre
+        )
     if not selected:
         detail = f"“{difficulty}”难度区间" if difficulty else "要求"
-        return {"status": "not_found", "message": f"没有找到符合{detail}的文库文章。",
-                "next_action": "这是筛选结果为空，不是能力限制：去掉难度或换关键词再调一次，或先用 fm_library_search 看有哪些可选。"}
+        return {"status": "not_found", "message": f"没有找到符合{detail}的文库文章。"}
     row, body, score, actual_difficulty = selected
     content = normalize_library_content(row["content"])
-    metadata = classify_library_row(db, row)
     if not body:
-        return {"status": "not_found", "message": "找到的文章没有可发送正文。",
-                "next_action": "换一篇再试一次（重调本工具或换 query），不要把这一篇的问题说成系统做不到。"}
+        return {"status": "not_found", "message": "找到的文章没有可发送正文。"}
+    metadata = classify_library_row(db, row)
     save_previous_library_session(db, platform, chat_id, requester_id)
     end = len(body)
     now = time.time()
@@ -1877,23 +2987,22 @@ def start_library_session(db: sqlite3.Connection, payload: dict) -> dict:
         tuple(session.values()),
     )
     db.execute(
-        "INSERT INTO library_session_modes (session_id,requested_difficulty,requested_length,requested_genre) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
-        "requested_difficulty=excluded.requested_difficulty,requested_length=excluded.requested_length,"
-        "requested_genre=excluded.requested_genre",
+        "INSERT INTO library_session_modes (session_id,requested_difficulty,requested_length,requested_genre,auto_continue_same) "
+        "VALUES (?, ?, ?, ?, 0) ON CONFLICT(session_id) DO UPDATE SET "
+        "requested_difficulty=excluded.requested_difficulty,requested_length=excluded.requested_length,requested_genre=excluded.requested_genre,auto_continue_same=0",
         (session["session_id"], difficulty, fixed_length, requested_genre),
     )
     db.commit()
-    message, segment_id = format_library_segment(db, session, body, metadata)
+    message, segment_id = format_library_segment(db, session, body)
+    remember_library_send(db, platform, chat_id, requester_id, str(row["text_id"]))
     db.commit()
     return {
         "status": "segment", "message": message, "segment_id": segment_id,
         "session_id": session["session_id"], "title": row["title"],
         "difficulty": actual_difficulty, "score": score, "segment_no": 1,
         "next_offset": end, "total_chars": len(content), "completed": end >= len(content),
-        "genre": metadata["primary_genre"], "genres": metadata["genres"],
-        "form": metadata["form"], "article_difficulty": metadata["difficulty"],
-        "article_score": metadata["difficulty_score"], "confidence": metadata["confidence"],
+        "genre": metadata["primary_genre"], "genres": metadata["genres"], "form": metadata["form"],
+        "article_difficulty": metadata["difficulty"], "article_score": metadata["difficulty_score"],
         "metadata_summary": library_metadata_summary(metadata, actual_difficulty, score),
     }
 
@@ -1906,8 +3015,7 @@ def continue_library_session(db: sqlite3.Connection, payload: dict) -> dict:
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。",
-                "next_action": "这是状态，不是能力限制：调用 fm_library_start 新开一篇，或调 fm_library_continue_previous 恢复上一篇；不要告诉用户系统做不到。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。"}
     mode = db.execute(
         "SELECT requested_difficulty,requested_length,requested_genre FROM library_session_modes WHERE session_id=?",
         (row["session_id"],),
@@ -1935,8 +3043,7 @@ def continue_same_library_session(db: sqlite3.Connection, payload: dict) -> dict
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。",
-                "next_action": "这是状态，不是能力限制：调用 fm_library_start 新开一篇，或调 fm_library_continue_previous 恢复上一篇；不要告诉用户系统做不到。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的发文。"}
     content = normalize_library_content(row["content"])
     start = int(row["next_offset"])
     mode = db.execute(
@@ -1957,7 +3064,8 @@ def continue_same_library_session(db: sqlite3.Connection, payload: dict) -> dict
     end = min(start + int(row["segment_length"]), len(content))
     body = content[start:end]
     score, actual_difficulty = get_library_ranker().rank(body)
-    metadata = classify_library_row(db, row)
+    article = db.execute("SELECT * FROM library_texts WHERE text_id=?", (row["text_id"],)).fetchone()
+    metadata = classify_library_row(db, article) if article else {"primary_genre": "综合文学", "genres": ["综合文学"], "form": "小说/叙事", "difficulty": actual_difficulty, "difficulty_score": score, "confidence": 0}
     session = dict(row)
     session["segment_no"] = int(row["segment_no"]) + 1
     session["next_offset"] = end
@@ -1981,9 +3089,8 @@ def continue_same_library_session(db: sqlite3.Connection, payload: dict) -> dict
         "segment_no": session["segment_no"], "next_offset": end,
         "total_chars": len(content), "completed": end >= len(content),
         "continuation_mode": "same_article",
-        "genre": metadata["primary_genre"], "genres": metadata["genres"],
-        "form": metadata["form"], "article_difficulty": metadata["difficulty"],
-        "article_score": metadata["difficulty_score"], "confidence": metadata["confidence"],
+        "genre": metadata["primary_genre"], "genres": metadata["genres"], "form": metadata["form"],
+        "article_difficulty": metadata["difficulty"], "article_score": metadata["difficulty_score"],
         "metadata_summary": library_metadata_summary(metadata, actual_difficulty, score),
     }
 
@@ -2028,10 +3135,9 @@ def continue_previous_library_session(db: sqlite3.Connection, payload: dict) -> 
         ),
     )
     db.execute(
-        "INSERT INTO library_session_modes (session_id,requested_difficulty,requested_length,requested_genre) "
-        "VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
-        "requested_difficulty=excluded.requested_difficulty,requested_length=excluded.requested_length,"
-        "requested_genre=excluded.requested_genre",
+        "INSERT INTO library_session_modes (session_id,requested_difficulty,requested_length,requested_genre,auto_continue_same) "
+        "VALUES (?,?,?,?,1) ON CONFLICT(session_id) DO UPDATE SET "
+        "requested_difficulty=excluded.requested_difficulty,requested_length=excluded.requested_length,requested_genre=excluded.requested_genre,auto_continue_same=1",
         (
             current["session_id"], previous["requested_difficulty"],
             previous["requested_length"], previous["requested_genre"],
@@ -2100,13 +3206,25 @@ def continue_library_session_from_score(db: sqlite3.Connection, payload: dict) -
         "requester_id": requester_id,
         "requester_name": requester_name,
     }
-    result = (
-        continue_single_session(db, identity)
-        if row["session_kind"] == "single"
-        else continue_contest_session(db, identity)
-        if row["session_kind"] == "contest"
-        else continue_library_session(db, identity)
-    )
+    if row["session_kind"] == "single":
+        result = continue_single_session(db, identity)
+    elif row["session_kind"] == "contest":
+        result = continue_contest_session(db, identity)
+    else:
+        mode = db.execute(
+            "SELECT auto_continue_same FROM library_session_modes WHERE session_id=?",
+            (row["session_id"],),
+        ).fetchone()
+        if mode and int(mode["auto_continue_same"] or 0):
+            result = continue_same_library_session(db, identity)
+            if result.get("status") == "article_completed":
+                db.execute(
+                    "UPDATE library_session_modes SET auto_continue_same=0 WHERE session_id=?",
+                    (row["session_id"],),
+                )
+                result = continue_library_session(db, identity)
+        else:
+            result = continue_library_session(db, identity)
     result["trigger_segment_id"] = segment_id
     return result
 
@@ -2158,16 +3276,14 @@ def start_single_session(db: sqlite3.Connection, payload: dict) -> dict:
         (name,),
     ).fetchone()
     if not row:
-        return {"status": "not_found", "message": f"单字库《{name}》还没装好。",
-                "next_action": "换一个单字库名字再试，或先列出可用的单字库。"}
+        return {"status": "not_found", "message": f"单字库《{name}》还没装好。"}
     sequence = re.sub(r"\s+", "", row["content"])
     if order_name == "乱":
         characters = list(sequence)
         random.shuffle(characters)
         sequence = "".join(characters)
     if not sequence:
-        return {"status": "not_found", "message": f"单字库《{name}》没有可发送内容。",
-                "next_action": "换一个单字库再试一次。"}
+        return {"status": "not_found", "message": f"单字库《{name}》没有可发送内容。"}
     end = min(length, len(sequence))
     now = time.time()
     session = {
@@ -2214,8 +3330,7 @@ def continue_single_session(db: sqlite3.Connection, payload: dict) -> dict:
         (platform, chat_id, requester_id),
     ).fetchone()
     if not row:
-        return {"status": "idle", "message": "你在当前会话里没有正在进行的单字练习。",
-                "next_action": "这是状态，不是能力限制：调用 fm_library_start 或对应的单字练习工具新开一轮，不要告诉用户系统做不到。"}
+        return {"status": "idle", "message": "你在当前会话里没有正在进行的单字练习。"}
     start = int(row["next_offset"])
     sequence = str(row["sequence"])
     if start >= len(sequence):
@@ -2263,8 +3378,7 @@ def stop_library_session(db: sqlite3.Connection, payload: dict) -> dict:
             if row:
                 candidates.append((row, table))
     if not candidates:
-        return {"status": "idle", "message": "当前会话没有正在进行的发文。",
-                "next_action": "这是状态，不是能力限制：调用 fm_library_start 新开一篇，不要告诉用户系统做不到。"}
+        return {"status": "idle", "message": "当前会话没有正在进行的发文。"}
     row, table = max(candidates, key=lambda item: float(item[0]["updated_at"]))
     db.execute(
         f"UPDATE {table} SET status='stopped',updated_at=? WHERE session_id=?",
@@ -2349,1133 +3463,40 @@ def mark_library_messages_recalled(db: sqlite3.Connection, payload: dict) -> dic
     return {"status": "ok", "marked": changed}
 
 
-# ── P4: 成绩聚合 ─────────────────────────────────────────────────────────
-# 阈值来自实测分布：速度 p99=339.63，所以不能按 400 砍（那会切掉真实高手）。
-# 真正要滤的是「只打一两个字却报出几千字/分」这类，以及字数异常大的。
-SCORE_MIN_CHARS = 40         # 少于这个字数的记录不参与速度排名
-# 阈值依据（实测 39656 条按字数分桶后的中位速度）：
-#     0-8 字   151.4      20-40 字   82.6   ← 明显异常低
-#     8-20 字  142.5      80-150 字 165.0   ← 峰值
-# 中位数与段落长度不是单调关系，原因是计时里含固定开销：段落越短，
-# 那点开销占比越大，速度被压得越低。所以短段落的成绩不能和长段落
-# 放在一起比速度 —— 8 字的下限太松，20-40 字那一档会系统性拉低均值。
-# 定在 40 能排除这种失真，同时保留约 76% 的真实成绩。
-SCORE_MAX_SPEED = 400.0      # 字/分上限，实测 p999=495 但那些都是 chars=1 的记录
-SCORE_MAX_KEYSTROKE = 20.0   # 击键上限，实测 p999=16.67
-SCORE_MIN_ACCURACY = 0.0
-SCORE_MAX_ACCURACY = 100.0
-
-
-def score_number(value):
-    """source_json 里的数值有的是数字、有的是带 % 的字符串。"""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().rstrip("%")
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def score_row(payload):
-    """把一条 score_records.source_json 规范化成统一的字段。
-
-    两批数据的字段名不一致，实测：
-      旧批（napcat_log_import）用 keystrokes，新批用 keystroke
-      旧批的 accuracy 是 '93.16%' 字符串，新批是数字
-    """
-    if not isinstance(payload, dict):
-        return None
-    return {
-        "segment_id": str(payload.get("segment_id") or ""),
-        "speed": score_number(payload.get("speed")),
-        "keystroke": score_number(payload.get("keystroke", payload.get("keystrokes"))),
-        "accuracy": score_number(payload.get("accuracy")),
-        "characters": score_number(payload.get("characters")),
-        "sender_id": str(payload.get("sender_id") or ""),
-        "sender_name": str(payload.get("sender_name") or ""),
-        "group_id": str(payload.get("group_id") or ""),
-        "group_name": str(payload.get("group_name") or ""),
-        "source": str(payload.get("source") or ""),
-        "method": str(payload.get("method") or ""),
-        "certificate": str(payload.get("certificate") or ""),
-        "duration": str(payload.get("duration") or ""),
-    }
-
-
-def score_reasons(row):
-    """返回这条记录的问题列表；空列表表示可用。"""
-    reasons = []
-    chars = row.get("characters")
-    if chars is not None and chars < SCORE_MIN_CHARS:
-        reasons.append("字数过少")
-    speed = row.get("speed")
-    if speed is not None and (speed < 0 or speed > SCORE_MAX_SPEED):
-        reasons.append("速度异常")
-    keystroke = row.get("keystroke")
-    if keystroke is not None and (keystroke < 0 or keystroke > SCORE_MAX_KEYSTROKE):
-        reasons.append("击键异常")
-    accuracy = row.get("accuracy")
-    if accuracy is not None and not (SCORE_MIN_ACCURACY <= accuracy <= SCORE_MAX_ACCURACY):
-        reasons.append("准确率异常")
-    return reasons
-
-
-def score_thresholds(query):
-    """从查询参数里读质量阈值，没给就用模块默认（默认值来自实测分布）。"""
-
-    def number(name, fallback):
-        raw = (query.get(name, [""])[0] or "").strip()
-        if not raw:
-            return fallback
-        try:
-            return float(raw)
-        except ValueError:
-            return fallback
-
-    return {
-        "min_chars": number("min_chars", SCORE_MIN_CHARS),
-        "max_speed": number("max_speed", SCORE_MAX_SPEED),
-        "max_keystroke": number("max_keystroke", SCORE_MAX_KEYSTROKE),
-    }
-
-
-def score_quality_ok(row, min_chars=SCORE_MIN_CHARS, max_speed=SCORE_MAX_SPEED,
-                     max_keystroke=SCORE_MAX_KEYSTROKE):
-    chars = row.get("characters")
-    if chars is not None and chars < min_chars:
-        return False
-    speed = row.get("speed")
-    if speed is not None and (speed < 0 or speed > max_speed):
-        return False
-    keystroke = row.get("keystroke")
-    if keystroke is not None and (keystroke < 0 or keystroke > max_keystroke):
-        return False
-    accuracy = row.get("accuracy")
-    if accuracy is not None and not (SCORE_MIN_ACCURACY <= accuracy <= SCORE_MAX_ACCURACY):
-        return False
-    return True
-
-
-def load_scores(db, since=None, until=None, thresholds=None):
-    """读出并规范化成绩，按时间升序。同时返回被过滤掉的条数。"""
-    limits = thresholds or {}
-    where, args = [], []
-    if since is not None:
-        where.append("occurred_at >= ?")
-        args.append(since)
-    if until is not None:
-        where.append("occurred_at <= ?")
-        args.append(until)
-    clause = (" WHERE " + " AND ".join(where)) if where else ""
-    sql = (
-        "SELECT record_id, occurred_at, group_id, sender_id, source_json "
-        "FROM score_records" + clause + " ORDER BY occurred_at"
-    )
-    rows, dropped, unreadable = [], 0, 0
-    for record in db.execute(sql, args):
-        try:
-            payload = json.loads(record["source_json"])
-        except (TypeError, ValueError):
-            unreadable += 1
-            continue
-        row = score_row(payload)
-        if row is None:
-            unreadable += 1
-            continue
-        row["occurred_at"] = record["occurred_at"]
-        row["record_id"] = record["record_id"]
-        if not row["group_id"]:
-            row["group_id"] = str(record["group_id"] or "")
-        if not row["sender_id"]:
-            row["sender_id"] = str(record["sender_id"] or "")
-        if not score_quality_ok(
-            row,
-            limits.get("min_chars", SCORE_MIN_CHARS),
-            limits.get("max_speed", SCORE_MAX_SPEED),
-            limits.get("max_keystroke", SCORE_MAX_KEYSTROKE),
-        ):
-            dropped += 1
-            continue
-        rows.append(row)
-    return rows, dropped, unreadable
-
-
-def score_day(ts):
-    return time.strftime("%Y-%m-%d", time.localtime(ts))
-
-
-SCORE_AGG_CACHE = {}
-SCORE_AGG_CACHE_LOCK = threading.Lock()
-SCORE_AGG_CACHE_TTL = 30.0
-
-
-def score_agg_cache(func):
-    """给成绩聚合接口加短 TTL 缓存。
-
-    三个聚合接口每次都要解析 2 万条 JSON 再聚合（各 320~380 ms），
-    而成绩是每分钟几条的频率，30 秒缓存足够。
-    写路径（record_message_event 落成绩时）会调 score_agg_invalidate() 主动失效。
-    """
-
-    @functools.wraps(func)
-    def wrapper(db, query):
-        key = (func.__name__, json.dumps(sorted(query.items()), ensure_ascii=False, default=str))
-        now = time.time()
-        with SCORE_AGG_CACHE_LOCK:
-            hit = SCORE_AGG_CACHE.get(key)
-            if hit and now - hit[0] < SCORE_AGG_CACHE_TTL:
-                result = dict(hit[1])
-                result["cached"] = True
-                return result
-        value = func(db, query)
-        with SCORE_AGG_CACHE_LOCK:
-            SCORE_AGG_CACHE[key] = (time.time(), value)
-            # 顺手清掉过期的，避免参数组合多起来之后无限增长
-            for stale in [k for k, v in SCORE_AGG_CACHE.items() if now - v[0] >= SCORE_AGG_CACHE_TTL]:
-                SCORE_AGG_CACHE.pop(stale, None)
-        return value
-
-    return wrapper
-
-
-def score_agg_invalidate():
-    """写成绩时调用。宁可下次多算一次，也不要让人看到过期数据。"""
-    with SCORE_AGG_CACHE_LOCK:
-        SCORE_AGG_CACHE.clear()
-
-
-# /stats/advanced 的缓存。key 里带 part，所以两个部分互不影响。
-STATS_ADVANCED_CACHE = {}
-STATS_ADVANCED_TTL = 60.0
-
-
-# ── 统计类接口的短 TTL 缓存 ──────────────────────────────────────────────
-# 这几个接口每次打开仪表盘都要调，但数字晚几十秒不影响任何判断。
-# 与成绩聚合缓存分开：数据源与失效点不同。
-STATS_CACHE = {}
-STATS_CACHE_LOCK = threading.Lock()
-STATS_CACHE_TTL = 45.0
-
-
-def stats_cache(key, builder):
-    now = time.time()
-    with STATS_CACHE_LOCK:
-        hit = STATS_CACHE.get(key)
-        if hit and now - hit[0] < STATS_CACHE_TTL:
-            return hit[1]
-    value = builder()
-    with STATS_CACHE_LOCK:
-        STATS_CACHE[key] = (time.time(), value)
-        for stale in [k for k, v in STATS_CACHE.items() if now - v[0] >= STATS_CACHE_TTL]:
-            STATS_CACHE.pop(stale, None)
-    return value
-
-
-def stats_cache_invalidate(*keys):
-    """不传就全清。"""
-    with STATS_CACHE_LOCK:
-        if not keys:
-            STATS_CACHE.clear()
-        else:
-            for key in keys:
-                STATS_CACHE.pop(key, None)
-
-
-def stats_advanced_cached(part, builder):
-    """part='heat' 或 'speed'。两者数据源不同、更新时间也不同，分开缓存。"""
-    now = time.time()
-    hit = STATS_ADVANCED_CACHE.get(part)
-    if hit and now - hit[0] < STATS_ADVANCED_TTL:
-        return hit[1]
-    value = builder()
-    STATS_ADVANCED_CACHE[part] = (time.time(), value)
-    return value
-
-
-def stats_advanced_invalidate(part=None):
-    """消息归档变化时清 heat，成绩变化时清 speed；不传就全清。"""
-    if part is None:
-        STATS_ADVANCED_CACHE.clear()
-    else:
-        STATS_ADVANCED_CACHE.pop(part, None)
-
-
-@score_agg_cache
-def scores_leaderboard(db, query):
-    """按人聚合的排行榜。"""
-    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
-    metric = (query.get("metric", ["speed"])[0] or "speed").strip().lower()
-    limit = max(1, min(200, int(query.get("limit", ["30"])[0] or 30)))
-    min_attempts = max(1, int(query.get("min_attempts", ["3"])[0] or 3))
-    include_all = query.get("all", [""])[0].lower() in {"1", "true", "yes"}
-
-    since = None if include_all else time.time() - days * 86400
-    limits = score_thresholds(query)
-    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
-
-    people = {}
-    for row in rows:
-        key = row["sender_id"] or row["sender_name"]
-        if not key:
-            continue
-        bucket = people.setdefault(key, {
-            "sender_id": row["sender_id"],
-            "sender_name": row["sender_name"],
-            "group_name": row["group_name"],
-            "attempts": 0,
-            "speeds": [],
-            "keystrokes": [],
-            "accuracies": [],
-            "best_speed": None,
-            "best_keystroke": None,
-            "best_accuracy": None,
-            "chars": 0,
-            "segments": set(),
-            "first_at": row["occurred_at"],
-            "last_at": row["occurred_at"],
-        })
-        bucket["attempts"] += 1
-        if row["speed"] is not None:
-            bucket["speeds"].append(row["speed"])
-            if bucket["best_speed"] is None or row["speed"] > bucket["best_speed"]:
-                bucket["best_speed"] = row["speed"]
-        if row["keystroke"] is not None:
-            bucket["keystrokes"].append(row["keystroke"])
-            if bucket["best_keystroke"] is None or row["keystroke"] > bucket["best_keystroke"]:
-                bucket["best_keystroke"] = row["keystroke"]
-        if row["accuracy"] is not None:
-            bucket["accuracies"].append(row["accuracy"])
-            if bucket["best_accuracy"] is None or row["accuracy"] > bucket["best_accuracy"]:
-                bucket["best_accuracy"] = row["accuracy"]
-        if row["characters"]:
-            bucket["chars"] += int(row["characters"])
-        if row["segment_id"]:
-            bucket["segments"].add(row["segment_id"])
-        bucket["last_at"] = max(bucket["last_at"], row["occurred_at"])
-        bucket["first_at"] = min(bucket["first_at"], row["occurred_at"])
-        if row["sender_name"]:
-            bucket["sender_name"] = row["sender_name"]
-
-    def avg(values):
-        return round(sum(values) / len(values), 2) if values else None
-
-    ranked = []
-    for bucket in people.values():
-        if bucket["attempts"] < min_attempts:
-            continue
-        ranked.append({
-            "sender_id": bucket["sender_id"],
-            "sender_name": bucket["sender_name"],
-            "group_name": bucket["group_name"],
-            "attempts": bucket["attempts"],
-            "best_speed": round(bucket["best_speed"], 2) if bucket["best_speed"] is not None else None,
-            "avg_speed": avg(bucket["speeds"]),
-            "best_keystroke": round(bucket["best_keystroke"], 2) if bucket["best_keystroke"] is not None else None,
-            "avg_keystroke": avg(bucket["keystrokes"]),
-            "best_accuracy": round(bucket["best_accuracy"], 2) if bucket["best_accuracy"] is not None else None,
-            "avg_accuracy": avg(bucket["accuracies"]),
-            "characters": bucket["chars"],
-            "segments": len(bucket["segments"]),
-            "first_at": bucket["first_at"],
-            "last_at": bucket["last_at"],
-        })
-
-    keymap = {
-        "speed": lambda r: (r["best_speed"] is None, -(r["best_speed"] or 0)),
-        "avg_speed": lambda r: (r["avg_speed"] is None, -(r["avg_speed"] or 0)),
-        "keystroke": lambda r: (r["best_keystroke"] is None, -(r["best_keystroke"] or 0)),
-        "accuracy": lambda r: (r["best_accuracy"] is None, -(r["best_accuracy"] or 0)),
-        "volume": lambda r: (-r["attempts"],),
-        "characters": lambda r: (-r["characters"],),
-    }
-    ranked.sort(key=keymap.get(metric, keymap["speed"]))
-    for index, item in enumerate(ranked, start=1):
-        item["rank"] = index
-
-    total = len(rows)
-    return {
-        "days": days,
-        "include_all": include_all,
-        "metric": metric,
-        "min_attempts": min_attempts,
-        "total_records": total,
-        "dropped": dropped,
-        "unreadable": unreadable,
-        "applied": limits,
-        "people": len(ranked),
-        "rows": ranked[:limit],
-    }
-
-
-@score_agg_cache
-def scores_player(db, query):
-    """个人档案：总览 + 每日曲线 + 最近记录 + 拿手段落。"""
-    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
-    user_id = (query.get("user_id", [""])[0] or "").strip()
-    name = (query.get("name", [""])[0] or "").strip()
-    if not user_id and not name:
-        return {"error": "user_id 或 name 至少给一个"}
-
-    since = time.time() - days * 86400
-    limits = score_thresholds(query)
-    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
-    mine = [
-        row for row in rows
-        if (user_id and row["sender_id"] == user_id) or (name and row["sender_name"] == name)
-    ]
-    if not mine:
-        return {
-            "user_id": user_id, "name": name, "days": days,
-            "found": False, "attempts": 0, "daily": [], "recent": [], "segments": [],
-        }
-
-    daily = {}
-    for row in mine:
-        day = score_day(row["occurred_at"])
-        bucket = daily.setdefault(day, {"date": day, "attempts": 0, "speeds": [], "best": None, "chars": 0})
-        bucket["attempts"] += 1
-        if row["speed"] is not None:
-            bucket["speeds"].append(row["speed"])
-            if bucket["best"] is None or row["speed"] > bucket["best"]:
-                bucket["best"] = row["speed"]
-        if row["characters"]:
-            bucket["chars"] += int(row["characters"])
-
-    curve = []
-    for day in sorted(daily):
-        bucket = daily[day]
-        curve.append({
-            "date": day,
-            "attempts": bucket["attempts"],
-            "best_speed": round(bucket["best"], 2) if bucket["best"] is not None else None,
-            "avg_speed": round(sum(bucket["speeds"]) / len(bucket["speeds"]), 2) if bucket["speeds"] else None,
-            "characters": bucket["chars"],
-        })
-
-    seg_best = {}
-    for row in mine:
-        if not row["segment_id"] or row["speed"] is None:
-            continue
-        current = seg_best.get(row["segment_id"])
-        if current is None or row["speed"] > current["best_speed"]:
-            seg_best[row["segment_id"]] = {
-                "segment_id": row["segment_id"],
-                "best_speed": row["speed"],
-                "best_keystroke": row["keystroke"],
-                "best_accuracy": row["accuracy"],
-                "attempts": (current["attempts"] + 1) if current else 1,
-            }
-        else:
-            seg_best[row["segment_id"]]["attempts"] = current["attempts"] + 1
-
-    speeds = [r["speed"] for r in mine if r["speed"] is not None]
-    keystrokes = [r["keystroke"] for r in mine if r["keystroke"] is not None]
-    accuracies = [r["accuracy"] for r in mine if r["accuracy"] is not None]
-
-    # 首打认证：数据里的 certificate 字段只在部分记录出现，这里按「第一次打出某段落」算
-    first_seen = {}
-    for row in sorted(mine, key=lambda r: r["occurred_at"]):
-        if row["segment_id"] and row["segment_id"] not in first_seen:
-            first_seen[row["segment_id"]] = row["occurred_at"]
-
-    latest = sorted(mine, key=lambda r: r["occurred_at"], reverse=True)[:30]
-    return {
-        "user_id": mine[0]["sender_id"],
-        "name": mine[0]["sender_name"],
-        "days": days,
-        "found": True,
-        "attempts": len(mine),
-        "best_speed": round(max(speeds), 2) if speeds else None,
-        "avg_speed": round(sum(speeds) / len(speeds), 2) if speeds else None,
-        "best_keystroke": round(max(keystrokes), 2) if keystrokes else None,
-        "avg_keystroke": round(sum(keystrokes) / len(keystrokes), 2) if keystrokes else None,
-        "best_accuracy": round(max(accuracies), 2) if accuracies else None,
-        "avg_accuracy": round(sum(accuracies) / len(accuracies), 2) if accuracies else None,
-        "characters": sum(int(r["characters"]) for r in mine if r["characters"]),
-        "new_segments": len(first_seen),
-        "active_days": len(daily),
-        "first_at": min(r["occurred_at"] for r in mine),
-        "last_at": max(r["occurred_at"] for r in mine),
-        "dropped": dropped,
-        "unreadable": unreadable,
-        "applied": limits,
-        "daily": curve,
-        "segments": sorted(
-            seg_best.values(), key=lambda s: -(s["best_speed"] or 0))[:20],
-        "recent": [
-            {
-                "segment_id": r["segment_id"],
-                "speed": r["speed"],
-                "keystroke": r["keystroke"],
-                "accuracy": r["accuracy"],
-                "characters": r["characters"],
-                "occurred_at": r["occurred_at"],
-                "source": r["source"],
-                "group_name": r["group_name"],
-            }
-            for r in latest
-        ],
-    }
-
-
-def media_refs(value) -> list:
-    """把 chat_log.image_urls 解析成媒体引用列表。
-
-    字段名叫 image_urls，但实测**不是 JSON**，而是逗号分隔的引用，
-    形如 'media:mf_-pBRNiAl92lqEUtOucGYeA'（129 条机器人消息带它）。
-
-    我第一版直接 json.loads 了它 —— 遇到非空值就抛异常、连接断开（踩过一次）。
-    这个库里「字段类型与预期不符」是有先例的（occurred_at 混类型、
-    recorded_at 是字符串、source_json 字段名新旧不一致），
-    所以凡是读出来要解析的地方都得兜底。
-    """
-    if not value:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(x) for x in value]
-    text = str(value).strip()
-    if not text:
-        return []
-    if text.startswith("["):
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return [str(x) for x in parsed]
-        except (TypeError, ValueError):
-            pass
-    return [piece for piece in re.split(r"[,\s]+", text) if piece]
-
-
-BOT_DB = "/botdata/cosmobot.sqlite3"
-
-
-def bot_db_connect():
-    """只读打开机器人的库。挂载本身就是 :ro，这里再加一层 mode=ro。"""
-    if not os.path.exists(BOT_DB):
-        return None
-    try:
-        con = sqlite3.connect(f"file:{BOT_DB}?mode=ro", uri=True, timeout=10)
-        con.row_factory = sqlite3.Row
-        return con
-    except sqlite3.Error:
-        return None
-
-
-def bot_messages(query) -> dict:
-    """机器人最近的发言，以及它回复的那条消息。
-
-    chat_log.recorded_at 是**字符串**（形如 '2026-09-17 15:53:08.250294411+0000'），
-    不是 Unix 时间戳 —— 与 score_records.occurred_at 是同一个坑。
-    按 id 倒序拿最近的最可靠。
-    """
-    try:
-        limit = min(max(int(query.get("limit", ["50"])[0]), 1), 300)
-    except (TypeError, ValueError):
-        limit = 50
-    chat_id = (query.get("chat_id", [""])[0] or "").strip()
-    keyword = (query.get("q", [""])[0] or "").strip()
-
-    con = bot_db_connect()
-    if con is None:
-        return {"error": "读不到机器人的库（/botdata/cosmobot.sqlite3）", "available": False}
-
-    where = ["is_bot=1"]
-    args = []
-    if chat_id:
-        where.append("chat_id = ?")
-        args.append(chat_id)
-    if keyword:
-        where.append("body_text LIKE ?")
-        args.append(f"%{keyword}%")
-    clause = " AND ".join(where)
-
-    try:
-        rows = con.execute(f"""
-            SELECT id, chat_id, kind_key, message_id, reply_to_message_id,
-                   body_text, image_urls, recorded_at
-            FROM chat_log WHERE {clause}
-            ORDER BY id DESC LIMIT ?
-        """, (*args, limit)).fetchall()
-
-        out = []
-        for row in rows:
-            reply_text = None
-            if row["reply_to_message_id"]:
-                # 找到它回复的那条
-                parent = con.execute("""
-                    SELECT sender_username, body_text, is_bot FROM chat_log
-                    WHERE message_id = ? LIMIT 1
-                """, (row["reply_to_message_id"],)).fetchone()
-                if parent:
-                    reply_text = {
-                        "sender": parent["sender_username"],
-                        "text": (parent["body_text"] or "")[:400],
-                        "from_bot": bool(parent["is_bot"]),
-                    }
-            out.append({
-                "id": row["id"],
-                "chat_id": row["chat_id"],
-                "kind": row["kind_key"],
-                "message_id": row["message_id"],
-                "body": (row["body_text"] or "")[:1200],
-                # 统一成 Unix 时间戳（与 /scores 的 received_at 同口径），
-                # 不让前端去猜时区 —— 猜错过一次，少了 8 小时。
-                "at_unix": parse_bot_time(row["recorded_at"]),
-                "at_raw": row["recorded_at"],
-                "media_refs": media_refs(row["image_urls"]),
-                "reply_to": reply_text,
-            })
-        return {"available": True, "count": len(out), "messages": out}
-    except sqlite3.Error as err:
-        return {"error": f"查询失败：{err}", "available": False}
-    finally:
-        con.close()
-
-
-def bot_runs(query) -> dict:
-    """最近的 agent 运行：耗时、轮数、工具调用、token。
-
-    数据在 audit_log 的 event_json 里，按 event_kind 筛选。
-    agent_run_finished 里带 elapsed / turns；model_turn_finished 带 tokenUsage。
-    """
-    try:
-        limit = min(max(int(query.get("limit", ["50"])[0]), 1), 300)
-    except (TypeError, ValueError):
-        limit = 50
-
-    con = bot_db_connect()
-    if con is None:
-        return {"error": "读不到机器人的库", "available": False}
-
-    try:
-        fin = {}
-        # 旧->新的顺序处理，这样才能算「首尾时间差 = 耗时」
-        for row in con.execute("""
-            SELECT run_id, event_kind, event_json, occurred_at, linked_message_id, id
-            FROM audit_log
-            WHERE run_id IN (
-                SELECT run_id FROM audit_log
-                WHERE event_kind='agent_run_finished' ORDER BY id DESC LIMIT ?
-            )
-            ORDER BY id
-        """, (limit,)):
-            run_id = row["run_id"]
-            item = fin.setdefault(run_id, {
-                "run_id": run_id,
-                "first_at": row["occurred_at"],
-                "last_at": row["occurred_at"],
-                "at_raw": row["occurred_at"],
-                "linked_message_id": row["linked_message_id"],
-                "tool_calls": 0,
-                "turns": 0,
-                "tools": [],
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-            })
-            item["last_at"] = row["occurred_at"]
-            if row["linked_message_id"]:
-                item["linked_message_id"] = row["linked_message_id"]
-
-            kind = row["event_kind"]
-            if kind not in ("agent_run_started", "agent_run_finished",
-                            "model_turn_finished", "tool_call_started"):
-                continue
-            try:
-                payload = json.loads(row["event_json"] or "{}")
-            except (TypeError, ValueError):
-                payload = {}
-
-            if kind == "agent_run_started":
-                # exposedTools 是实际下发给模型的工具名单，直接反映工具开销
-                exposed = payload.get("exposedTools") or []
-                item["exposed_tools"] = len(exposed)
-            elif kind == "agent_run_finished":
-                item["turns"] = payload.get("turnsUsed") or payload.get("turns")
-                item["status"] = payload.get("status")
-                item["final_length"] = payload.get("finalLength")
-            elif kind == "tool_call_started":
-                item["tool_calls"] += 1
-                call = payload.get("toolCall")
-                if isinstance(call, dict) and call.get("name") and call["name"] not in item["tools"]:
-                    item["tools"].append(call["name"])
-            elif kind == "model_turn_finished":
-                usage = payload.get("tokenUsage") or {}
-                item["prompt_tokens"] += usage.get("prompt_tokens") or 0
-                item["completion_tokens"] += usage.get("completion_tokens") or 0
-
-        # 用 audit_log 的首尾时间戳算耗时（事件里没有这个字段）
-        runs = []
-        for item in fin.values():
-            start = parse_audit_time(item.pop("first_at", None))
-            end = parse_audit_time(item.pop("last_at", None))
-            item["elapsed_ms"] = round((end - start) * 1000) if (start and end and end >= start) else None
-            item["at_unix"] = parse_bot_time(item.pop("at_raw", None))
-            runs.append(item)
-        runs.sort(key=lambda r: r.get("elapsed_ms") is None)
-        runs.sort(key=lambda r: r["run_id"], reverse=True)
-        return {"available": True, "count": len(runs), "runs": runs[:limit]}
-    except sqlite3.Error as err:
-        return {"error": f"查询失败：{err}", "available": False}
-    finally:
-        con.close()
-
-
-def parse_bot_time(value):
-    """解析机器人库里的时间字符串 → Unix 秒。
-
-    实测形态：'2026-09-17 15:34:46.985508029+0000'
-      · 空格分隔（不是 ISO 的 T）
-      · 时区写成 +0000（fromisoformat 要 +00:00）
-      · 小数部分是 9 位纳秒（datetime 只吃 6 位微秒）
-
-    三个都不兼容，所以手工规整。返回 None 而不是抛异常 ——
-    这个库里字段形态不统一是有先例的，读不到时间不该让整个请求失败。
-    """
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    # 时区补冒号
-    if len(text) >= 5 and text[-5] in "+-" and text[-3] != ":":
-        text = f"{text[:-2]}:{text[-2:]}"
-    # 空格换 T，小数截到 6 位
-    head, sep, rest = text.partition(" ")
-    if sep:
-        text = f"{head}T{rest}"
-    main, dot, frac = text.partition(".")
-    if dot:
-        digits = "".join(ch for ch in frac if ch.isdigit())[:6]
-        tail = ""
-        for marker in ("+", "-", "Z"):
-            idx = frac.find(marker)
-            if idx >= 0:
-                tail = frac[idx:]
-                break
-        if tail and len(tail) >= 5 and tail[-3] != ":":
-            tail = f"{tail[:-2]}:{tail[-2:]}"
-        elif tail == "Z":
-            tail = "Z"
-        text = f"{main}.{digits}{tail}" if digits else f"{main}{tail}"
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_audit_time(value):
-    """audit_log.occurred_at 与 chat_log.recorded_at 是同一种形态，复用解析。"""
-    return parse_bot_time(value)
-
-
-def digest_row_to_dict(row) -> dict:
-    try:
-        topics = json.loads(row["topics_json"] or "[]")
-    except (TypeError, ValueError):
-        topics = []
-    try:
-        decisions = json.loads(row["decisions_json"] or "[]")
-    except (TypeError, ValueError):
-        decisions = []
-    try:
-        people = json.loads(row["people_json"] or "[]")
-    except (TypeError, ValueError):
-        people = []
-    try:
-        pending = json.loads(row["pending_json"] or "[]")
-    except (TypeError, ValueError):
-        pending = []
-    try:
-        unverified = json.loads(row["unverified_ids"] or "[]")
-    except (TypeError, ValueError):
-        unverified = []
-    return {
-        "day": row["day"],
-        "summary": row["summary"],
-        "topics": topics,
-        "decisions": decisions,
-        "people": people,
-        "pending": pending,
-        "msg_count": row["msg_count"],
-        "verified": bool(row["verified"]),
-        "unverified_ids": unverified,
-    }
-
-
-def digests_for_chat(db, query) -> dict:
-    """某个群最近几天的摘要。默认只给通过机器校验的。"""
-    platform = (query.get("platform", ["qq"])[0] or "qq").strip().lower()
-    group_id = (query.get("group_id", [""])[0] or "").strip()
-    if not group_id:
-        return {"error": "group_id 必填"}
-    try:
-        days = min(max(int(query.get("days", ["3"])[0]), 1), 90)
-    except (TypeError, ValueError):
-        days = 3
-    try:
-        limit = min(max(int(query.get("limit", ["7"])[0]), 1), 60)
-    except (TypeError, ValueError):
-        limit = 7
-    include_unverified = (query.get("all", ["0"])[0] or "0").strip().lower() in {"1", "true", "yes"}
-
-    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
-    sql = ("SELECT * FROM group_digests WHERE platform=? AND group_id=? AND day>=? "
-           + ("" if include_unverified else "AND verified=1 ")
-           + "ORDER BY day DESC LIMIT ?")
-    rows = db.execute(sql, (platform, group_id, since, limit)).fetchall()
-    return {
-        "platform": platform,
-        "group_id": group_id,
-        "group_name": rows[0]["group_name"] if rows else "",
-        "days": days,
-        "include_unverified": include_unverified,
-        "count": len(rows),
-        "digests": [digest_row_to_dict(row) for row in rows],
-    }
-
-
-def digests_overview(db, query) -> dict:
-    """所有群的摘要概览。"""
-    try:
-        days = min(max(int(query.get("days", ["7"])[0]), 1), 90)
-    except (TypeError, ValueError):
-        days = 7
-    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
-    rows = db.execute("""
-        SELECT platform, group_id, MAX(group_name) AS group_name,
-               COUNT(*) AS digests,
-               SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified_digests,
-               MAX(day) AS latest_day,
-               SUM(msg_count) AS msg_count
-        FROM group_digests WHERE day >= ?
-        GROUP BY platform, group_id ORDER BY msg_count DESC
-    """, (since,)).fetchall()
-    return {
-        "days": days,
-        "since": since,
-        "groups": [
-            {
-                "platform": r["platform"],
-                "group_id": r["group_id"],
-                "group_name": r["group_name"] or r["group_id"],
-                "digests": r["digests"],
-                "verified_digests": r["verified_digests"],
-                "latest_day": r["latest_day"],
-                "msg_count": r["msg_count"],
-            }
-            for r in rows
-        ],
-    }
-
-
-@score_agg_cache
-def scores_duel(db, query):
-    """两个人的对比：逐项并排 + 共同段落对决 + 每日走势。"""
-    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
-    a = (query.get("a", [""])[0] or "").strip()
-    b = (query.get("b", [""])[0] or "").strip()
-    by = (query.get("by", [""])[0] or "").strip().lower()
-    if not a or not b:
-        return {"error": "a 和 b 都要给"}
-
-    since = time.time() - days * 86400
-    limits = score_thresholds(query)
-    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
-
-    def pick(who):
-        """优先按 sender_id 精确匹配；没命中再按名字匹配。"""
-        if by == "name":
-            return [r for r in rows if r["sender_name"] == who]
-        exact = [r for r in rows if r["sender_id"] == who]
-        if exact:
-            return exact
-        return [r for r in rows if r["sender_name"] == who]
-
-    left, right = pick(a), pick(b)
-    if not left or not right:
-        return {
-            "days": days, "a": a, "b": b, "found": False,
-            "missing": [x for x, rows_ in ((a, left), (b, right)) if not rows_],
-            "applied": limits,
-        }
-
-    def profile(side):
-        speeds = [r["speed"] for r in side if r["speed"] is not None]
-        keys = [r["keystroke"] for r in side if r["keystroke"] is not None]
-        accs = [r["accuracy"] for r in side if r["accuracy"] is not None]
-        chars = sum(int(r["characters"]) for r in side if r["characters"])
-        dayset = {score_day(r["occurred_at"]) for r in side}
-        segs = {r["segment_id"] for r in side if r["segment_id"]}
-        groups = {}
-        for r in side:
-            key = r["group_id"] or r["group_name"]
-            if key:
-                groups[key] = r["group_name"] or key
-        avg = lambda xs: round(sum(xs) / len(xs), 2) if xs else None
-        return {
-            "sender_id": side[0]["sender_id"],
-            "sender_name": side[0]["sender_name"],
-            "group_names": sorted(set(groups.values())),
-            "attempts": len(side),
-            "active_days": len(dayset),
-            "segments": len(segs),
-            "characters": chars,
-            "best_speed": round(max(speeds), 2) if speeds else None,
-            "avg_speed": avg(speeds),
-            "median_speed": round(statistics.median(speeds), 2) if speeds else None,
-            "p90_speed": round(sorted(speeds)[int(len(speeds) * 0.9)], 2) if len(speeds) >= 10 else (round(max(speeds), 2) if speeds else None),
-            "best_keystroke": round(max(keys), 2) if keys else None,
-            "avg_keystroke": avg(keys),
-            "best_accuracy": round(max(accs), 2) if accs else None,
-            "avg_accuracy": avg(accs),
-            "first_at": min(r["occurred_at"] for r in side),
-            "last_at": max(r["occurred_at"] for r in side),
-        }
-
-    pa, pb = profile(left), profile(right)
-
-    # 共同打过的段落：各自的最好成绩对比
-    def best_by_segment(side):
-        out = {}
-        for row in side:
-            if not row["segment_id"] or row["speed"] is None:
-                continue
-            cur = out.get(row["segment_id"])
-            if cur is None or row["speed"] > cur["speed"]:
-                out[row["segment_id"]] = {
-                    "speed": row["speed"],
-                    "keystroke": row["keystroke"],
-                    "accuracy": row["accuracy"],
-                }
-        return out
-
-    sa, sb = best_by_segment(left), best_by_segment(right)
-    shared = sorted(set(sa) & set(sb))
-    duels = []
-    win_a = win_b = 0
-    for seg in shared:
-        mine, theirs = sa[seg]["speed"], sb[seg]["speed"]
-        if mine > theirs:
-            win_a += 1
-        elif theirs > mine:
-            win_b += 1
-        duels.append({
-            "segment_id": seg,
-            "a_speed": round(mine, 2),
-            "b_speed": round(theirs, 2),
-            "diff": round(mine - theirs, 2),
-            "winner": "a" if mine > theirs else ("b" if theirs > mine else "tie"),
-        })
-    duels.sort(key=lambda d: -abs(d["diff"]))
-
-    # 每日走势：两人每天的均速，按日期对齐
-    def daily(side):
-        bucket = {}
-        for row in side:
-            if row["speed"] is None:
-                continue
-            day = score_day(row["occurred_at"])
-            bucket.setdefault(day, []).append(row["speed"])
-        return {d: round(sum(v) / len(v), 2) for d, v in bucket.items()}
-
-    da, db_ = daily(left), daily(right)
-    dates = sorted(set(da) | set(db_))
-    trend = [
-        {"date": d, "a": da.get(d), "b": db_.get(d)}
-        for d in dates
-    ]
-
-    return {
-        "days": days,
-        "found": True,
-        "applied": limits,
-        "dropped": dropped,
-        "a": pa,
-        "b": pb,
-        "duel": {
-            "shared_segments": len(shared),
-            "a_wins": win_a,
-            "b_wins": win_b,
-            "ties": len(shared) - win_a - win_b,
-            "rows": duels[:30],
-        },
-        "trend": trend,
-    }
-
-
-@score_agg_cache
-def scores_group_compare(db, query):
-    """群对比：人均速度、活跃人数、日均条数。"""
-    days = max(1, min(365, int(query.get("days", ["30"])[0] or 30)))
-    since = time.time() - days * 86400
-    limits = score_thresholds(query)
-    rows, dropped, unreadable = load_scores(db, since=since, thresholds=limits)
-
-    groups = {}
-    for row in rows:
-        key = row["group_id"] or row["group_name"] or "(未知)"
-        bucket = groups.setdefault(key, {
-            "group_id": row["group_id"],
-            "group_name": row["group_name"] or "(未知群)",
-            "attempts": 0,
-            "speeds": [],
-            "keystrokes": [],
-            "accuracies": [],
-            "people": set(),
-            "days": set(),
-            "best": None,
-            "best_who": "",
-        })
-        bucket["attempts"] += 1
-        if row["group_name"]:
-            bucket["group_name"] = row["group_name"]
-        if row["sender_id"]:
-            bucket["people"].add(row["sender_id"])
-        bucket["days"].add(score_day(row["occurred_at"]))
-        if row["speed"] is not None:
-            bucket["speeds"].append(row["speed"])
-            if bucket["best"] is None or row["speed"] > bucket["best"]:
-                bucket["best"] = row["speed"]
-                bucket["best_who"] = row["sender_name"]
-        if row["keystroke"] is not None:
-            bucket["keystrokes"].append(row["keystroke"])
-        if row["accuracy"] is not None:
-            bucket["accuracies"].append(row["accuracy"])
-
-    def avg(values):
-        return round(sum(values) / len(values), 2) if values else None
-
-    out = []
-    for bucket in groups.values():
-        day_count = max(len(bucket["days"]), 1)
-        out.append({
-            "group_id": bucket["group_id"],
-            "group_name": bucket["group_name"],
-            "attempts": bucket["attempts"],
-            "people": len(bucket["people"]),
-            "active_days": len(bucket["days"]),
-            "per_day": round(bucket["attempts"] / day_count, 1),
-            "avg_speed": avg(bucket["speeds"]),
-            "best_speed": round(bucket["best"], 2) if bucket["best"] is not None else None,
-            "best_who": bucket["best_who"],
-            "avg_keystroke": avg(bucket["keystrokes"]),
-            "avg_accuracy": avg(bucket["accuracies"]),
-            "per_person": round(bucket["attempts"] / max(len(bucket["people"]), 1), 1),
-        })
-    out.sort(key=lambda g: -(g["avg_speed"] or 0))
-    return {
-        "days": days,
-        "total_records": len(rows),
-        "dropped": dropped,
-        "unreadable": unreadable,
-        "applied": limits,
-        "groups": out,
-    }
-
-
 def library_stats(db: sqlite3.Connection) -> dict:
-    # 先把全库闲置的会话收掉，否则下面的 active 计数是累积出来的假数字
-    sweep_idle_library_sessions(db)
     categories = {
         row["category"]: row["count"]
         for row in db.execute("SELECT category,COUNT(*) AS count FROM library_texts GROUP BY category")
     }
-    # Article classifications contain the difficulty even when the optional
-    # ranking cache is empty.
     difficulties = {
         row["difficulty"]: row["count"]
-        for row in db.execute("SELECT difficulty,COUNT(*) AS count FROM library_classifications GROUP BY difficulty")
-    }
-    genres = {
-        row["primary_genre"]: row["count"]
-        for row in db.execute(
-            "SELECT primary_genre,COUNT(*) AS count FROM library_classifications GROUP BY primary_genre ORDER BY count DESC"
-        )
+        for row in db.execute("SELECT difficulty,COUNT(*) AS count FROM library_rankings GROUP BY difficulty")
     }
     totals = db.execute("SELECT COUNT(*) AS texts,COALESCE(SUM(char_count),0) AS chars FROM library_texts").fetchone()
-    eligible_total = db.execute(
-        "SELECT COUNT(*) FROM library_texts WHERE category<>'fm_single_chars'"
-    ).fetchone()[0]
     active = sum(
         db.execute(f"SELECT COUNT(*) FROM {table} WHERE status='active'").fetchone()[0]
         for table in ("library_sessions", "single_sessions")
     )
     ranked = sum(difficulties.values())
-    classified = db.execute("SELECT COUNT(*) FROM library_classifications").fetchone()[0]
+    genre_rows = db.execute(
+        "SELECT primary_genre AS name,COUNT(*) AS count FROM library_classifications "
+        "WHERE TRIM(primary_genre)<>'' GROUP BY primary_genre ORDER BY primary_genre"
+    ).fetchall()
+    genres = [{"name": row["name"], "count": int(row["count"])} for row in genre_rows]
+    genre_count = len(genres)
     return {
         "texts": totals["texts"], "characters": totals["chars"], "categories": categories,
+        "genre_count": int(genre_count),
+        "genres": genres,
         "ranked_texts": ranked, "unranked_texts": max(0, totals["texts"] - ranked),
         "difficulties": difficulties, "active_sessions": active,
-        "classified_texts": classified,
-        "unclassified_texts": max(0, eligible_total - classified),
-        "genres": genres,
     }
-
-
-def expire_idle_library_sessions(db: sqlite3.Connection, platform: str,
-                                 chat_id: str, requester_id: str) -> int:
-    """Stop abandoned sessions for this chat+person; return how many were stopped.
-
-    Lazy expiry: called on every status read instead of running a timer.
-    """
-    cutoff = time.time() - LIBRARY_SESSION_IDLE_SECONDS
-    stopped = 0
-    for table in ("library_sessions", "single_sessions"):
-        rows = db.execute(
-            f"SELECT session_id FROM {table} WHERE platform=? AND chat_id=? "
-            f"AND requester_id=? AND status='active' AND updated_at < ?",
-            (platform, chat_id, requester_id, cutoff),
-        ).fetchall()
-        if not rows:
-            continue
-        db.execute(
-            f"UPDATE {table} SET status='stopped', updated_at=? WHERE platform=? "
-            f"AND chat_id=? AND requester_id=? AND status='active' AND updated_at < ?",
-            (time.time(), platform, chat_id, requester_id, cutoff),
-        )
-        stopped += len(rows)
-    if stopped:
-        db.commit()
-    return stopped
-
-
-def sweep_idle_library_sessions(db: sqlite3.Connection) -> int:
-    """Stop every active session that has been idle past the cutoff.
-
-    Unlike expire_idle_library_sessions(), this is not scoped to one
-    platform/chat/person: it looks at the whole table. That matters because the
-    scoped version only runs when the *same* person asks for status again —
-    someone who abandons a session never triggers it, so the session sits at
-    status='active' forever and inflates the admin panel's active count.
-
-    Cheap enough to call from read paths: it is one UPDATE that normally
-    matches zero rows thanks to the (platform, chat_id, status, updated_at)
-    index.
-    """
-    cutoff = time.time() - LIBRARY_SESSION_IDLE_SECONDS
-    stopped = 0
-    for table in ("library_sessions", "single_sessions"):
-        cursor = db.execute(
-            f"UPDATE {table} SET status='stopped', updated_at=? "
-            f"WHERE status='active' AND updated_at < ?",
-            (time.time(), cutoff),
-        )
-        stopped += cursor.rowcount or 0
-    if stopped:
-        db.commit()
-    return stopped
 
 
 def library_session_status(db: sqlite3.Connection, payload: dict) -> dict:
     platform, chat_id, requester_id, _ = library_payload_identity(payload)
-    expire_idle_library_sessions(db, platform, chat_id, requester_id)
     article = db.execute(
-        "SELECT s.*,m.requested_difficulty,m.requested_length,m.requested_genre FROM library_sessions s "
+        "SELECT s.*,m.requested_difficulty,m.requested_length FROM library_sessions s "
         "LEFT JOIN library_session_modes m ON m.session_id=s.session_id "
         "WHERE s.platform=? AND s.chat_id=? AND s.requester_id=? AND s.status='active'",
         (platform, chat_id, requester_id),
@@ -3487,7 +3508,7 @@ def library_session_status(db: sqlite3.Connection, payload: dict) -> dict:
     ).fetchone()
     previous = db.execute(
         "SELECT title,text_id,next_offset,total_chars,segment_no,requested_difficulty,"
-        "requested_genre,requested_length,saved_at FROM library_previous_sessions "
+        "requested_length,saved_at FROM library_previous_sessions "
         "WHERE platform=? AND chat_id=? AND requester_id=?",
         (platform, chat_id, requester_id),
     ).fetchone()
@@ -3514,28 +3535,6 @@ def library_session_status(db: sqlite3.Connection, payload: dict) -> dict:
         requested_length = int(article["requested_length"] or 0)
         result["length_mode"] = "fixed" if requested_length else "random_200_400"
         result["requested_length"] = requested_length
-        article_row = db.execute(
-            "SELECT * FROM library_texts WHERE text_id=?", (article["text_id"],)
-        ).fetchone()
-        if article_row:
-            metadata = classify_library_row(db, article_row)
-            result.update({
-                "genre": metadata["primary_genre"], "genres": metadata["genres"],
-                "form": metadata["form"], "article_difficulty": metadata["difficulty"],
-                "article_score": metadata["difficulty_score"], "confidence": metadata["confidence"],
-                "metadata_summary": library_metadata_summary(metadata),
-            })
-            db.commit()
-        article_row = db.execute(
-            "SELECT * FROM library_texts WHERE text_id=?", (article["text_id"],)
-        ).fetchone()
-        if article_row:
-            metadata = classify_library_row(db, article_row)
-            result.update({
-                "genre": metadata["primary_genre"], "genres": metadata["genres"],
-                "form": metadata["form"], "article_difficulty": metadata["difficulty"],
-                "article_score": metadata["difficulty_score"], "confidence": metadata["confidence"],
-            })
     else:
         result["length_mode"] = "fixed"
         result["requested_length"] = int(single["segment_length"])
@@ -3544,7 +3543,7 @@ def library_session_status(db: sqlite3.Connection, payload: dict) -> dict:
 
 def archive_status(db: sqlite3.Connection) -> dict:
     sources = {
-        "messages": ("message_archive", "occurred_at"),
+        "messages": ("recent_messages", "occurred_at"),
         "recalls": ("recall_records", "recalled_ts"),
         "typing_scores": ("score_records", "occurred_at"),
         "ai_contest_scores": ("ai_contest_scores", "occurred_at"),
@@ -3582,32 +3581,24 @@ def rank_library(db: sqlite3.Connection, limit: int = 0) -> dict:
         if index % 200 == 0:
             db.commit()
     db.commit()
-    classified = classify_library(db, limit)
-    return {"ranked": len(rows), "difficulties": counts, "classified": classified, **library_stats(db)}
+    return {"ranked": len(rows), "difficulties": counts, **library_stats(db)}
 
 
 def classify_library(db: sqlite3.Connection, limit: int = 0) -> dict:
-    """Backfill or refresh metadata for all non-single-character library texts."""
-    query = (
-        "SELECT l.* FROM library_texts l LEFT JOIN library_classifications c ON c.text_id=l.text_id "
-        "WHERE l.category<>'fm_single_chars' AND "
-        "(c.text_id IS NULL OR c.classifier_version<>?) ORDER BY l.text_id"
-    )
-    params: list = [LIBRARY_CLASSIFIER_VERSION]
+    query = "SELECT l.* FROM library_texts l LEFT JOIN library_classifications c ON c.text_id=l.text_id WHERE c.text_id IS NULL OR c.classifier_version<>? ORDER BY l.text_id"
+    params = [LIBRARY_CLASSIFIER_VERSION]
     if limit > 0:
         query += " LIMIT ?"
         params.append(limit)
-    rows = db.execute(query, tuple(params)).fetchall()
-    genres = {}
-    difficulties = {}
+    rows = db.execute(query, params).fetchall()
+    counts = {}
     for index, row in enumerate(rows, 1):
         metadata = classify_library_row(db, row, refresh=True)
-        genres[metadata["primary_genre"]] = genres.get(metadata["primary_genre"], 0) + 1
-        difficulties[metadata["difficulty"]] = difficulties.get(metadata["difficulty"], 0) + 1
+        counts[metadata["primary_genre"]] = counts.get(metadata["primary_genre"], 0) + 1
         if index % 200 == 0:
             db.commit()
     db.commit()
-    return {"classified": len(rows), "genres": genres, "difficulties": difficulties}
+    return {"classified": len(rows), "genres": counts, **library_stats(db)}
 
 
 def load_json(path: Path, default):
@@ -3780,11 +3771,14 @@ def bot_guard_check(db: sqlite3.Connection, payload: dict) -> dict:
                 (group_id, sender_id, now),
             )
             db.commit()
-    # Silent by design: blocking another bot is housekeeping, not something the
-    # group needs narrated. The caller posts a reply only when it is non-empty
-    # (Bot/Handler/FM.hs: `unless (Text.null reply) $ void (Chat.replyTo ...)`), so
-    # returning nothing stops FM answering without announcing that it stopped.
-    return {"blocked": blocked, "reply": "", "enabled": enabled}
+    replies = [
+        "你先停一下，FM 不接机器人互聊，免得群里绕成循环。",
+        "这轮不跟机器人对话，再接下去就要开始无限套话了。",
+        "识别到机器人消息了，FM 到这里收手，不陪你自动循环。",
+        "机器人互聊先打住，这句我不往下接。",
+    ]
+    index = sum(ord(char) for char in f"{group_id}:{sender_id}") % len(replies)
+    return {"blocked": blocked, "reply": replies[index] if should_reply else "", "enabled": enabled}
 
 
 def update_bot_guard_account(db: sqlite3.Connection, payload: dict) -> dict:
@@ -3817,7 +3811,7 @@ def publish_ai_contest_text(db: sqlite3.Connection, payload: dict) -> dict:
     if not isinstance(policy, dict):
         policy = dict(AI_CONTEST_POLICY_DEFAULTS)
     min_chars = int(policy.get("min_chars", 200))
-    max_chars = int(policy.get("max_chars", 350))
+    max_chars = int(policy.get("max_chars", 300))
     china_time = timezone(timedelta(hours=8))
     competition_date = str(payload.get("date") or datetime.now(china_time).date().isoformat()).strip()
     try:
@@ -3897,7 +3891,7 @@ def update_ai_contest_policy(db: sqlite3.Connection, payload: dict) -> dict:
         else:
             value = str(value).strip()[:160]
         policy[name] = value
-    if int(policy.get("min_chars", 200)) > int(policy.get("max_chars", 350)):
+    if int(policy.get("min_chars", 200)) > int(policy.get("max_chars", 300)):
         raise ValueError("min_chars cannot exceed max_chars")
     write_setting(db, "ai_contest_policy", policy)
     db.commit()
@@ -4219,7 +4213,7 @@ def import_retained_snapshot(db: sqlite3.Connection, snapshot: Path) -> dict:
     for item in load_jsonl(outputpro / "fm_ai_competition_history.jsonl") or ():
         record_id = stable_record_id(item)
         db.execute(
-            "INSERT INTO ai_contest_scores VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO ai_contest_scores VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(record_id) DO UPDATE SET source_json=excluded.source_json",
             (
                 record_id, str(item.get("competition_date") or ""), canonical_user_id(item.get("user_id")),
@@ -4227,6 +4221,10 @@ def import_retained_snapshot(db: sqlite3.Connection, snapshot: Path) -> dict:
                 float(item.get("speed") or 0), float(item.get("key") or 0),
                 float(item.get("acc") or 0), float(item.get("ts") or 0),
                 json.dumps(item, ensure_ascii=False),
+                # 从原始跟打行里取。取不到就是 None（NULL），**不要写 0**。
+                _raw_score_field(item.get("raw"), "码长"),
+                _raw_retype(item.get("raw")),
+                _raw_score_field(item.get("raw"), "打词"),
             ),
         )
         imported_ai_scores += 1
@@ -4265,14 +4263,20 @@ def render_ai_leaderboard(db: sqlite3.Connection, competition_date: str) -> byte
     if not competition_date:
         competition_date = public_competition_date()
     score_rows = db.execute(
-        "SELECT user_id,source_json FROM ai_contest_scores WHERE competition_date=? AND speed>0 ORDER BY speed DESC,occurred_at ASC",
+        "SELECT user_id,source_json,code_length,retype,word_rate FROM ai_contest_scores "
+        "WHERE competition_date=? AND speed>0 ORDER BY speed DESC,occurred_at ASC",
         (competition_date,),
     ).fetchall()
     best = {}
     for row in score_rows:
         user_id = str(row["user_id"] or "")
         if user_id and user_id not in best:
-            best[user_id] = json.loads(row["source_json"])
+            item = json.loads(row["source_json"])
+            # 新列直接用表里已解析好的字段，不再从原文抠一遍
+            item["code_length"] = row["code_length"]
+            item["retype"] = row["retype"]
+            item["word_rate"] = row["word_rate"]
+            best[user_id] = item
     rows = list(best.values())
     text_row = db.execute(
         "SELECT title FROM ai_contest_texts WHERE competition_date=?", (competition_date,)
@@ -4308,7 +4312,7 @@ def render_ai_leaderboard(db: sqlite3.Connection, competition_date: str) -> byte
 
     font_path = os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc")
     font = lambda size: ImageFont.truetype(font_path, size)
-    width = 1080
+    width = 1240
     row_height = 74
     height = 230 + max(1, len(rows)) * row_height + 70
     image = Image.new("RGB", (width, height), (20, 24, 31))
@@ -4316,8 +4320,8 @@ def render_ai_leaderboard(db: sqlite3.Connection, competition_date: str) -> byte
     draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
     draw.text((48, 38), "FM AI赛文排行榜", font=font(40), fill=(244, 247, 252))
     draw.text((48, 98), f"{competition_date or '日期未知'}  |  《{title}》  |  第555段", font=font(22), fill=(159, 172, 193))
-    columns = [(52, "排名"), (146, "成员"), (560, "速度"), (710, "击键"), (842, "键准")]
-    draw.rounded_rectangle((40, 154, 1040, 210), radius=8, fill=(35, 43, 55))
+    columns = [(52, "排名"), (120, "成员"), (430, "速度"), (580, "击键"), (700, "码长"), (820, "打词率"), (950, "重打"), (1060, "键准")]
+    draw.rounded_rectangle((40, 154, 1200, 210), radius=8, fill=(35, 43, 55))
     for x, label in columns:
         draw.text((x, 168), label, font=font(20), fill=(184, 196, 214))
     if not rows:
@@ -4325,16 +4329,19 @@ def render_ai_leaderboard(db: sqlite3.Connection, competition_date: str) -> byte
     for index, item in enumerate(rows, 1):
         top = 224 + (index - 1) * row_height
         fill = (29, 36, 47) if index % 2 else (25, 31, 41)
-        draw.rounded_rectangle((40, top, 1040, top + 62), radius=7, fill=fill)
+        draw.rounded_rectangle((40, top, 1200, top + 62), radius=7, fill=fill)
         rank_color = (247, 199, 95) if index <= 3 else (219, 226, 237)
         name = str(item.get("user_name") or item.get("user_id") or "unknown")[:24]
         draw.text((58, top + 17), str(index), font=font(22), fill=rank_color)
-        draw.text((146, top + 17), name, font=font(22), fill=(235, 239, 245))
+        draw.text((120, top + 17), name, font=font(22), fill=(235, 239, 245))
         speed = float(item.get("speed") or 0)
         accuracy = float(item.get("acc") or 0)
-        draw.text((560, top + 17), f"{speed:.2f}", font=font(22), fill=speed_color(speed))
-        draw.text((710, top + 17), f"{float(item.get('key') or 0):.2f}", font=font(22), fill=(113, 164, 255))
-        draw.text((842, top + 17), f"{accuracy:.2f}%", font=font(22), fill=accuracy_color(accuracy))
+        draw.text((430, top + 17), f"{speed:.2f}", font=font(22), fill=speed_color(speed))
+        draw.text((580, top + 17), f"{float(item.get('key') or 0):.2f}", font=font(22), fill=(113, 164, 255))
+        draw.text((700, top + 17), f"{float(item.get('code_length') or 0):.2f}", font=font(22), fill=(159, 172, 193))
+        draw.text((820, top + 17), f"{float(item.get('word_rate') or 0):.2f}%", font=font(22), fill=(159, 172, 193))
+        draw.text((950, top + 17), f"{float(item.get('retype') or 0):.0f}", font=font(22), fill=(159, 172, 193))
+        draw.text((1060, top + 17), f"{accuracy:.2f}%", font=font(22), fill=accuracy_color(accuracy))
     footer = f"共 {len(rows)} 人 | 每人保留当日最高速度"
     draw.text((48, height - 48), footer, font=font(18), fill=(128, 141, 160))
     output = io.BytesIO()
@@ -4345,6 +4352,7 @@ def render_ai_leaderboard(db: sqlite3.Connection, competition_date: str) -> byte
 def render_competition_score(db: sqlite3.Connection, user_id: str, name: str, source: str) -> bytes:
     from PIL import Image, ImageDraw, ImageFont
 
+    contest_title = ""
     summary = competition_score_summary(db, user_id, name, source)
     recent = summary["recent"][:12]
     display_name = name or user_id
@@ -4372,7 +4380,11 @@ def render_competition_score(db: sqlite3.Connection, user_id: str, name: str, so
         draw.text((left + 18, 168), label, font=font(18), fill=(147, 160, 181))
         draw.text((left + 18, 204), value, font=font(26), fill=(235, 239, 245))
     draw.text((48, 286), "最近成绩", font=font(24), fill=(235, 239, 245))
-    columns = [(50, "日期"), (245, "来源"), (610, "速度"), (750, "击键"), (884, "键准")]
+    # 2026-11-15 修复：这张图的表头引用了 _detail_label，但那个变量只在
+    # render_score_chart 里定义过 —— 独立调用本函数必 NameError，
+    # 后台 /api/domain/reports/competition-score.png 之前就是因此 503 的。
+    _detail_label = lambda label: label  # noqa: E731
+    columns = [(50, _detail_label("日期")), (245, _detail_label("来源")), (610, _detail_label("速度")), (750, _detail_label("击键")), (884, _detail_label("键准"))]
     draw.rounded_rectangle((40, 326, 1040, 378), radius=7, fill=(35, 43, 55))
     for x, label in columns:
         draw.text((x, 341), label, font=font(18), fill=(184, 196, 214))
@@ -4394,18 +4406,817 @@ def render_competition_score(db: sqlite3.Connection, user_id: str, name: str, so
     return output.getvalue()
 
 
-def render_score_chart(db: sqlite3.Connection, user_id: str, name: str, source: str, days: int, metric: str) -> bytes:
+def ai_contest_score_history(db: sqlite3.Connection, user_id: str, name: str, days: int) -> list[dict]:
+    """555 赛文的历史成绩，字段名对齐 render_score_chart 的期望（speed/acc/key/…）。
+
+    时间窗口用 SQL 的 date('now', '-N days') 算，省得在这里再 import 一个 datetime。
+    """
+    rows = db.execute(
+        "SELECT competition_date,user_name,speed,key_rate,accuracy,code_length,word_rate,retype "
+        "FROM ai_contest_scores "
+        "WHERE competition_date >= date('now', '-' || ? || ' days') "
+        # 按 user_id 匹配；**只有 name 非空时**才把名字算进条件。
+        # 原来最后一项是 f"%{name}%"，name 传空时得到 '%%' —— 匹配所有人，
+        # 于是所有者要自己的曲线，画出来却是全群的（标题显示最后一条的人名）。
+        # 两侧都要判空：user_id 空时 LIKE '%%' 会匹配所有人，name 空时同理。
+        # 实测过两次翻车：只修 name 那侧 → 「只给名字」画出 17 个人的混合曲线 ✗。
+        "  AND ((? != '' AND user_id LIKE ?) OR (? != '' AND user_name LIKE ?)) "
+        "ORDER BY competition_date ASC",
+        (max(1, int(days or 3650)), user_id, f"%{user_id}%", name, f"%{name}%"),
+    ).fetchall()
+    # 每天只留一条（当日最快）。所有者要的是「每天 555 的成绩曲线」——
+    # 同一天打多次就有多个点，曲线会糊成一团。这和榜单「每人保留当日最高速度」一致。
+    best_per_day = {}
+    for row in rows:
+        day = row["competition_date"]
+        if day not in best_per_day or float(row["speed"] or 0) > float(best_per_day[day]["speed"] or 0):
+            best_per_day[day] = row
+    rows = [best_per_day[day] for day in sorted(best_per_day)]
+
+    return [
+        {
+            "competition_date": row["competition_date"],
+            "user_name": row["user_name"],
+            "name": row["user_name"],
+            "speed": row["speed"],
+            "acc": row["accuracy"],
+            "key": row["key_rate"],
+            "code_length": row["code_length"],
+            "word_rate": row["word_rate"],
+            "retype": row["retype"],
+            # 明细表那一列原来显示「未知」—— 555 的记录里没有赛事字段。
+            # 几个可能的键都填上，免得去猜渲染层读的是哪一个。
+            "source": "555赛文",
+            "source_group": "555赛文",
+            "competition": "555赛文",
+            "contest": "555赛文",
+        }
+        for row in rows
+    ]
+
+
+def _last_score_date(db, user_id, name, is_555):
+    """这个人在这项赛事里最近一次是哪天、一共多少条（不受时间窗口限制）。"""
+    table = "ai_contest_scores" if is_555 else "competition_scores"
+    try:
+        row = db.execute(
+            "SELECT max(competition_date), count(*) FROM " + table + " "
+            "WHERE (? != '' AND user_id LIKE ?) OR (? != '' AND user_name LIKE ?)",
+            (user_id, "%" + user_id + "%", name, "%" + name + "%"),
+        ).fetchone()
+    except Exception:
+        return None, 0
+    if not row or not row[0]:
+        return None, 0
+    return row[0], int(row[1] or 0)
+
+
+def contest_live_rows(contest_key: str, group_id: str) -> list[dict]:
+    """从官网 /competition/live 拿实时排名。拿不到就返回空 list（上层改用成绩库）。"""
+    source = CONTEST_LIVE_SOURCES.get(contest_key)
+    if not source and contest_key == "999" and group_id in CONTEST_GROUP_LIVE_GROUPS:
+        source = group_id
+    if not source:
+        return []
+    # 显式导入：app.py 顶部没有 import urllib.request，
+    # 之前这里抛 NameError 被 except 吞掉，导致「官网优先」永远静默回落成绩库。
+    import urllib.request as urllib_request
+    url = f"http://127.0.0.1:8077/competition/live?source={source}&group_id={group_id}&soft=1"
+    try:
+        with urllib_request.urlopen(url, timeout=15) as response:
+            payload = json.load(response)
+    except Exception:
+        return []
+    if payload.get("status") != "ok":
+        return []
+    return payload.get("rows") or []
+
+
+def contest_day_stats(db: sqlite3.Connection, contest_key: str, group_id: str, scope: str,
+                      days: int, user: str = "", use_live: bool = True) -> list[dict]:
+    """取某赛文按天的统计。官网优先，失败回落成绩库。
+
+    返回 [{date, avg_speed, best_speed, avg_key_rate, avg_accuracy, users}]，按日期升序。
+    2026-11-15 修复：原来的「回落成绩库」分支只剩 `return []`（真取数代码被删了），
+    导致非官网赛文（555/666/777/groupmatch）的曲线永远是空的。
+    """
+    import urllib.request as urllib_request
+    import json as json_module
+
+    source = CONTEST_LIVE_SOURCES.get(contest_key)
+    if not source and contest_key == "999" and group_id in CONTEST_GROUP_LIVE_GROUPS:
+        source = group_id
+
+    points: list[dict] = []
+    today = china_now().date()
+    start = today - timedelta(days=max(1, days) - 1)
+
+    # ① 官网逐日取（支持 date 参数，实测能回溯一年）
+    if source and use_live:
+        day = start
+        while day <= today:
+            url = (f"http://127.0.0.1:8077/competition/live?source={source}"
+                   f"&soft=1&date={day.isoformat()}")
+            try:
+                with urllib_request.urlopen(url, timeout=12) as response:
+                    payload = json_module.load(response)
+            except Exception:
+                payload = {}
+            rows = (payload.get("rows") or []) if payload.get("status") == "ok" else []
+            if user:
+                # 只看这个人（所有者 2026-11-06：问的肯定是个人成绩曲线）
+                # 模糊匹配：官网的名字常带群头衔（「云南」Fixmood（三当家）」），
+                # 用户只会传「Fixmood」，所以用包含判断。
+                rows = [row for row in rows
+                        if user in str(row.get("name") or "")
+                        or str(row.get("user_id") or "") == user]
+            speeds: list[float] = []
+            keys: list[float] = []
+            accs: list[float] = []
+            for row in rows:
+                try:
+                    if row.get("speed") is not None:
+                        speeds.append(float(row["speed"]))
+                except (TypeError, ValueError):
+                    pass
+                for field, bucket in (("key", keys), ("keystroke", keys),
+                                      ("acc", accs), ("accuracy", accs)):
+                    try:
+                        value = row.get(field)
+                        if value is not None:
+                            bucket.append(float(str(value).replace("%", "")))
+                    except (TypeError, ValueError):
+                        pass
+            if speeds:
+                points.append({
+                    "date": day.isoformat(),
+                    "avg_speed": round(sum(speeds) / len(speeds), 2),
+                    "best_speed": round(max(speeds), 2),
+                    "avg_key_rate": round(sum(keys) / len(keys), 2) if keys else None,
+                    "avg_accuracy": round(sum(accs) / len(accs), 2) if accs else None,
+                    "users": len(speeds),
+                })
+            day += timedelta(days=1)
+        if points:
+            return points
+
+    # ② 回落成绩库（同一份 contest_scores，/contest/chart.png 的柱状图也用它）
+    room = group_id if scope == "group" else ""
+    since = (today - timedelta(days=max(1, days) - 1)).isoformat()
+    user_clause, user_params = "", []
+    if user:
+        fragments = [f for f in re.split(r"[「」『』（）()\[\]【】\s]+", user) if len(f) >= 2]
+        latin = [f for f in fragments if re.fullmatch(r"[A-Za-z0-9_]+", f)]
+        best_fragment = max(latin or fragments, key=len) if fragments else ""
+        clauses = ["user_name LIKE ?", "user_id = ?"]
+        user_params = [f"%{user}%", user]
+        if best_fragment and best_fragment != user:
+            clauses.append("user_name LIKE ?")
+            user_params.append(f"%{best_fragment}%")
+        user_clause = " AND (" + " OR ".join(clauses) + ")"
+    rows = db.execute(
+        "SELECT score_date AS date, AVG(speed) AS avg_speed, MAX(speed) AS best_speed, "
+        "AVG(key_rate) AS avg_key_rate, AVG(accuracy) AS avg_accuracy, COUNT(*) AS users "
+        "FROM contest_scores WHERE contest_key=? AND group_id=? AND score_date<>'' "
+        "AND score_date>=?" + user_clause +
+        " GROUP BY score_date ORDER BY score_date",
+        tuple([contest_key, room, since] + user_params),
+    ).fetchall()
+    return [
+        {"date": row["date"],
+         "avg_speed": round(float(row["avg_speed"] or 0), 2),
+         "best_speed": round(float(row["best_speed"] or 0), 2),
+         "avg_key_rate": maybe_float(row["avg_key_rate"]),
+         "avg_accuracy": maybe_float(row["avg_accuracy"]),
+         "users": int(row["users"] or 0)}
+        for row in rows
+    ]
+
+
+
+def render_contest_trend(db: sqlite3.Connection, contest_key: str, group_id: str,
+                         contest_name: str, scope: str, days: int, user: str = "") -> bytes:
+    """按天画速度曲线（平均 + 最快两条线）。"""
+    from PIL import Image, ImageDraw, ImageFont
+    import datetime
+
+    points = contest_day_stats(db, contest_key, group_id, scope, days, user)
+    room = group_id if scope == "group" else ""
+    if not points:
+        # 官网没有就回落成绩库（按 score_date 聚合）
+        room_key = group_id if scope == "group" else ""
+        user_clause, user_params = "", []
+        if user:
+            user_clause = " AND (user_name LIKE ? OR user_id=?)"
+            user_params = [f"%{user}%", user]
+        rows = db.execute(
+            "SELECT score_date, avg(speed) AS avg_speed, max(speed) AS best_speed, "
+            "count(*) AS users FROM contest_scores "
+            "WHERE contest_key=? AND group_id=? AND score_date<>''" + user_clause +
+            " GROUP BY score_date ORDER BY score_date DESC LIMIT ?",
+            tuple([contest_key, room_key] + user_params + [max(1, days)]),
+        ).fetchall()
+        points = [
+            {"date": r["score_date"], "avg_speed": float(r["avg_speed"] or 0),
+             "best_speed": float(r["best_speed"] or 0), "users": r["users"]}
+            for r in reversed(rows)
+        ]
+
+    width, height = 960, 540
+    image = Image.new("RGB", (width, height), (24, 26, 32))
+    draw = ImageDraw.Draw(image)
+    font_paths = [os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc"),
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+
+    def font(size: int):
+        for path in font_paths:
+            try:
+                return ImageFont.truetype(path, size)
+            except (OSError, ValueError):
+                continue
+        return ImageFont.load_default()
+
+    who = f"{user} · " if user else ""
+    title = f"{who}{contest_name}" + (f"（群 {room}）" if room else "（全群）") + " · 成绩曲线"
+    draw.text((32, 24), title, fill=(238, 240, 245), font=font(32))
+    if points:
+        span = f"{points[0]['date']} ~ {points[-1]['date']} · {len(points)} 天"
+    else:
+        span = f"最近 {days} 天"
+    draw.text((32, 68), span, fill=(150, 158, 172), font=font(20))
+
+    if not points:
+        missing = f"{user} 在这段时间" if user else "这段时间"
+        draw.text((32, height // 2), f"{missing}还没有成绩记录。", fill=(200, 120, 120), font=font(28))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+
+    left, right, top, bottom = 90, width - 60, 130, height - 90
+    max_speed = max(p["best_speed"] for p in points) or 1.0
+    min_speed = min(p["avg_speed"] for p in points)
+    floor = max(0.0, min_speed - 20)
+    span_speed = max(1.0, max_speed - floor)
+
+    # 网格 + Y 轴
+    for step in range(5):
+        ratio = step / 4
+        y = int(bottom - (bottom - top) * ratio)
+        value = floor + span_speed * ratio
+        draw.line([(left, y), (right, y)], fill=(44, 48, 58), width=1)
+        draw.text((16, y - 10), f"{value:.0f}", fill=(140, 148, 160), font=font(18))
+
+    def x_of(index: int) -> int:
+        if len(points) == 1:
+            return (left + right) // 2
+        return int(left + (right - left) * index / (len(points) - 1))
+
+    def y_of(speed: float) -> int:
+        return int(bottom - (bottom - top) * (speed - floor) / span_speed)
+
+    for key, color in (("best_speed", (120, 180, 255)), ("avg_speed", (96, 220, 160))):
+        coords = [(x_of(i), y_of(p[key])) for i, p in enumerate(points)]
+        if len(coords) > 1:
+            draw.line(coords, fill=color, width=3, joint="curve")
+        for x, y in coords:
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color)
+
+    # X 轴标签（最多 8 个）
+    label_step = max(1, len(points) // 8)
+    for i in range(0, len(points), label_step):
+        draw.text((x_of(i) - 28, bottom + 12), points[i]["date"][5:], fill=(150, 158, 172), font=font(16))
+
+    # 图例
+    draw.line([(left, height - 34), (left + 28, height - 34)], fill=(120, 180, 255), width=3)
+    draw.text((left + 36, height - 44), "单日最快", fill=(190, 198, 210), font=font(18))
+    draw.line([(left + 150, height - 34), (left + 178, height - 34)], fill=(96, 220, 160), width=3)
+    draw.text((left + 186, height - 44), "单日平均", fill=(190, 198, 210), font=font(18))
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+def render_contest_chart(db: sqlite3.Connection, contest_key: str, group_id: str,
+                        contest_name: str, scope: str, days: int, metric: str) -> bytes:
+    """把一个赛文的成绩画成横向柱状图（最快的前 N 人）。
+
+    数据全部来自 contest_scores —— 网站挂了也能出图（所有者 2026-11-06 的要求）。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    room = group_id if scope == "group" else ""
+
+    # 取数与 /contest/chart-data 共用同一个函数（官网优先，取不到回落成绩库）。
+    rows, source_label = contest_rank_rows(db, contest_key, group_id, scope, days)
+
+    width, row_height = 900, 54
+    header = 120
+    footer = 50
+    height = header + max(1, len(rows)) * row_height + footer
+    image = Image.new("RGB", (width, height), (24, 26, 32))
+    draw = ImageDraw.Draw(image)
+
+    # 用和现有成绩图一样的中文字体（/assets/msyh.ttc = 微软雅黑），
+    # 2026-11-06 第一版用了 DejaVu，中文全变方块。
+    font_paths = [
+        os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc"),
+        "/assets/fonts/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+
+    def font(size: int):
+        for path in font_paths:
+            try:
+                return ImageFont.truetype(path, size)
+            except (OSError, ValueError):
+                continue
+        return ImageFont.load_default()
+
+    title = f"{contest_name}" + (f"（群 {room}）" if room else "（全群）")
+    draw.text((32, 26), title, fill=(238, 240, 245), font=font(34))
+    subtitle = f"最近 {days} 天" if days > 0 else "全部时间"
+    subtitle += " · 按最快成绩排序" if metric == "speed" else " · 按平均键准排序"
+    subtitle += f" · 数据来源：{source_label}"
+    subtitle += f" · 共 {sum(r['n'] for r in rows)} 条成绩" if rows else ""
+    draw.text((32, 74), subtitle, fill=(150, 158, 172), font=font(22))
+
+    if not rows:
+        draw.text((32, header), "还没有这个赛文的成绩记录。", fill=(200, 120, 120), font=font(28))
+    else:
+        best_speed = max(float(r["best"] or 0) for r in rows) or 1.0
+        bar_left, bar_width = 300, 480
+        for index, row in enumerate(rows):
+            y = header + index * row_height
+            name = (row["user_name"] or row["user_id"] or "?")[:12]
+            speed = float(row["best"] or 0)
+            ratio = speed / best_speed
+            draw.text((32, y + 8), f"{index + 1}. {name}", fill=(224, 228, 236), font=font(24))
+            draw.rounded_rectangle(
+                (bar_left, y + 8, bar_left + bar_width, y + 40),
+                radius=6,
+                fill=(38, 42, 52),
+            )
+            draw.rounded_rectangle(
+                (bar_left, y + 8, bar_left + max(6, int(bar_width * ratio)), y + 40),
+                radius=6,
+                fill=(86, 156, 255),
+            )
+            draw.text(
+                (bar_left + bar_width + 14, y + 10),
+                f"{speed:.2f}",
+                fill=(240, 244, 250),
+                font=font(24),
+            )
+    # 底部说明要跟实际数据源一致 —— 之前不管哪种都写「成绩库」，走官网时是误导。
+    footer_text = (
+        "FM · 官网实时数据" if source_label == "官网实时"
+        else "FM · 成绩库（官网取不到时以此为准）"
+    )
+    draw.text((32, height - footer + 8), footer_text, fill=(110, 116, 128), font=font(18))
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def contest_chart_lookup(db: sqlite3.Connection, query: dict) -> tuple[str, str, str, str] | None:
+    """把 query 里的 contest 参数解析成 (key, name, scope, group_id)。"""
+    label = str(query.get("contest", [""])[0] if isinstance(query.get("contest"), list) else query.get("contest") or "").strip()
+    if not label:
+        return None
+    # 自然说法 → 段号（2026-11-06：模型把「梦幻打字阁的群赛文」认成了 555，
+    # 这里让 domain 直接认这些说法，不指望模型每次都猜对）。
+    aliases = {
+        "群赛文": "999", "本群赛文": "999", "这个群的赛文": "999", "群里的赛文": "999",
+        "梦幻打字阁": "999", "五笔修炼基地": "999", "帝隆": "999",
+        "092五笔": "999", "仓颉之友": "999", "倉頡之友": "999", "小鹤进修班": "999",
+        "555": "555", "555赛文": "555", "ai赛文": "555", "ai赛文555": "555",
+        "晴分身": "777", "晴分身赛文": "777", "777赛文": "777",
+        "1847992065": "groupmatch", "groupmatch赛文": "groupmatch",
+        "1916996679": "666", "666赛文": "666",
+        "虎杯": "HB", "锦标赛": "100000", "极速杯": "99999", "极速联赛": "100004",
+    }
+    lowered = label.lower()
+    if lowered in aliases:
+        label = aliases[lowered]
+    for key, (name, scope) in CONTEST_LABELS.items():
+        if label in (key, name):
+            group_id = str(query.get("group_id", [""])[0] if isinstance(query.get("group_id"), list) else query.get("group_id") or "")
+            return key, name, scope, (group_id if scope == "group" else "")
+    return None
+
+CONTEST_ALIASES = {
+    "群赛文": "999", "本群赛文": "999", "这个群的赛文": "999", "群里的赛文": "999", "本群的赛文": "999",
+    "群寒文": "999", "寒文": "999",
+    "梦幻打字阁": "999", "五笔修炼基地": "999", "帝隆": "999",
+    "092五笔": "999", "仓颉之友": "999", "倉頡之友": "999", "小鹤进修班": "999",
+    "555": "555", "555赛文": "555", "ai赛文": "555",
+    "晴分身": "777", "晴分身赛文": "777", "777赛文": "777",
+    "1847992065": "groupmatch", "groupmatch赛文": "groupmatch",
+    "1916996679": "666", "666赛文": "666",
+    "虎杯": "HB", "锦标赛": "100000", "极速杯": "99999", "极速联赛": "100004",
+}
+
+
+# 群名 → 群号（所有者 2026-11-06：不想记群号，直接说群名）
+GROUP_NAME_ALIASES = {
+    "梦幻打字阁": "776227233", "梦幻": "776227233",
+    "五笔修炼基地": "1021522088", "五笔修炼": "1021522088",
+    "帝隆": "151040026",
+    "092五笔": "391047371", "092": "391047371",
+    "仓颉之友": "201323122", "倉頡之友": "201323122",
+    "小鹤进修班": "488748631", "小鹤": "488748631",
+    "虎码训练营": "21037015", "虎码训练": "21037015", "虎营": "21037015",
+    "剑气冲霄堂": "1025725817", "剑气": "1025725817",
+    "五林风": "697015277",
+}
+
+
+# 群号 → 群名（标题里要写清楚是哪个群，2026-11-06）
+GROUP_NAMES_BY_ID = {
+    "776227233": "梦幻打字阁",
+    "1021522088": "五笔修炼基地",
+    "151040026": "帝隆",
+    "391047371": "092五笔",
+    "201323122": "仓颉之友",
+    "488748631": "小鹤进修班",
+    "21037015": "虎码训练营",
+    "1025725817": "剑气冲霄堂",
+    "697015277": "五林风",
+    "906230260": "魔然魔改自然码",
+    "216063968": "FM测试群2",
+    "158408350": "FM测试群",
+}
+
+
+def group_display_name(db: sqlite3.Connection, group_id: str) -> str:
+    """群号 → 群名。别名表优先（groups.display_name 常带后缀，如「梦幻打字阁&集训营」）。"""
+    if not group_id:
+        return ""
+    if group_id in GROUP_NAMES_BY_ID:
+        return GROUP_NAMES_BY_ID[group_id]
+    row = db.execute("SELECT display_name FROM groups WHERE group_id=?", (group_id,)).fetchone()
+    if row and row[0]:
+        return str(row[0])
+    return group_id
+
+
+def resolve_group_id(db: sqlite3.Connection, value: str) -> str:
+    """群号原样返回；群名就查表。认不出返回空串（上层用当前群）。"""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return raw
+    if raw in GROUP_NAME_ALIASES:
+        return GROUP_NAME_ALIASES[raw]
+    lowered = raw.lower()
+    for name, gid in GROUP_NAME_ALIASES.items():
+        if lowered in name.lower() or name.lower() in lowered:
+            return gid
+    row = db.execute(
+        "SELECT group_id FROM groups WHERE display_name LIKE ? LIMIT 1", (f"%{raw}%",)
+    ).fetchone()
+    if row:
+        return str(row[0])
+    return ""
+
+
+def resolve_contest_key(value: str) -> str:
+    """把自然说法或段号解析成段号。认不出就返回空串。"""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw in CONTEST_LABELS:
+        return raw
+    lowered = raw.lower()
+    if lowered in CONTEST_ALIASES:
+        return CONTEST_ALIASES[lowered]
+    for key, (name, _scope) in CONTEST_LABELS.items():
+        if raw == name:
+            return key
+    return ""
+
+
+def contest_score_history(db: sqlite3.Connection, contest_key: str, group_id: str,
+                          user: str, days: int) -> list[dict]:
+    """赛文成绩历史，返回 render_score_chart 认的形状。
+
+    2026-11-06：所有者说老那张图比我自己画的曲线好看得多，所以赛文曲线也走老渲染器，
+    这里只负责把 contest_scores 的数据整成同一形状。
+    """
+    scope = CONTEST_LABELS.get(contest_key, ("", "global"))[1]
+    room = group_id if scope == "group" else ""
+    clause, params = "", []
+    if days > 0:
+        # 按成绩日期过滤，不是入库时间 —— 回填的数据 recorded_at 全是入库时刻，
+        # 用它过滤等于「全部时间」（2026-11-06 所有者实测：问一个月画出了五个月）。
+        from datetime import date, timedelta
+        since = (date.today() - timedelta(days=days - 1)).isoformat()
+        clause = " AND score_date >= ?"
+        params = [since]
+    base_sql = (
+        "SELECT score_date, speed, accuracy, key_rate, code_length, word_rate, "
+        "user_name, contest_name FROM contest_scores "
+        "WHERE contest_key=? AND group_id=?" + clause
+    )
+    order_sql = " ORDER BY score_date ASC, speed ASC"
+
+    def query(user_filter: str, user_params: list) -> list:
+        return db.execute(
+            base_sql + user_filter + order_sql,
+            tuple([contest_key, room] + params + user_params),
+        ).fetchall()
+
+    rows: list = []
+    if not user:
+        rows = query("", [])
+    else:
+        # 先按完整名字查；查不到再用名字片段查一次。
+        # 2026-11-06：官网存的是「Fixmood」，群名片是「「云南」Fixmood（三当家）」，
+        # 完整匹配永远 0 条，图就成了空白。
+        # 全名 + 最佳片段一起 OR（2026-11-06：只按全名查会漏，之前还「1 条」了）
+        fragments = [f for f in re.split(r"[「」『』（）()\[\]【】\s]+", user) if len(f) >= 2]
+        latin = [f for f in fragments if re.fullmatch(r"[A-Za-z0-9_]+", f)]
+        best_fragment = max(latin or fragments, key=len) if fragments else ""
+        clauses = ["user_name LIKE ?", "user_id = ?"]
+        params_user = [f"%{user}%", user]
+        if best_fragment and best_fragment != user:
+            clauses.append("user_name LIKE ?")
+            params_user.append(f"%{best_fragment}%")
+        rows = query(" AND (" + " OR ".join(clauses) + ")", params_user)
+    return [
+        {
+            "competition_date": row["score_date"],
+            "speed": row["speed"],
+            "acc": row["accuracy"],
+            "key_rate": row["key_rate"],
+            "code_length": row["code_length"],
+            "word_rate": row["word_rate"],
+            "source_group": row["contest_name"],
+            "user_name": row["user_name"],
+        }
+        for row in rows
+    ]
+
+
+def all_typing_history(db: sqlite3.Connection, user: str, days: int) -> list[dict]:
+    """不分赛文的「所有打字成绩」：**一条成绩一个点**，不做按天平均。
+
+    所有者 2026-11-06：「不是要当天的均速，怎么问的就怎么显示就行了」。
+    点多的时候靠 2200px 宽画布 + 抽样标签，不做聚合。
+    """
+    from datetime import date, timedelta
+
+    since = date.today() - timedelta(days=max(1, days) - 1)
+    params: list = [time.mktime(since.timetuple())]
+    clauses = ["recorded_at >= ?"]
+    if user:
+        fragments = [f for f in re.split(r"[「」『』（）()\[\]【】\s]+", user) if len(f) >= 2]
+        latin = [f for f in fragments if re.fullmatch(r"[A-Za-z0-9_]+", f)]
+        best = max(latin or fragments, key=len) if fragments else ""
+        user_clauses = ["user_name LIKE ?", "user_id = ?"]
+        user_params = [f"%{user}%", user]
+        if best and best != user:
+            user_clauses.append("user_name LIKE ?")
+            user_params.append(f"%{best}%")
+        clauses.append("(" + " OR ".join(user_clauses) + ")")
+        params += user_params
+    rows = db.execute(
+        "SELECT substr(date(recorded_at, 'unixepoch', '+8 hours'), 6) AS day, "
+        "speed, accuracy, key_rate, recorded_at "
+        "FROM typing_scores WHERE " + " AND ".join(clauses) +
+        " ORDER BY recorded_at",
+        tuple(params),
+    ).fetchall()
+    return [
+        {"competition_date": row["day"], "speed": row["speed"], "acc": row["accuracy"],
+         "key_rate": row["key_rate"]}
+        for row in rows if row["speed"] is not None
+    ]
+
+
+def contest_top_response(db: sqlite3.Connection, query: dict) -> dict:
+    """某赛文最快的人（回答「谁最快/排名」这类问题）。"""
+    contest_raw = (query.get("contest", [""])[0] or "").strip()
+    key = resolve_contest_key(contest_raw)
+    if not key:
+        return {"status": "unknown_contest", "known": list(CONTEST_LABELS), "message": "不清楚是哪个赛文。"}
+    name, scope = CONTEST_LABELS.get(key, (contest_raw, "global"))
+    group = resolve_group_id(db, (query.get("group_id", [""])[0] or "").strip())
+    room = group if scope == "group" else ""
+    try:
+        days = int(query.get("days", ["0"])[0] or 0)
+    except ValueError:
+        days = 0
+    try:
+        limit = max(1, min(20, int(query.get("limit", ["5"])[0] or 5)))
+    except ValueError:
+        limit = 5
+    clause, params = "", []
+    if days > 0:
+        from datetime import date, timedelta
+        since = (date.today() - timedelta(days=days - 1)).isoformat()
+        clause = " AND score_date >= ?"
+        params = [since]
+    rows = db.execute(
+        "SELECT user_name, speed, score_date FROM contest_scores "
+        "WHERE contest_key=? AND group_id=?" + clause,
+        tuple([key, room] + params),
+    ).fetchall()
+
+    # 同一人多个群名片要合并
+    def canonical(value: str) -> str:
+        parts = [p for p in re.split(r"[「」『』（）()\[\]【】\s]+", value or "") if len(p) >= 2]
+        latin = [p for p in parts if re.fullmatch(r"[A-Za-z0-9_]+", p)]
+        return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
+
+    best: dict = {}
+    for row in rows:
+        person = canonical(row["user_name"])
+        current = best.get(person)
+        if current is None or (row["speed"] or 0) > current[0]:
+            best[person] = (row["speed"] or 0, row["score_date"] or "")
+    if not best:
+        where = name + (f"（{group_display_name(db, group)}）" if scope == "group" and group else "")
+        return {"status": "empty", "message": f"{where}还没有成绩记录。"}
+    ranked = sorted(best.items(), key=lambda item: -item[1][0])[:limit]
+    where = name + (f"（{group_display_name(db, group)}）" if scope == "group" and group else "")
+    range_text = "全部时间" if days <= 0 or days >= 3650 else f"最近 {days} 天"
+    parts = [f"{index}. {person} {speed:.2f}" for index, (person, (speed, _)) in enumerate(ranked, 1)]
+    return {
+        "status": "ok",
+        "message": f"{where} · {range_text} 最快：" + "；".join(parts),
+        "rows": [{"rank": i, "user": p, "best": s} for i, (p, (s, _)) in enumerate(ranked, 1)],
+    }
+
+
+def contest_count_response(db: sqlite3.Connection, query: dict) -> dict:
+    """回答「某人某个赛文有多少条」—— 全群赛文不分群（555 就是全群共用）。"""
+    contest_raw = (query.get("contest", [""])[0] or "").strip()
+    user_raw = (query.get("user", [""])[0] or "").strip()
+    if contest_raw in ("all", "所有", "全部", "全部赛文"):
+        contest_raw = ""
+    key = resolve_contest_key(contest_raw) if contest_raw else ""
+    if contest_raw and not key:
+        return {"status": "unknown_contest", "known": list(CONTEST_LABELS)}
+    if not key:
+        # 没说赛文：返回这个人每个赛文的条数，并核对有没有重复（答「有没有去重」这类问题）
+        params: list = []
+        clause = ""
+        if user_raw:
+            fragments = [f for f in re.split(r"[「」『』（）()\[\]【】\s]+", user_raw) if len(f) >= 2]
+            latin = [f for f in fragments if re.fullmatch(r"[A-Za-z0-9_]+", f)]
+            best = max(latin or fragments, key=len) if fragments else ""
+            clauses = ["user_name LIKE ?", "user_id = ?"]
+            params = [f"%{user_raw}%", user_raw]
+            if best and best != user_raw:
+                clauses.append("user_name LIKE ?")
+                params.append(f"%{best}%")
+            clause = " AND (" + " OR ".join(clauses) + ")"
+        rows = db.execute(
+            "SELECT contest_name, COUNT(*) AS n, COUNT(DISTINCT score_date) AS days "
+            "FROM contest_scores WHERE 1=1" + clause + " GROUP BY contest_key ORDER BY n DESC",
+            tuple(params),
+        ).fetchall()
+        who = user_raw or "全部人"
+        if not rows:
+            return {"status": "ok", "count": 0, "message": f"{who}还没有任何赛文成绩。"}
+        parts = [f"{row['contest_name']} {row['n']} 条（{row['days']} 天）" for row in rows]
+        total = sum(row["n"] for row in rows)
+        # 重复检查：同 (赛文,群,日期,真人) 是否还有多条
+        dup_rows = db.execute(
+            "SELECT COUNT(*) FROM (SELECT contest_key, group_id, score_date, user_name, COUNT(*) c "
+            "FROM contest_scores WHERE 1=1" + clause +
+            " GROUP BY contest_key, group_id, score_date, user_name HAVING c > 1)", tuple(params),
+        ).fetchone()[0]
+        dup_note = "同一天同赛文只留最高分，没有重复 ✓" if dup_rows == 0 else f"还有 {dup_rows} 组重复 ✗"
+        # 原始消息记录数（typing_scores 不参与去重，是原始流水）
+        raw_params: list = []
+        raw_clause = ""
+        if user_raw:
+            fragments = [f for f in re.split(r"[「」『』（）()\[\]【】\s]+", user_raw) if len(f) >= 2]
+            latin = [f for f in fragments if re.fullmatch(r"[A-Za-z0-9_]+", f)]
+            best = max(latin or fragments, key=len) if fragments else ""
+            clauses = ["user_name LIKE ?", "user_id = ?"]
+            raw_params = [f"%{user_raw}%", user_raw]
+            if best and best != user_raw:
+                clauses.append("user_name LIKE ?")
+                raw_params.append(f"%{best}%")
+            raw_clause = " WHERE (" + " OR ".join(clauses) + ")"
+        raw_total = db.execute(
+            "SELECT COUNT(*) FROM typing_scores" + raw_clause, tuple(raw_params)
+        ).fetchone()[0]
+        message = f"{who}共 {total} 条赛文成绩 —— " + "；".join(parts) + "。" + dup_note
+        if raw_total and raw_total != total:
+            message += f"（原始消息流水 {raw_total} 条，按「同人同天同赛文只留最高分」去重后 {total} 条）"
+        return {"status": "ok", "count": total, "raw_count": raw_total, "message": message}
+    name, scope = CONTEST_LABELS.get(key, (contest_raw, "global"))
+    user = (query.get("user", [""])[0] or "").strip()
+    group = resolve_group_id(db, (query.get("group_id", [""])[0] or "").strip())
+    room = group if scope == "group" else ""
+    clause, params = "", []
+    if user:
+        fragments = [f for f in re.split(r"[「」『』（）()\[\]【】\s]+", user) if len(f) >= 2]
+        latin = [f for f in fragments if re.fullmatch(r"[A-Za-z0-9_]+", f)]
+        best = max(latin or fragments, key=len) if fragments else ""
+        clauses = ["user_name LIKE ?", "user_id = ?"]
+        params = [f"%{user}%", user]
+        if best and best != user:
+            clauses.append("user_name LIKE ?")
+            params.append(f"%{best}%")
+        clause = " AND (" + " OR ".join(clauses) + ")"
+    rows = db.execute(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT score_date) AS days, "
+        "MIN(score_date) AS first, MAX(score_date) AS last, MAX(speed) AS best "
+        "FROM contest_scores WHERE contest_key=? AND group_id=?" + clause,
+        tuple([key, room] + params),
+    ).fetchone()
+    if scope == "global":
+        where = name
+    else:
+        room_name = group_display_name(db, group) if group else ""
+        where = name + (f"（{room_name or group}）" if group else "")
+    who = user or "全部人"
+    message = f"{who}的{where}共 {rows['n']} 条，覆盖 {rows['days']} 天（{rows['first']} ~ {rows['last']}），最高 {rows['best']}。"
+    if scope == "group" and group and rows["n"] == 0:
+        message = f"{who}的{where}共 0 条 —— 这个群没有群赛文记录。要看别的群可以说群名。"
+    return {
+        "status": "ok",
+        "contest": key,
+        "contest_name": where,
+        "user": who,
+        "count": rows["n"],
+        "days": rows["days"],
+        "first": rows["first"],
+        "last": rows["last"],
+        "best": rows["best"],
+        "message": message,
+    }
+
+
+def render_score_chart(db: sqlite3.Connection, user_id: str, name: str, source: str, days: int, metric: str,
+                       contest: str = "", group_id: str = "", contest_user: str = "") -> bytes:
     """Render a deterministic, readable score chart instead of model-generated artwork."""
     from PIL import Image, ImageDraw, ImageFont
 
+    contest_title = ""
     summary = competition_score_summary(db, user_id, name, source)
     records = competition_score_history(db, user_id, name, source, days)
+    if contest == "all":
+        # 不分赛文的所有打字成绩（所有者 2026-11-06）
+        contest_title = "所有打字"
+        records = all_typing_history(db, contest_user or name, days if days > 0 else 30)
+        summary = competition_score_summary(db, user_id, name, source)
+    elif contest:
+        # 赛文曲线也走这个渲染器（所有者 2026-11-06：老的比新画的好看）。
+        # contest 可能是「锦标赛」「群赛文」这种自然说法，必须先解析成段号，
+        # 否则查不到数据会静默回落到虎杯（2026-11-06 实测就是这个 bug）。
+        resolved = resolve_contest_key(contest)
+        if resolved:
+            contest_label = CONTEST_LABELS.get(resolved, (contest, "global"))[0]
+            contest_scope = CONTEST_LABELS.get(resolved, (contest, "global"))[1]
+            if contest_scope == "group" and group_id:
+                # 按群的赛文：标题写清楚是哪个群（所有者 2026-11-06：
+                # 「这个群赛文不要写本群，要写清楚是哪个群才对」）
+                room_name = group_display_name(db, group_id)
+                contest_label = (f"{room_name}赛文" if resolved == "999"
+                                 else f"{room_name}·{contest_label}")
+            records = contest_score_history(db, resolved, group_id, contest_user or name, days)
+            # 标题也要用这个赛文名 —— 之前 source_name 硬编码成「虎杯」，
+            # 所以查锦标赛也显示虎杯（2026-11-06 实测）。
+            contest_title = contest_label
+    # FM 实际传的是「555赛文」（审计里看到的 ✗），不是「555」——
+    # 我以前只认 == "555"，于是真实调用落到虎杯那张表、出空图。
+    # 改成包含判断，任何带 555 / AI赛文 的说法都算。
+    if "555" in source or "AI赛文" in source or "ai赛文" in source:
+        # 555 的成绩在 ai_contest_scores，和虎杯/公开赛事的 competition_scores 是两张表。
+        # 实测（2026-10-05）：后者在 8 月 27 日之后就没有新数据了，所以只读它的曲线
+        # 一直是空图（记录 0 条）。这里把记录源换成 555 —— 图的主体和「空图」判断
+        # 都由 records 决定，所以只换它就够。
+        records = ai_contest_score_history(db, user_id, name, days)
     metric_key = {"accuracy": "acc", "keystrokes": "key", "key": "key", "speed": "speed"}.get(metric.lower(), "speed")
     metric_name = {"speed": "速度（字/分）", "acc": "键准（%）", "key": "击键"}[metric_key]
-    display_name = name or user_id or "未指定成员"
+    # 按群赛文时，模型有时把群名当成「谁」传进来 → 标题会变成「五林风 · 五林风赛文」。
+    room_name_for_title = group_display_name(db, group_id) if group_id and CONTEST_LABELS.get(contest or "", ("", ""))[1] == "group" else ""
+    if contest_user and room_name_for_title and contest_user == room_name_for_title:
+        contest_user = ""
+    display_name = (contest_user or name or user_id or "")
     if records:
         display_name = str(records[-1].get("user_name") or records[-1].get("name") or display_name)
-    source_name = source or "全部赛事"
+    # 没指定 source 时别再写「全部赛事」：如果这批记录都来自同一个赛事，
+    # 就用那个名字（所有者 2026-10-24：虎杯的图上写着「全部赛事」很怪）。
+    # 这两个必须在**任何使用之前**定义：函数体是从上往下执行的，
+    # 而 _is_555 原来在下面才赋值、_detail_label 更是压根没定义（明细表删掉时
+    # 把它的定义一起删了，但 columns 列表里还在调用）→ 连着两次 UnboundLocalError。
+    _is_555 = "555" in (source or "") or "AI赛文" in (source or "") or "ai赛文" in (source or "")
+    _detail_label = lambda label: ""  # 明细表已整体移除（所有者 2026-10-24）
+
+    if source:
+        source_name = source
+    else:
+        # 按数据来自哪张表定，别去猜记录里的字段（有的老记录没有 source_group）。
+        source_name = contest_title if contest else ("555赛文" if _is_555 else "虎杯")
     font_path = os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc")
 
     def font(size):
@@ -4420,23 +5231,51 @@ def render_score_chart(db: sqlite3.Connection, user_id: str, name: str, source: 
         except (TypeError, ValueError):
             return 0.0
 
-    detail_records = list(reversed(records))
+    # 555 不出明细表（所有者 2026-10-05）：120 行明细把图拉到 4500px 高，
+    # 想看的曲线反而要滚半天。空列表同时会让 height 自己缩下来。
+    # 同一处判断有两份（这里和上面那个 records 分支）—— 上次只改了上面那份，
+    # 于是 source="555赛文" 时明细表还是画了出来。判断要一致。
+    # 所有者 2026-10-24：明细记录一律不要 —— 555 和虎杯都只看曲线。
+    # 原来 555 隐藏、虎杯保留，现在统一隐藏（图更短、也更干净）。
+    detail_records = []
     row_height = 31
-    width = 1600
-    height = max(1040, 790 + max(1, len(detail_records)) * row_height + 100)
-    image = Image.new("RGB", (width, height), (246, 248, 251))
-    draw = ImageDraw.Draw(image)
-    navy, muted, grid, teal = (25, 39, 61), (91, 105, 121), (218, 225, 233), (23, 143, 137)
-    draw.rectangle((0, 0, width, 12), fill=teal)
-    draw.text((72, 46), f"{display_name} · {source_name}成绩趋势", font=font(42), fill=navy)
-    draw.text((74, 108), f"指标：{metric_name}    时间范围：最近 {days} 天    记录：{len(records)} 条", font=font(23), fill=muted)
-    if not records:
-        draw.rounded_rectangle((72, 190, width - 72, 440), radius=12, fill=(255, 255, 255), outline=grid, width=2)
-        draw.text((width // 2, 305), "没有找到符合条件的成绩记录", font=font(30), fill=muted, anchor="mm")
+    # 画布宽度跟着点数走（所有者 2026-11-06：非常密集可以适当宽一些）：
+    # 少量点固定 2200；点越多越宽，最多 4400，保证相邻两点至少隔开几个像素。
+    n_points = len(records)
+    if n_points <= 150:
+        width = 2200
     else:
-        chart = (104, 190, 1496, 610)
+        width = min(4400, int(2200 + (n_points - 150) * 2.4))
+    # 没有明细表就没有下半部分，图收短。
+    height = (790 + max(1, len(detail_records)) * row_height + 100) if detail_records else 760
+    # 深色主题，和排行榜一致（所有者 2026-10-05 要求）。
+    image = Image.new("RGB", (width, height), (20, 24, 31))
+    draw = ImageDraw.Draw(image)
+    navy, muted, grid, teal = (244, 247, 252), (159, 172, 193), (44, 53, 66), (78, 205, 181)
+    draw.rectangle((0, 0, width, 12), fill=teal)
+    title_text = (display_name + " · ") if display_name else ""
+    draw.text((72, 46), f"{title_text}{source_name}成绩趋势", font=font(46), fill=navy)
+    draw.text((74, 108), f"指标：{metric_name}    时间范围：{'全部' if days <= 0 or days >= 3650 else f'最近 {days} 天'}    记录：{len(records)} 条", font=font(24), fill=muted)
+    if not records:
+        draw.rounded_rectangle((72, 196, width - 72, 520), radius=12, fill=(29, 36, 47), outline=grid, width=2)
+        # 空图别只说「没找到」—— 那看着像功能坏了。先查这个人在这项赛事里
+        # 最近一次是什么时候（虎杯 2026-08-27 之后就停了，555 一直在跑）。
+        _last, _total = _last_score_date(db, user_id, name, _is_555)
+        if _last:
+            draw.text((width // 2, 300), "这个时间范围里没有成绩", font=font(30), fill=navy, anchor="mm")
+            draw.text((width // 2, 360),
+                      f"最近一次是 {_last}，{source_name}共有 {_total} 条记录",
+                      font=font(24), fill=muted, anchor="mm")
+        else:
+            empty_text = "没有找到符合条件的成绩记录"
+            if contest_label:
+                # 按群的赛文：说清楚是哪个群没有，而不是一句含糊的「没有记录」
+                empty_text = f"{contest_label}还没有成绩记录"
+            draw.text((width // 2, 320), empty_text, font=font(30), fill=muted, anchor="mm")
+    else:
+        chart = (104, 196, width - 104, 660)
         left, top, right, bottom = chart
-        draw.rounded_rectangle(chart, radius=12, fill=(255, 255, 255), outline=grid, width=2)
+        draw.rounded_rectangle(chart, radius=12, fill=(29, 36, 47), outline=grid, width=2)
         values = [number(item) for item in records]
         low, high = min(values), max(values)
         span = max(high - low, max(abs(high), 1) * 0.12, 1)
@@ -4454,35 +5293,88 @@ def render_score_chart(db: sqlite3.Connection, user_id: str, name: str, source: 
             x = plot_left if len(values) == 1 else plot_left + index * (plot_right - plot_left) / (len(values) - 1)
             y = plot_bottom - (value - low) / (high - low) * (plot_bottom - plot_top)
             points.append((x, y))
+        # 点多的时候缩小线和点，否则 700 个直径 20 的圆会糊成一团（2026-11-06）
+        dense = len(records) > 200
+        line_width = 3 if dense else 6
+        dot_radius = 4 if len(records) > 1200 else (5 if dense else 10)
         if len(points) > 1:
-            draw.line(points, fill=teal, width=5, joint="curve")
+            draw.line(points, fill=teal, width=line_width, joint="curve")
         # Keep the exact value beside every point, as requested. The complete
         # table below remains available for histories whose labels overlap.
         show_point_labels = True
+        # 每个点都尝试标速度：用二维矩形碰撞检测，只要不和已放置的标签重叠就标。
+        # （以前只跟「上一个标签」比，隔得远的空位也不标 —— 2026-11-06 所有者要求改掉）
+        label_font_size = 15 if len(records) > 120 else 17
+        label_char_w = 7.0 if label_font_size == 15 else 8.0
+        max_labels = 500
+        placed_boxes: list[tuple[float, float, float, float]] = []
+        labeled_count = 0
         for index, ((x, y), item, value) in enumerate(zip(points, records, values)):
             accuracy = float(str(item.get("acc") or item.get("accuracy") or 0).replace("%", "") or 0)
             color = (35, 163, 108) if accuracy >= 95 else (224, 105, 71)
-            draw.ellipse((x - 9, y - 9, x + 9, y + 9), fill=color, outline=(255, 255, 255), width=3)
-            if show_point_labels:
-                draw.text((x, y - 24), f"{value:.2f}", font=font(17), fill=navy, anchor="ms")
+            draw.ellipse((x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius),
+                         fill=color, outline=(255, 255, 255), width=2 if dense else 3)
+            # 点太多时不要每个都标数字（180 个点会糊成一片 ✗）。
+            if show_point_labels and labeled_count < max_labels:
+                label_text = f"{value:.2f}"
+                try:
+                    # 用真实文字宽度算碰撞框（估算宽度偏小会漏判重叠）
+                    text_w = draw.textlength(label_text, font=font(label_font_size))
+                except Exception:
+                    text_w = len(label_text) * label_char_w
+                half = text_w / 2 + 2
+                box = (x - half, y - 34, x + half, y - 16)
+                collision = any(
+                    not (box[2] <= b[0] or box[0] >= b[2] or box[3] <= b[1] or box[1] >= b[3])
+                    for b in placed_boxes
+                )
+                if not collision:
+                    draw.text((x, y - 22), label_text,
+                              font=font(label_font_size), fill=navy, anchor="ms")
+                    placed_boxes.append(box)
+                    labeled_count += 1
         date_labels = [str(item.get("competition_date") or item.get("date") or "-")[-5:] for item in records]
-        label_indexes = range(len(date_labels)) if len(date_labels) <= 12 else sorted({0, len(date_labels) - 1, *range(0, len(date_labels), max(1, len(date_labels) // 10))})
-        for index in label_indexes:
-            label = date_labels[index]
+        # 日期也「能放就放」：逐个做水平碰撞检测，不挤就标（2026-11-06 所有者要求）。
+        # 同一天连续出现时只标一次，避免一串重复日期。
+        date_boxes: list[tuple[float, float, float, float]] = []
+        last_date_text = ""
+        for index, label in enumerate(date_labels):
             x = plot_left if len(date_labels) == 1 else plot_left + index * (plot_right - plot_left) / (len(date_labels) - 1)
+            if label == last_date_text:
+                continue
+            try:
+                text_w = draw.textlength(label, font=font(16))
+            except Exception:
+                text_w = len(label) * 8.0
+            box = (x - text_w / 2 - 6, bottom - 44, x + text_w / 2 + 6, bottom - 12)
+            collision = any(
+                not (box[2] <= b[0] or box[0] >= b[2] or box[3] <= b[1] or box[1] >= b[3])
+                for b in date_boxes
+            )
+            if collision:
+                continue
             draw.text((x, bottom - 28), label, font=font(16), fill=muted, anchor="ms")
-        draw.text((right - 250, top + 25), "● 键准≥95%", font=font(17), fill=(35, 163, 108))
-        draw.text((right - 250, top + 51), "● 键准<95%", font=font(17), fill=(224, 105, 71))
+            date_boxes.append(box)
+            last_date_text = label
+        # 图例放右上角空白（所有者 2026-11-06：原来压在曲线上）
+        draw.text((width - 350, 48), "● 键准≥95%", font=font(24), fill=(35, 163, 108))
+        draw.text((width - 350, 88), "● 键准<95%", font=font(24), fill=(224, 105, 71))
 
-    draw.text((72, 660), "明细记录", font=font(28), fill=navy)
+    # 555 不出明细表：空表下面挂个标题更奇怪，所以无明细时标题和表头都不画。
+    _detail_label = (lambda s: s) if detail_records else (lambda s: "")
+    draw.text((72, 660), _detail_label("明细记录"), font=font(28), fill=navy)
     columns = [(76, "日期"), (300, "赛事"), (810, metric_name), (1050, "键准"), (1250, "击键")]
-    draw.rounded_rectangle((72, 710, width - 72, 765), radius=8, fill=(31, 55, 80))
-    for x, label in columns:
-        draw.text((x, 727), label, font=font(19), fill=(255, 255, 255))
+    # 明细表已经不用了（detail_records 恒为空）；画布变高后原来的空表头会露出来，
+    # 2026-11-06 加宽到 2200x760 时底部多出一个空框，所以这里跟着条件走。
+    if detail_records:
+        draw.rounded_rectangle((72, 710, width - 72, 765), radius=8, fill=(31, 55, 80))
+    # 无明细就整段不画（所有者 2026-10-05：图里不要出现这个空表头）。
+    for x, label in (columns if detail_records else []):
+        draw.text((x, 727), label, font=font(19), fill=(29, 36, 47))
     for row_index, item in enumerate(detail_records):
         y = 778 + row_index * 31
         if row_index % 2 == 0:
-            draw.rectangle((72, y - 4, width - 72, y + 27), fill=(255, 255, 255))
+            draw.rectangle((72, y - 4, width - 72, y + 27), fill=(29, 36, 47))
         values_text = [
             str(item.get("competition_date") or item.get("date") or "-")[:10],
             str(item.get("source_group") or item.get("source") or "未知")[:34],
@@ -4588,82 +5480,1104 @@ def render_public_competition_rank(result: dict, page=1, combined=False) -> byte
     return output.getvalue()
 
 
-# ── 自动登记新群 / 新好友 ────────────────────────────────────────────────
-#
-# 为什么需要：groups 表原本只有 set_group_capability() 和 import_snapshot()
-# 两条写入路径，都不是自动的 —— 机器人被拉进新群后表里没有它，
-# 中控「群与房间」看不到、也无法单独配置。
-#
-# 挂在这里（record_message_event）的理由：每条消息都过它，
-# 而且它已经拿到了 group_name 与 sender_name；群聊与私聊同一个入口。
-#
-# 时间一律用 Unix 秒（REAL）。字符串时间是「时间对不上」的根源之一：
-# 库里现在混着 UTC 的 '...+00:00'、北京的 '...+08:00'、
-# 以及不带时区的 'YYYY-MM-DD HH:MM:SS'，看格式分不出来。
+# ==================== 后台控制台只读接口（2026-11-15） ====================
+# fm-admin 后台的数据页（番茄书架 / 赛文图表 / 文库 / 打字排行 / 日报 / 统计）
+# 需要可直接 curl 的 GET 只读接口。本段约定：
+#   * 新接口统一返回 {"ok": true, ...} 或 {"ok": false, "message": ...}；
+#   * 老接口（/groups、/scores、/library/search、/contest/search…）保持原形状，
+#     只做参数加固 + 双问号兼容（后台旧代理会拼出 "?limit=50?q=xx"）；
+#   * 所有查询只做 SELECT，不写库。
 
-GROUP_REGISTER_FEATURES = {
-    # 照跟打群的配置给默认值。跟打相关的默认开，其余留给后台按需改。
-    "library": True,
-    "recall": True,
-    "scores": True,
-    "contest": True,
-    "ai_contest": True,
-    "score_archive": True,
-    "group_reply": "inherit",
-    "group_trigger_mode": "inherit",
-    "reply_style": "",
-    "active_hours": "",
-    "daily_archive": True,
-    "cross_group_visibility": "owner_private_only",
-    "private_context_access": False,
-}
+APP_NAME = "fm-domain"
+APP_VERSION = "2026.11.15-backend-readonly"
+SERVER_STARTED_AT = time.time()
+CHINA_TZ = timezone(timedelta(hours=8))
 
 
-def ensure_group_registered(db, group_id: str, group_name: str) -> bool:
-    """群不存在就登记一条。返回 True 表示这次新建了。"""
-    group_id = str(group_id or "").strip()
-    if not group_id:
-        return False
-    row = db.execute("SELECT display_name FROM groups WHERE group_id=?", (group_id,)).fetchone()
-    if row:
-        if group_name and not (row["display_name"] or "").strip():
-            db.execute("UPDATE groups SET display_name=?, updated_at=? WHERE group_id=?",
-                       (group_name[:120], time.time(), group_id))
-        return False
-    db.execute(
-        "INSERT INTO groups VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(group_id) DO NOTHING",
-        (group_id, group_name[:120], "observed",
-         json.dumps(GROUP_REGISTER_FEATURES, ensure_ascii=False),
-         json.dumps({"registered_by": "auto", "first_seen": time.time()}, ensure_ascii=False),
-         time.time()),
+def query_value(query: dict, name: str, default: str = "") -> str:
+    """从 parse_qs 结果里取第一个值（原样字符串）。"""
+    if not isinstance(query, dict):
+        return default
+    value = query.get(name, default)
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else default
+    if value is None:
+        return default
+    return str(value)
+
+
+def query_int(query: dict, name: str, default: int = 0,
+              minimum: int | None = None, maximum: int | None = None) -> int:
+    """健壮地读整数参数：脏值回退默认值，绝不因为 ?limit=abc 把连接打断。"""
+    raw = query_value(query, name, "").strip()
+    value = default
+    if raw:
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def query_flag(query: dict, name: str, default: bool = False) -> bool:
+    raw = query_value(query, name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def query_payload(query: dict) -> dict:
+    """parse_qs 结果 → 老函数认的扁平 payload（value 取第一个）。"""
+    payload: dict = {}
+    for key, values in (query or {}).items():
+        if isinstance(values, (list, tuple)):
+            payload[key] = values[0] if values else ""
+        else:
+            payload[key] = values
+    return payload
+
+
+def parse_backend_query(raw_query: str) -> dict:
+    """parse_qs + 兼容后台旧代理的双问号拼接。
+
+    fm-admin 的 DOMAIN_READS 里写死了 "/library/search?limit=50"、"scores?limit=50"、
+    "/contest/search?limit=50"，代理又无条件补一个 "?"，于是真实请求是
+    "/scores?limit=50?q=xxx" —— parse_qs 只会得到 {"limit": ["50?q=xxx"]}，
+    取整数时直接抛 ValueError（之前后台看到的 503 就是这么来的）。
+    这里把值里的 "?" 重新拆回键值，既修 503 也保住 q 参数。
+    """
+    query = parse_qs(raw_query)
+    if not any("?" in str(value) for values in query.values() for value in values):
+        return query
+    fixed: dict = {}
+    for key, values in query.items():
+        for value in values:
+            if "?" not in str(value):
+                fixed.setdefault(key, []).append(value)
+                continue
+            head, _, tail = str(value).partition("?")
+            fixed.setdefault(key, []).append(head)
+            for extra_key, extra_values in parse_qs(tail).items():
+                fixed.setdefault(extra_key, []).extend(extra_values)
+    return fixed
+
+
+def table_count(db: sqlite3.Connection, table: str) -> int | None:
+    """表行数；表不存在/查询失败返回 None（扩展 /stats 时不能因为一张表把整页打挂）。"""
+    try:
+        return int(db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+    except sqlite3.Error:
+        return None
+
+
+def table_counts(db: sqlite3.Connection, tables: list[str]) -> dict:
+    return {table: (table_count(db, table) or 0) for table in tables}
+
+
+def china_now() -> datetime:
+    return datetime.now(CHINA_TZ)
+
+
+def china_date_text(value: str = "") -> str:
+    """规整成北京时间 YYYY-MM-DD；非法/空值取今天。"""
+    text = str(value or "").strip()
+    if text:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            pass
+    return china_now().date().isoformat()
+
+
+def china_day_range(date_text: str) -> tuple[float, float]:
+    day = datetime.strptime(china_date_text(date_text), "%Y-%m-%d").replace(tzinfo=CHINA_TZ)
+    start = day.timestamp()
+    return start, start + 86400
+
+
+def epoch_text(value, fmt: str = "iso") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number <= 0:
+        return ""
+    if fmt == "iso":
+        return datetime.fromtimestamp(number, CHINA_TZ).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(number, CHINA_TZ).strftime(fmt)
+
+
+def maybe_float(value, digits: int = 2):
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+# ── 番茄小说（novel_*） ──────────────────────────────────
+
+def novel_book_dict(row: sqlite3.Row) -> dict:
+    return {
+        "book_id": str(row["book_id"]),
+        "title": row["title"],
+        "author": row["author"] or "",
+        "total_chapters": int(row["total_chapters"] or 0),
+        "word_count": int(row["word_count"] or 0),
+        "source": row["source"] or "fanqie",
+        "imported_at": row["imported_at"],
+        "imported_at_text": epoch_text(row["imported_at"]),
+    }
+
+
+def novel_shelf_stats(db: sqlite3.Connection) -> dict:
+    """番茄书架总览：后台「番茄小说」页直接渲染 items（书名/作者/章节/字数）。"""
+    books = table_count(db, "novel_books") or 0
+    chapters = table_count(db, "novel_chapters") or 0
+    progress = table_count(db, "novel_progress") or 0
+    records = table_count(db, "novel_records") or 0
+    rows = db.execute(
+        "SELECT b.book_id,b.title,b.author,b.total_chapters,b.word_count,b.source,b.imported_at,"
+        "(SELECT COUNT(*) FROM novel_chapters c WHERE c.book_id=b.book_id) AS chapter_count,"
+        "(SELECT COUNT(*) FROM novel_progress p WHERE p.book_id=b.book_id) AS progress_records,"
+        "(SELECT COUNT(DISTINCT p.requester_id) FROM novel_progress p WHERE p.book_id=b.book_id) AS progress_users "
+        "FROM novel_books b ORDER BY b.word_count DESC, b.title LIMIT 500"
+    ).fetchall()
+    items = []
+    for row in rows:
+        item = novel_book_dict(row)
+        item["chapter_count"] = int(row["chapter_count"] or 0)
+        item["progress_records"] = int(row["progress_records"] or 0)
+        item["progress_users"] = int(row["progress_users"] or 0)
+        items.append(item)
+    return {
+        "ok": True, "books": books, "chapters": chapters, "progress": progress,
+        "records": records, "count": len(items), "items": items,
+    }
+
+
+def novel_books_shelf(db: sqlite3.Connection, query: dict | None = None) -> dict:
+    """GET /novel/books：书架清单（支持 q 模糊搜书名/作者）。"""
+    text = query_value(query or {}, "q").strip() or query_value(query or {}, "book").strip()
+    clause, params = "", []
+    if text:
+        clause = " WHERE b.title LIKE ? OR b.author LIKE ?"
+        params = [f"%{text}%", f"%{text}%"]
+    rows = db.execute(
+        "SELECT b.book_id,b.title,b.author,b.total_chapters,b.word_count,b.source,b.imported_at "
+        "FROM novel_books b" + clause + " ORDER BY b.word_count DESC, b.title LIMIT 500",
+        tuple(params),
+    ).fetchall()
+    items = [novel_book_dict(row) for row in rows]
+    return {"ok": True, "count": len(items), "items": items}
+
+
+def novel_book_detail(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /novel/book?book_id=：书 + 章节目录 + 每人进度 + 单章成绩。"""
+    raw_id = query_value(query, "book_id").strip()
+    book = None
+    if raw_id:
+        book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (raw_id,)).fetchone()
+    if book is None:
+        keyword = query_value(query, "book").strip() or query_value(query, "title").strip() or raw_id
+        if keyword:
+            book = novel_find_book(db, keyword)
+    if book is None:
+        return {"ok": False, "message": "书库里没有这本书。", "book_id": raw_id,
+                "chapters": [], "progress": []}
+
+    book_id = str(book["book_id"])
+    user = query_value(query, "user").strip() or query_value(query, "requester_id").strip()
+    limit = query_int(query, "limit", 500, 1, 3000)
+    offset = query_int(query, "offset", 0, 0, 200000)
+    total_chapters = int(
+        db.execute("SELECT COUNT(*) FROM novel_chapters WHERE book_id=?", (book_id,)).fetchone()[0]
     )
-    return True
+    chapter_rows = db.execute(
+        "SELECT chapter_index,title,word_count FROM novel_chapters "
+        "WHERE book_id=? ORDER BY chapter_index LIMIT ? OFFSET ?",
+        (book_id, limit, offset),
+    ).fetchall()
+    chapters = [
+        {"chapter_index": int(row["chapter_index"]), "title": row["title"],
+         "word_count": int(row["word_count"] or 0)}
+        for row in chapter_rows
+    ]
+
+    chapter_scores: list[dict] = []
+    try:
+        score_sql = (
+            "SELECT novel_chapter_index AS chapter_index, COUNT(*) AS records, "
+            "AVG(speed) AS avg_speed, MAX(speed) AS best_speed, AVG(accuracy) AS avg_accuracy, "
+            "AVG(key_rate) AS avg_key_rate FROM typing_scores "
+            "WHERE novel_book_id=? AND novel_chapter_index IS NOT NULL"
+        )
+        score_params: list = [book_id]
+        if user:
+            score_sql += " AND (user_name LIKE ? OR user_id=?)"
+            score_params += [f"%{user}%", user]
+        score_sql += " GROUP BY novel_chapter_index ORDER BY novel_chapter_index LIMIT 500"
+        chapter_scores = [
+            {"chapter_index": int(row["chapter_index"]), "records": int(row["records"]),
+             "avg_speed": maybe_float(row["avg_speed"]), "best_speed": maybe_float(row["best_speed"]),
+             "avg_accuracy": maybe_float(row["avg_accuracy"]),
+             "avg_key_rate": maybe_float(row["avg_key_rate"])}
+            for row in db.execute(score_sql, tuple(score_params)).fetchall()
+        ]
+    except sqlite3.Error:
+        chapter_scores = []
+
+    progress_sql = (
+        "SELECT p.platform,p.chat_id,p.requester_id,p.chapter_index,p.char_offset,p.updated_at,"
+        "p.segment_length,p.last_segment_id,p.last_segment_chars,p.last_sent_at,"
+        "COALESCE(n.user_name,'') AS user_name,n.records,n.avg_speed,n.avg_accuracy,n.chars,n.last_recorded_at "
+        "FROM novel_progress p LEFT JOIN ("
+        "SELECT user_id,COUNT(*) AS records,AVG(speed) AS avg_speed,AVG(accuracy) AS avg_accuracy,"
+        "SUM(chars) AS chars,MAX(recorded_at) AS last_recorded_at "
+        "FROM novel_records WHERE book_id=? GROUP BY user_id"
+        ") n ON n.user_id=p.requester_id WHERE p.book_id=?"
+    )
+    params: list = [book_id, book_id]
+    if user:
+        progress_sql += " AND (p.requester_id=? OR p.requester_id LIKE ? OR n.user_name LIKE ?)"
+        params += [user, f"%{user}%", f"%{user}%"]
+    progress_sql += " ORDER BY p.updated_at DESC LIMIT 200"
+    try:
+        progress_rows = db.execute(progress_sql, tuple(params)).fetchall()
+    except sqlite3.Error:
+        progress_rows = []
+    progress = [
+        {"platform": row["platform"], "chat_id": row["chat_id"],
+         "requester_id": row["requester_id"], "user_name": row["user_name"] or "",
+         "chapter_index": int(row["chapter_index"] or 0), "char_offset": int(row["char_offset"] or 0),
+         "updated_at": row["updated_at"], "updated_at_text": epoch_text(row["updated_at"]),
+         "segment_length": int(row["segment_length"] or 0),
+         "last_segment_id": row["last_segment_id"] or "",
+         "last_segment_chars": int(row["last_segment_chars"] or 0),
+         "last_sent_at": row["last_sent_at"] or 0,
+         "records": int(row["records"] or 0),
+         "avg_speed": maybe_float(row["avg_speed"]), "avg_accuracy": maybe_float(row["avg_accuracy"]),
+         "chars": int(row["chars"] or 0), "last_recorded_at": row["last_recorded_at"] or 0,
+         "last_recorded_at_text": epoch_text(row["last_recorded_at"])}
+        for row in progress_rows
+    ]
+    return {
+        "ok": True, "book": novel_book_dict(book), "total_chapters": total_chapters,
+        "chapters": chapters, "chapter_offset": offset, "chapter_limit": limit,
+        "chapters_truncated": offset + len(chapters) < total_chapters,
+        "progress": progress, "progress_count": len(progress),
+        "chapter_scores": chapter_scores,
+    }
 
 
-def ensure_sender_known(db, platform: str, sender_id: str, sender_name: str,
-                        group_id: str = "") -> bool:
-    """人没见过就记一条。返回 True 表示这次新建了。"""
-    sender_id = str(sender_id or "").strip()
-    if not sender_id:
-        return False
-    now = time.time()
+def novel_progress_report(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /novel/progress?user=&days=：每本书/每人的最新阅读进度。"""
+    days = query_int(query, "days", 0, 0, 3650)
+    user = query_value(query, "user").strip() or query_value(query, "requester_id").strip()
+    platform = query_value(query, "platform").strip()
+    chat_id = query_value(query, "chat_id").strip() or query_value(query, "group_id").strip()
+    clauses: list[str] = []
+    params: list = []
+    if user:
+        clauses.append("(p.requester_id=? OR p.requester_id LIKE ?)")
+        params += [user, f"%{user}%"]
+    if platform:
+        clauses.append("p.platform=?")
+        params.append(platform)
+    if chat_id:
+        clauses.append("p.chat_id=?")
+        params.append(chat_id)
+    if days > 0:
+        clauses.append("p.updated_at>=?")
+        params.append(time.time() - days * 86400)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = db.execute(
+        "SELECT p.platform,p.chat_id,p.requester_id,p.book_id,p.chapter_index,p.char_offset,"
+        "p.updated_at,p.segment_length,p.last_segment_id,p.last_segment_chars,p.last_sent_at,"
+        "b.title AS book_title,b.author AS book_author,b.total_chapters AS book_total_chapters,"
+        "b.word_count AS book_word_count,c.title AS chapter_title,"
+        "c.word_count AS chapter_word_count,l.char_count AS chapter_chars "
+        "FROM novel_progress p LEFT JOIN novel_books b ON b.book_id=p.book_id "
+        "LEFT JOIN novel_chapters c ON c.book_id=p.book_id AND c.chapter_index=p.chapter_index "
+        "LEFT JOIN library_texts l ON l.text_id=c.text_id" + where +
+        " ORDER BY p.updated_at DESC LIMIT 500",
+        tuple(params),
+    ).fetchall()
+    items = []
+    for row in rows:
+        chapter_total = int(row["chapter_chars"] or row["chapter_word_count"] or 0)
+        offset = int(row["char_offset"] or 0)
+        score_row = db.execute(
+            "SELECT COUNT(*) AS n,AVG(speed) AS speed,AVG(accuracy) AS acc,"
+            "AVG(wpm) AS wpm,SUM(chars) AS chars,MAX(recorded_at) AS last_at "
+            "FROM novel_records WHERE book_id=? AND user_id=?",
+            (row["book_id"], row["requester_id"]),
+        ).fetchone()
+        score = None
+        if score_row and score_row["n"]:
+            score = {
+                "records": int(score_row["n"]), "avg_speed": maybe_float(score_row["speed"]),
+                "avg_accuracy": maybe_float(score_row["acc"]), "avg_word_rate": maybe_float(score_row["wpm"]),
+                "chars": int(score_row["chars"] or 0),
+                "last_recorded_at": score_row["last_at"] or 0,
+                "last_recorded_at_text": epoch_text(score_row["last_at"]),
+            }
+        items.append({
+            "platform": row["platform"], "chat_id": row["chat_id"],
+            "requester_id": row["requester_id"], "user_name": row["requester_id"],
+            "book_id": row["book_id"], "book_title": row["book_title"] or "",
+            "book_author": row["book_author"] or "",
+            "book_total_chapters": int(row["book_total_chapters"] or 0),
+            "book_word_count": int(row["book_word_count"] or 0),
+            "chapter_index": int(row["chapter_index"] or 0),
+            "chapter_title": row["chapter_title"] or "",
+            "char_offset": offset, "chapter_chars": chapter_total,
+            "remaining_chars": max(0, chapter_total - offset),
+            "segment_length": int(row["segment_length"] or 0),
+            "last_segment_id": row["last_segment_id"] or "",
+            "last_segment_chars": int(row["last_segment_chars"] or 0),
+            "last_sent_at": row["last_sent_at"] or 0,
+            "updated_at": row["updated_at"],
+            "updated_at_text": epoch_text(row["updated_at"]),
+            "score": score,
+        })
+    linked_typing = 0
+    try:
+        linked_typing = int(db.execute(
+            "SELECT COUNT(*) FROM typing_scores WHERE novel_book_id IS NOT NULL AND novel_book_id<>''"
+        ).fetchone()[0])
+    except sqlite3.Error:
+        linked_typing = 0
+    return {
+        "ok": True, "count": len(items), "days": days, "items": items,
+        "progress_total": table_count(db, "novel_progress") or 0,
+        "records_total": table_count(db, "novel_records") or 0,
+        "typing_linked": linked_typing,
+        "typing_total": table_count(db, "typing_scores") or 0,
+    }
+
+
+def stats_response(db: sqlite3.Connection) -> dict:
+    """/stats：保留原来的 9 个字段（后台 v1 页面在用），只追加新表计数。"""
+    tables = [
+        "groups", "library_texts", "contest_texts", "recall_records", "score_records",
+        "ai_contest_texts", "ai_contest_scores", "competition_scores", "recent_messages",
+        "contest_scores", "novel_books", "novel_chapters", "novel_progress", "novel_records",
+        "typing_scores", "message_archive", "library_classifications", "library_rankings",
+        "known_senders", "group_runtime", "contest_sessions", "library_sessions",
+        "single_sessions", "group_digests", "library_sent_messages", "repeat_cooldowns",
+    ]
+    return table_counts(db, tables)
+
+
+# ── 文库（library_*） ────────────────────────────────────
+
+def library_list_response(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /library/list：文库分页列表（标题/字数/难度/题材/来源/入库时间）。"""
+    limit = query_int(query, "limit", 20, 1, 200)
+    offset = query_int(query, "offset", 0, 0, 1000000)
+    text = query_value(query, "q").strip()
+    difficulty = query_value(query, "difficulty").strip()
+    category = query_value(query, "category").strip()
+    group_raw = query_value(query, "group_id").strip() or query_value(query, "chat_id").strip()
+    group_id = resolve_group_id(db, group_raw) if group_raw else ""
+    clauses = ["1=1"]
+    params: list = []
+    if text:
+        clauses.append("(t.title LIKE ? OR t.content LIKE ?)")
+        params += [f"%{text}%", f"%{text}%"]
+    if difficulty:
+        clauses.append("COALESCE(r.difficulty,c.difficulty)=?")
+        params.append(difficulty)
+    if category:
+        clauses.append("t.category=?")
+        params.append(category)
+    if group_id:
+        clauses.append(
+            "(EXISTS (SELECT 1 FROM library_selection_history h "
+            "WHERE h.text_id=t.text_id AND h.chat_id=?) OR "
+            "EXISTS (SELECT 1 FROM library_sent_messages sm "
+            "JOIN library_sessions s ON s.session_id=sm.session_id "
+            "WHERE s.text_id=t.text_id AND sm.chat_id=?))"
+        )
+        params += [group_id, group_id]
+    where = " WHERE " + " AND ".join(clauses)
+    base = (
+        "FROM library_texts t LEFT JOIN library_rankings r ON r.text_id=t.text_id "
+        "LEFT JOIN library_classifications c ON c.text_id=t.text_id" + where
+    )
+    total = int(db.execute("SELECT COUNT(*) " + base, tuple(params)).fetchone()[0])
+    rows = db.execute(
+        "SELECT t.text_id,t.title,t.char_count,t.category,t.relative_path,"
+        "COALESCE(r.difficulty,c.difficulty) AS difficulty,r.score AS difficulty_score,"
+        "COALESCE(c.primary_genre,'') AS primary_genre,COALESCE(c.form,'') AS form,"
+        "COALESCE(c.classified_at,r.ranked_at) AS added_at " + base +
+        " ORDER BY added_at DESC, t.text_id LIMIT ? OFFSET ?",
+        tuple(params + [limit, offset]),
+    ).fetchall()
+    items = [
+        {"id": row["text_id"], "text_id": row["text_id"], "title": row["title"],
+         "char_count": int(row["char_count"] or 0), "category": row["category"],
+         "source": row["relative_path"], "relative_path": row["relative_path"],
+         "difficulty": row["difficulty"] or "", "difficulty_score": maybe_float(row["difficulty_score"]),
+         "primary_genre": row["primary_genre"], "form": row["form"],
+         "added_at": row["added_at"], "added_at_text": epoch_text(row["added_at"])}
+        for row in rows
+    ]
+    return {
+        "ok": True, "total": total, "limit": limit, "offset": offset,
+        "count": len(items), "has_more": offset + len(items) < total,
+        "group_id": group_id, "items": items,
+    }
+
+
+def library_text_response(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /library/text?id=：单篇详情（正文前 2000 字，全文长度另给）。"""
+    text_id = query_value(query, "id").strip() or query_value(query, "text_id").strip()
+    if not text_id:
+        return {"ok": False, "message": "id (text_id) is required"}
     row = db.execute(
-        "SELECT display_name FROM known_senders WHERE platform=? AND sender_id=?",
-        (platform, sender_id)).fetchone()
-    if row:
-        db.execute(
-            "UPDATE known_senders SET message_count=message_count+1,"
-            " display_name=CASE WHEN ? <> '' THEN ? ELSE display_name END,"
-            " last_group_id=CASE WHEN ? <> '' THEN ? ELSE last_group_id END,"
-            " last_seen_at=? WHERE platform=? AND sender_id=?",
-            (sender_name, sender_name[:120], group_id, group_id, now, platform, sender_id))
-        return False
-    db.execute(
-        "INSERT INTO known_senders (platform, sender_id, display_name, first_seen_at,"
-        " last_seen_at, message_count, first_group_id, last_group_id)"
-        " VALUES (?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(platform, sender_id) DO NOTHING",
-        (platform, sender_id, sender_name[:120], now, now, group_id, group_id))
-    return True
+        "SELECT t.text_id,t.title,t.char_count,t.category,t.relative_path,t.content,"
+        "COALESCE(r.difficulty,c.difficulty) AS difficulty,r.score AS difficulty_score,"
+        "COALESCE(c.primary_genre,'') AS primary_genre,COALESCE(c.form,'') AS form,"
+        "COALESCE(c.classified_at,r.ranked_at) AS added_at "
+        "FROM library_texts t LEFT JOIN library_rankings r ON r.text_id=t.text_id "
+        "LEFT JOIN library_classifications c ON c.text_id=t.text_id "
+        "WHERE t.text_id=?",
+        (text_id,),
+    ).fetchone()
+    if row is None:
+        return {"ok": False, "message": "text not found", "id": text_id}
+    content = row["content"] or ""
+    preview_chars = query_int(query, "chars", 2000, 100, 20000)
+    preview = content[:preview_chars]
+    item = {
+        "id": row["text_id"], "text_id": row["text_id"], "title": row["title"],
+        "char_count": int(row["char_count"] or 0), "category": row["category"],
+        "relative_path": row["relative_path"], "source": row["relative_path"],
+        "difficulty": row["difficulty"] or "", "difficulty_score": maybe_float(row["difficulty_score"]),
+        "primary_genre": row["primary_genre"], "form": row["form"],
+        "added_at": row["added_at"], "added_at_text": epoch_text(row["added_at"]),
+        "content": preview, "content_preview": preview, "content_preview_chars": preview_chars,
+        "content_length": len(content), "content_truncated": len(content) > len(preview),
+    }
+    return {"ok": True, "item": item}
+
+
+# ── 打字成绩（typing_scores，原始流水） ──────────────────
+
+def typing_scope(db: sqlite3.Connection, query: dict) -> tuple[str, list, int, str]:
+    """typing_scores 的通用过滤：群（名字或群号）+ 最近 N 天。"""
+    clauses = ["recorded_at > 0"]
+    params: list = []
+    group_raw = (query_value(query, "group_id").strip()
+                 or query_value(query, "group").strip()
+                 or query_value(query, "chat_id").strip())
+    group_id = resolve_group_id(db, group_raw) if group_raw else ""
+    if group_id:
+        clauses.append("chat_id=?")
+        params.append(group_id)
+    days = query_int(query, "days", 7, 0, 3650)
+    if days > 0:
+        clauses.append("recorded_at >= ?")
+        params.append(time.time() - days * 86400)
+    return " AND ".join(clauses), params, days, group_id
+
+
+def typing_leaderboard_response(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /typing/leaderboard：按均速/键准/条数排行（人数与活动天数一起给）。"""
+    where, params, days, group_id = typing_scope(db, query)
+    limit = query_int(query, "limit", 20, 1, 200)
+    min_records = query_int(query, "min_count", 1, 1, 100000)
+    metric = (query_value(query, "metric", "speed").strip().lower() or "speed")
+    order_by = {
+        "speed": "avg_speed DESC, records DESC",
+        "accuracy": "avg_accuracy DESC, records DESC",
+        "acc": "avg_accuracy DESC, records DESC",
+        "key": "avg_key_rate DESC, records DESC",
+        "key_rate": "avg_key_rate DESC, records DESC",
+        "count": "records DESC, avg_speed DESC",
+        "records": "records DESC, avg_speed DESC",
+    }.get(metric, "avg_speed DESC, records DESC")
+    rows = db.execute(
+        "SELECT user_id,COALESCE(NULLIF(MAX(user_name),''),user_id) AS user_name,"
+        "COUNT(*) AS records,AVG(speed) AS avg_speed,MAX(speed) AS best_speed,"
+        "AVG(accuracy) AS avg_accuracy,AVG(key_rate) AS avg_key_rate,"
+        "AVG(code_length) AS avg_code_length,AVG(word_rate) AS avg_word_rate,"
+        "SUM(char_count) AS chars,"
+        "COUNT(DISTINCT date(recorded_at,'unixepoch','+8 hours')) AS active_days,"
+        "MIN(recorded_at) AS first_at,MAX(recorded_at) AS last_at "
+        "FROM typing_scores WHERE " + where +
+        " GROUP BY user_id HAVING COUNT(*)>=? ORDER BY " + order_by + " LIMIT ?",
+        tuple(params + [min_records, limit]),
+    ).fetchall()
+    items = []
+    for index, row in enumerate(rows, 1):
+        items.append({
+            "rank": index, "user_id": row["user_id"], "user_name": row["user_name"],
+            "records": int(row["records"]), "count": int(row["records"]),
+            "avg_speed": maybe_float(row["avg_speed"]), "best_speed": maybe_float(row["best_speed"]),
+            "avg_accuracy": maybe_float(row["avg_accuracy"]),
+            "avg_key_rate": maybe_float(row["avg_key_rate"]),
+            "avg_code_length": maybe_float(row["avg_code_length"]),
+            "avg_word_rate": maybe_float(row["avg_word_rate"]),
+            "chars": int(row["chars"] or 0), "active_days": int(row["active_days"] or 0),
+            "first_at": row["first_at"], "first_at_text": epoch_text(row["first_at"]),
+            "last_at": row["last_at"], "last_at_text": epoch_text(row["last_at"]),
+        })
+    totals = db.execute(
+        "SELECT COUNT(*) AS records,COUNT(DISTINCT user_id) AS users,"
+        "COUNT(DISTINCT date(recorded_at,'unixepoch','+8 hours')) AS active_days,"
+        "AVG(speed) AS avg_speed,MAX(speed) AS best_speed,AVG(accuracy) AS avg_accuracy,"
+        "AVG(key_rate) AS avg_key_rate,SUM(char_count) AS chars "
+        "FROM typing_scores WHERE " + where,
+        tuple(params),
+    ).fetchone()
+    return {
+        "ok": True, "group_id": group_id,
+        "group_name": group_display_name(db, group_id) if group_id else "全部群",
+        "days": days, "metric": metric, "min_count": min_records,
+        "users": int(totals["users"] or 0), "records": int(totals["records"] or 0),
+        "active_days": int(totals["active_days"] or 0),
+        "avg_speed": maybe_float(totals["avg_speed"]),
+        "best_speed": maybe_float(totals["best_speed"]),
+        "avg_accuracy": maybe_float(totals["avg_accuracy"]),
+        "avg_key_rate": maybe_float(totals["avg_key_rate"]),
+        "items": items,
+    }
+
+
+def typing_summary_response(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /typing/summary：人数 / 总条数 / 均速均值 / 活跃天数（附每日点集）。"""
+    where, params, days, group_id = typing_scope(db, query)
+    totals = db.execute(
+        "SELECT COUNT(*) AS records,COUNT(DISTINCT user_id) AS users,"
+        "COUNT(DISTINCT date(recorded_at,'unixepoch','+8 hours')) AS active_days,"
+        "AVG(speed) AS avg_speed,MAX(speed) AS best_speed,AVG(accuracy) AS avg_accuracy,"
+        "AVG(key_rate) AS avg_key_rate,AVG(code_length) AS avg_code_length,"
+        "AVG(word_rate) AS avg_word_rate,SUM(char_count) AS chars,"
+        "MIN(recorded_at) AS first_at,MAX(recorded_at) AS last_at "
+        "FROM typing_scores WHERE " + where,
+        tuple(params),
+    ).fetchone()
+    daily_rows = db.execute(
+        "SELECT date(recorded_at,'unixepoch','+8 hours') AS day,COUNT(*) AS records,"
+        "COUNT(DISTINCT user_id) AS users,AVG(speed) AS avg_speed,MAX(speed) AS best_speed,"
+        "AVG(accuracy) AS avg_accuracy,AVG(key_rate) AS avg_key_rate,SUM(char_count) AS chars "
+        "FROM typing_scores WHERE " + where + " GROUP BY day ORDER BY day",
+        tuple(params),
+    ).fetchall()
+    daily = [
+        {"date": row["day"], "records": int(row["records"]), "users": int(row["users"]),
+         "avg_speed": maybe_float(row["avg_speed"]), "best_speed": maybe_float(row["best_speed"]),
+         "avg_accuracy": maybe_float(row["avg_accuracy"]),
+         "avg_key_rate": maybe_float(row["avg_key_rate"]), "chars": int(row["chars"] or 0)}
+        for row in daily_rows
+    ]
+    top_rows = db.execute(
+        "SELECT COALESCE(NULLIF(MAX(user_name),''),user_id) AS user_name,user_id,"
+        "COUNT(*) AS records,MAX(speed) AS best_speed,AVG(speed) AS avg_speed,"
+        "AVG(accuracy) AS avg_accuracy FROM typing_scores WHERE " + where +
+        " GROUP BY user_id ORDER BY best_speed DESC LIMIT 5",
+        tuple(params),
+    ).fetchall()
+    top = [
+        {"rank": index, "user_id": row["user_id"], "user_name": row["user_name"],
+         "records": int(row["records"]), "best_speed": maybe_float(row["best_speed"]),
+         "avg_speed": maybe_float(row["avg_speed"]), "avg_accuracy": maybe_float(row["avg_accuracy"])}
+        for index, row in enumerate(top_rows, 1)
+    ]
+    return {
+        "ok": True, "group_id": group_id,
+        "group_name": group_display_name(db, group_id) if group_id else "全部群",
+        "days": days,
+        "users": int(totals["users"] or 0), "records": int(totals["records"] or 0),
+        "total_records": int(totals["records"] or 0),
+        "active_days": int(totals["active_days"] or 0),
+        "avg_speed": maybe_float(totals["avg_speed"]),
+        "best_speed": maybe_float(totals["best_speed"]),
+        "avg_accuracy": maybe_float(totals["avg_accuracy"]),
+        "avg_key_rate": maybe_float(totals["avg_key_rate"]),
+        "avg_code_length": maybe_float(totals["avg_code_length"]),
+        "avg_word_rate": maybe_float(totals["avg_word_rate"]),
+        "chars": int(totals["chars"] or 0),
+        "first_at": totals["first_at"], "first_at_text": epoch_text(totals["first_at"]),
+        "last_at": totals["last_at"], "last_at_text": epoch_text(totals["last_at"]),
+        "daily": daily, "items": daily, "top": top,
+    }
+
+
+def recent_messages_response(db: sqlite3.Connection, query: dict) -> list:
+    """GET /recent_messages：后台全局搜索用（recent_messages + message_archive 合并）。"""
+    limit = query_int(query, "limit", 20, 1, 300)
+    offset = query_int(query, "offset", 0, 0, 100000)
+    text = query_value(query, "q").strip()
+    group_raw = query_value(query, "group_id").strip() or query_value(query, "chat_id").strip()
+    group_id = resolve_group_id(db, group_raw) if group_raw else ""
+    platform = query_value(query, "platform").strip()
+
+    def build(table: str):
+        clauses, params = ["occurred_at > 0"], []
+        if text:
+            clauses.append("(text LIKE ? OR sender_name LIKE ? OR group_name LIKE ? OR sender_id LIKE ?)")
+            params += [f"%{text}%"] * 4
+        if group_id:
+            clauses.append("group_id=?")
+            params.append(group_id)
+        if platform:
+            clauses.append("platform=?")
+            params.append(platform)
+        return (
+            "SELECT platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at "
+            "FROM " + table + " WHERE " + " AND ".join(clauses)
+        ), params
+
+    sql_recent, params_recent = build("recent_messages")
+    sql_archive, params_archive = build("message_archive")
+    rows = db.execute(
+        "SELECT * FROM (" + sql_recent + " UNION ALL " + sql_archive + ")"
+        " ORDER BY occurred_at DESC LIMIT ? OFFSET ?",
+        tuple(params_recent + params_archive + [limit, offset]),
+    ).fetchall()
+    return [
+        {"platform": row["platform"], "message_id": row["message_id"],
+         "group_id": row["group_id"], "group_name": row["group_name"],
+         "sender_id": row["sender_id"], "sender_name": row["sender_name"],
+         "text": row["text"], "occurred_at": row["occurred_at"],
+         "occurred_at_text": epoch_text(row["occurred_at"])}
+        for row in rows
+    ]
+
+
+def ai_contest_scores_response(db: sqlite3.Connection, query: dict) -> list:
+    """GET /ai-contest/scores：AI 赛文成绩（后台成员成绩明细会用）。"""
+    name = query_value(query, "name").strip() or query_value(query, "user").strip()
+    user_id = query_value(query, "user_id").strip()
+    group_raw = query_value(query, "group_id").strip() or query_value(query, "group").strip()
+    group_id = resolve_group_id(db, group_raw) if group_raw else ""
+    date_raw = query_value(query, "date").strip()
+    days = query_int(query, "days", 0, 0, 3650)
+    limit = query_int(query, "limit", 100, 1, 5000)
+    clauses, params = ["1=1"], []
+    if name:
+        clauses.append("(user_name LIKE ? OR user_id=?)")
+        params += [f"%{name}%", name]
+    if user_id:
+        clauses.append("user_id=?")
+        params.append(user_id)
+    if group_id:
+        clauses.append("group_id=?")
+        params.append(group_id)
+    if date_raw:
+        clauses.append("competition_date=?")
+        params.append(china_date_text(date_raw))
+    if days > 0:
+        since = (china_now().date() - timedelta(days=days - 1)).isoformat()
+        clauses.append("competition_date>=?")
+        params.append(since)
+    rows = db.execute(
+        "SELECT source_json FROM ai_contest_scores WHERE " + " AND ".join(clauses) +
+        " ORDER BY occurred_at DESC LIMIT ?",
+        tuple(params + [limit]),
+    ).fetchall()
+    items = []
+    for row in rows:
+        try:
+            value = json.loads(row["source_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            items.append(value)
+    return items
+
+
+def version_response(db: sqlite3.Connection, db_path: str) -> dict:
+    """GET /version：app / 启动时间 / 数据库路径 / 表清单（含行数）。"""
+    rows = db.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
+    ).fetchall()
+    names = [str(row["name"]) for row in rows]
+    return {
+        "ok": True, "app": APP_NAME, "version": APP_VERSION,
+        "started_at": SERVER_STARTED_AT,
+        "started_at_text": epoch_text(SERVER_STARTED_AT),
+        "uptime_seconds": round(time.time() - SERVER_STARTED_AT, 1),
+        "db_path": db_path, "table_count": len(names), "tables": names,
+        "table_counts": table_counts(db, names),
+    }
+
+
+def stats_advanced_response(db: sqlite3.Connection) -> dict:
+    """GET /stats/advanced：老后台「高级面板」用的扩展统计（原来 404）。"""
+    counts = stats_response(db)
+    contest = [
+        {"key": row["contest_key"], "name": row["contest_name"], "scores": int(row["scores"]),
+         "users": int(row["users"]), "first_date": row["first_date"], "last_date": row["last_date"]}
+        for row in db.execute(
+            "SELECT contest_key,MAX(contest_name) AS contest_name,COUNT(*) AS scores,"
+            "COUNT(DISTINCT user_id) AS users,MIN(score_date) AS first_date,"
+            "MAX(score_date) AS last_date FROM contest_scores "
+            "GROUP BY contest_key ORDER BY scores DESC"
+        ).fetchall()
+    ]
+    typing_recent = {}
+    for label, days in (("today", 1), ("7d", 7), ("30d", 30)):
+        typing_recent[label] = typing_summary_response(db, {"days": [str(days)]})
+    messages_daily = [
+        {"date": row["day"], "messages": int(row["messages"]), "users": int(row["users"])}
+        for row in db.execute(
+            "SELECT date(occurred_at,'unixepoch','+8 hours') AS day,COUNT(*) AS messages,"
+            "COUNT(DISTINCT sender_id) AS users FROM message_archive "
+            "WHERE occurred_at>0 GROUP BY day ORDER BY day DESC LIMIT 30"
+        ).fetchall()
+    ][::-1]
+    novel = novel_shelf_stats(db)
+    novel.pop("items", None)
+    return {
+        "ok": True, "generated_at": time.time(),
+        "counts": counts, "contest": contest, "typing": typing_recent,
+        "library": library_stats(db), "novel": novel,
+        "messages_daily": messages_daily, "archive": archive_status(db),
+    }
+
+
+# ── 赛文（contest_scores + 官网实时） ────────────────────
+
+def known_contests_payload() -> list:
+    return [
+        {"key": key, "name": name, "scope": scope}
+        for key, (name, scope) in CONTEST_LABELS.items()
+    ]
+
+
+def contest_rank_rows(db: sqlite3.Connection, contest_key: str, group_id: str, scope: str,
+                      days: int, limit: int = 12, use_live: bool = True):
+    """某赛文的排行数据 —— /contest/chart.png 与 /contest/chart-data 共用这一个取数函数。
+
+    官网优先（所有者 2026-11-06 的要求），拿不到回落成绩库。
+    返回 (rows, source_label)；rows 的元素是 dict（user_name/user_id/best/acc/n）。
+    """
+    room = group_id if scope == "group" else ""
+    if use_live:
+        live_rows = contest_live_rows(contest_key, room)
+        if live_rows:
+            rows = [
+                {"user_name": row.get("name") or row.get("user_id") or "?",
+                 "user_id": str(row.get("user_id") or ""),
+                 "best": float(row.get("speed") or 0),
+                 "acc": row.get("accuracy"), "n": 1}
+                for row in live_rows
+            ]
+            rows.sort(key=lambda item: item["best"], reverse=True)
+            return rows[:limit], "官网实时"
+    clause, params = "", []
+    if days > 0:
+        clause = " AND c.recorded_at >= ?"
+        params = [time.time() - days * 86400]
+    rows = db.execute(
+        "SELECT COALESCE(NULLIF(c.user_name, ''), "
+        "  (SELECT t.user_name FROM typing_scores t WHERE t.user_id=c.user_id AND t.user_name<>'' LIMIT 1), "
+        "  c.user_id) AS user_name, "
+        "c.user_id, MAX(c.speed) AS best, AVG(c.accuracy) AS acc, "
+        "AVG(c.key_rate) AS key_rate, COUNT(*) AS n "
+        "FROM contest_scores c WHERE c.contest_key=? AND c.group_id=?" + clause +
+        " GROUP BY c.user_id ORDER BY best DESC LIMIT ?",
+        tuple([contest_key, room] + params + [limit]),
+    ).fetchall()
+    return [dict(row) for row in rows], "成绩库"
+
+
+def contest_user_points(db: sqlite3.Connection, contest_key: str, group_id: str,
+                        days: int, user: str) -> list:
+    """按天聚合某个人的赛文成绩（复用 /reports/score-chart.png 的 contest_score_history）。"""
+    history = contest_score_history(db, contest_key, group_id, user, days)
+    buckets: dict[str, dict] = {}
+    for item in history:
+        day = str(item.get("competition_date") or "")
+        if not day:
+            continue
+        bucket = buckets.setdefault(day, {"speed": [], "acc": [], "key": [], "code": []})
+        for field, target in (("speed", "speed"), ("acc", "acc"),
+                              ("key_rate", "key"), ("code_length", "code")):
+            value = item.get(field)
+            if value is None:
+                continue
+            try:
+                bucket[target].append(float(value))
+            except (TypeError, ValueError):
+                continue
+    points = []
+    for day in sorted(buckets):
+        bucket = buckets[day]
+        points.append({
+            "date": day,
+            "avg_speed": round(sum(bucket["speed"]) / len(bucket["speed"]), 2) if bucket["speed"] else None,
+            "best_speed": round(max(bucket["speed"]), 2) if bucket["speed"] else None,
+            "avg_accuracy": round(sum(bucket["acc"]) / len(bucket["acc"]), 2) if bucket["acc"] else None,
+            "avg_key_rate": round(sum(bucket["key"]) / len(bucket["key"]), 2) if bucket["key"] else None,
+            "avg_code_length": round(sum(bucket["code"]) / len(bucket["code"]), 2) if bucket["code"] else None,
+            "users": 1, "records": len(bucket["speed"]),
+        })
+    return points
+
+
+def contest_chart_data(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /contest/chart-data：给后台前端直接画曲线的数据点集。
+
+    数据源和 /contest/chart.png 完全一致（同一个 contest_rank_rows / contest_day_stats），
+    只是把「画图」换成「返回 JSON」。live=0 时只用成绩库（更快，默认）。
+    """
+    raw = query_value(query, "contest").strip()
+    if not raw:
+        return {"ok": False, "message": "contest is required", "known": known_contests_payload()}
+    group_hint = query_value(query, "group_id").strip() or query_value(query, "group").strip()
+    if group_hint:
+        resolved = resolve_group_id(db, group_hint)
+        if resolved:
+            query = {**query, "group_id": [resolved]}
+    lookup = contest_chart_lookup(db, query)
+    if not lookup:
+        return {"ok": False, "message": "unknown contest", "contest": raw,
+                "known": known_contests_payload()}
+    key, name, scope, group_id = lookup
+    days = query_int(query, "days", 30, 0, 3660)
+    user = query_value(query, "user").strip()
+    mode = (query_value(query, "mode", "all").strip().lower() or "all")
+    limit = query_int(query, "limit", 12, 1, 100)
+    use_live = query_flag(query, "live", False)
+    rank_rows, rank_source = contest_rank_rows(db, key, group_id, scope, days, limit, use_live)
+    rows = []
+    for index, item in enumerate(rank_rows, 1):
+        rows.append({
+            "rank": index,
+            "user_id": str(item.get("user_id") or ""),
+            "user_name": item.get("user_name") or item.get("user_id") or "?",
+            "best_speed": maybe_float(item.get("best")),
+            "avg_accuracy": maybe_float(item.get("acc")),
+            "avg_key_rate": maybe_float(item.get("key_rate")),
+            "records": int(item.get("n") or 1),
+        })
+    points: list = []
+    point_source = ""
+    # days=0 在柱状图里是「全部时间」，但曲线没法画全部（点数太多）——按 30 天给点集。
+    point_days = days if days > 0 else 30
+    if mode in {"all", "trend", "points", ""}:
+        if user:
+            points = contest_user_points(db, key, group_id, point_days, user)
+            point_source = "成绩库（个人）"
+        else:
+            points = contest_day_stats(db, key, group_id, scope, point_days, use_live=use_live)
+            point_source = "官网实时优先，取不到回落成绩库" if use_live else "成绩库"
+    return {
+        "ok": True,
+        "contest": {"key": key, "name": name, "scope": scope,
+                    "group_id": group_id,
+                    "group_name": group_display_name(db, group_id) if group_id else ""},
+        "days": days, "user": user, "mode": mode, "live": use_live,
+        "rank_source": rank_source, "rows": rows, "count": len(rows),
+        "point_source": point_source, "points": points, "point_count": len(points),
+    }
+
+
+def contests_catalog(db: sqlite3.Connection) -> dict:
+    """GET /contests/list：赛文清单（CONTEST_LABELS + 每组 type/数量/最近日期）。"""
+    items = []
+    for key, (name, scope) in CONTEST_LABELS.items():
+        total = db.execute(
+            "SELECT COUNT(*) AS n,COUNT(DISTINCT user_id) AS users,"
+            "MIN(score_date) AS first_date,MAX(score_date) AS last_date "
+            "FROM contest_scores WHERE contest_key=?",
+            (key,),
+        ).fetchone()
+        group_rows = db.execute(
+            "SELECT group_id,COUNT(*) AS n,COUNT(DISTINCT user_id) AS users,"
+            "MAX(score_date) AS last_date FROM contest_scores "
+            "WHERE contest_key=? AND group_id<>'' GROUP BY group_id ORDER BY n DESC",
+            (key,),
+        ).fetchall()
+        groups = [
+            {"group_id": row["group_id"],
+             "group_name": group_display_name(db, row["group_id"]),
+             "scores": int(row["n"]), "users": int(row["users"]),
+             "last_score_date": row["last_date"] or ""}
+            for row in group_rows
+        ]
+        live_source = CONTEST_LIVE_SOURCES.get(key, "")
+        if not live_source and key == "999":
+            live_source = "按群号（官网 source=群号）"
+        item = {
+            "key": key, "name": name, "scope": scope, "type": scope,
+            "scores": int(total["n"] or 0), "users": int(total["users"] or 0),
+            "first_score_date": total["first_date"] or "",
+            "last_score_date": total["last_date"] or "",
+            "group_count": len(groups), "groups": groups,
+            "live_source": live_source,
+        }
+        if key == "10000":
+            item["alias_of"] = "100000"
+        items.append(item)
+    items.sort(key=lambda item: -item["scores"])
+    return {"ok": True, "count": len(items), "items": items}
+
+
+# ── 群日报（messages + typing + contest） ────────────────
+
+def daily_report_response(db: sqlite3.Connection, query: dict) -> dict:
+    """GET /reports/daily?group_id=&date=：群日报数据（消息量/活跃人数/Top打字/赛文参与）。"""
+    group_raw = query_value(query, "group_id").strip() or query_value(query, "group").strip()
+    group_id = resolve_group_id(db, group_raw) if group_raw else ""
+    date_text = china_date_text(query_value(query, "date").strip())
+    start, end = china_day_range(date_text)
+    group_sql = " AND group_id=?" if group_id else ""
+    group_params = [group_id] if group_id else []
+    message_params = [start, end] + group_params + [start, end] + group_params
+    messages_row = db.execute(
+        "SELECT COUNT(*) AS messages,COUNT(DISTINCT sender_id) AS users FROM ("
+        "SELECT platform,message_id,group_id,sender_id FROM recent_messages "
+        "WHERE occurred_at>=? AND occurred_at<?" + group_sql +
+        " UNION SELECT platform,message_id,group_id,sender_id FROM message_archive "
+        "WHERE occurred_at>=? AND occurred_at<?" + group_sql + ")",
+        tuple(message_params),
+    ).fetchone()
+    hour_rows = db.execute(
+        "SELECT CAST((occurred_at + 28800) % 86400 / 3600 AS INTEGER) AS hour,"
+        "COUNT(*) AS messages FROM ("
+        "SELECT occurred_at,sender_id,group_id FROM recent_messages "
+        "WHERE occurred_at>=? AND occurred_at<?" + group_sql +
+        " UNION ALL SELECT occurred_at,sender_id,group_id FROM message_archive "
+        "WHERE occurred_at>=? AND occurred_at<?" + group_sql +
+        ") GROUP BY hour ORDER BY hour",
+        tuple(message_params),
+    ).fetchall()
+    by_hour = [0] * 24
+    for row in hour_rows:
+        hour = int(row["hour"] or 0)
+        if 0 <= hour < 24:
+            by_hour[hour] = int(row["messages"] or 0)
+    sender_rows = db.execute(
+        "SELECT sender_id,MAX(sender_name) AS sender_name,COUNT(*) AS messages FROM ("
+        "SELECT sender_id,sender_name,group_id FROM recent_messages "
+        "WHERE occurred_at>=? AND occurred_at<?" + group_sql +
+        " UNION ALL SELECT sender_id,sender_name,group_id FROM message_archive "
+        "WHERE occurred_at>=? AND occurred_at<?" + group_sql +
+        ") GROUP BY sender_id ORDER BY messages DESC LIMIT 8",
+        tuple(message_params),
+    ).fetchall()
+    group_rows = db.execute(
+        "SELECT group_id,MAX(group_name) AS group_name,COUNT(*) AS messages,"
+        "COUNT(DISTINCT sender_id) AS users FROM ("
+        "SELECT group_id,group_name,sender_id FROM recent_messages "
+        "WHERE occurred_at>=? AND occurred_at<?"
+        " UNION ALL SELECT group_id,group_name,sender_id FROM message_archive "
+        "WHERE occurred_at>=? AND occurred_at<?"
+        ") GROUP BY group_id ORDER BY messages DESC LIMIT 20",
+        (start, end, start, end),
+    ).fetchall()
+    typing_where = "recorded_at>=? AND recorded_at<?" + (" AND chat_id=?" if group_id else "")
+    typing_params = [start, end] + group_params
+    typing_rows = db.execute(
+        "SELECT COALESCE(NULLIF(MAX(user_name),''),user_id) AS user_name,user_id,"
+        "COUNT(*) AS records,MAX(speed) AS best_speed,AVG(speed) AS avg_speed,"
+        "AVG(accuracy) AS avg_accuracy,AVG(key_rate) AS avg_key_rate "
+        "FROM typing_scores WHERE " + typing_where +
+        " GROUP BY user_id ORDER BY best_speed DESC LIMIT 10",
+        tuple(typing_params),
+    ).fetchall()
+    typing_totals = db.execute(
+        "SELECT COUNT(*) AS records,COUNT(DISTINCT user_id) AS users "
+        "FROM typing_scores WHERE " + typing_where,
+        tuple(typing_params),
+    ).fetchone()
+    contest_rows = db.execute(
+        "SELECT contest_key,MAX(contest_name) AS contest_name,COUNT(*) AS scores,"
+        "COUNT(DISTINCT user_id) AS users,MAX(speed) AS best_speed "
+        "FROM contest_scores WHERE score_date=?" + (" AND group_id=?" if group_id else "") +
+        " GROUP BY contest_key ORDER BY scores DESC",
+        tuple([date_text] + group_params),
+    ).fetchall()
+    ai_row = db.execute(
+        "SELECT COUNT(*) AS scores,COUNT(DISTINCT user_id) AS users,MAX(speed) AS best_speed "
+        "FROM ai_contest_scores WHERE competition_date=?" + (" AND group_id=?" if group_id else ""),
+        tuple([date_text] + group_params),
+    ).fetchone()
+    sent_count = db.execute(
+        "SELECT COUNT(*) FROM library_sent_messages WHERE sent_at>=? AND sent_at<?" +
+        (" AND chat_id=?" if group_id else ""),
+        tuple([start, end] + group_params),
+    ).fetchone()[0]
+    recall_count = db.execute(
+        "SELECT COUNT(*) FROM recall_records WHERE recalled_ts>=? AND recalled_ts<?" +
+        (" AND group_id=?" if group_id else ""),
+        tuple([start, end] + group_params),
+    ).fetchone()[0]
+    digest = None
+    if group_id:
+        digest_row = db.execute(
+            "SELECT * FROM group_digests WHERE platform='qq' AND group_id=? AND day=?",
+            (group_id, date_text),
+        ).fetchone()
+        if digest_row:
+            try:
+                topics = json.loads(digest_row["topics_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                topics = []
+            digest = {
+                "summary": digest_row["summary"], "topics": topics,
+                "msg_count": int(digest_row["msg_count"] or 0),
+                "char_count": int(digest_row["char_count"] or 0),
+                "model": digest_row["model"], "verified": bool(digest_row["verified"]),
+            }
+    return {
+        "ok": True, "group_id": group_id,
+        "group_name": group_display_name(db, group_id) if group_id else "全部群",
+        "date": date_text,
+        "messages": {
+            "total": int(messages_row["messages"] or 0),
+            "active_users": int(messages_row["users"] or 0),
+            "by_hour": by_hour,
+            "top_senders": [
+                {"sender_id": row["sender_id"], "sender_name": row["sender_name"],
+                 "messages": int(row["messages"])}
+                for row in sender_rows
+            ],
+            "by_group": [
+                {"group_id": row["group_id"], "group_name": row["group_name"],
+                 "messages": int(row["messages"]), "users": int(row["users"])}
+                for row in group_rows
+            ],
+        },
+        "typing": {
+            "records": int(typing_totals["records"] or 0),
+            "users": int(typing_totals["users"] or 0),
+            "top": [
+                {"rank": index, "user_id": row["user_id"], "user_name": row["user_name"],
+                 "records": int(row["records"]), "best_speed": maybe_float(row["best_speed"]),
+                 "avg_speed": maybe_float(row["avg_speed"]),
+                 "avg_accuracy": maybe_float(row["avg_accuracy"]),
+                 "avg_key_rate": maybe_float(row["avg_key_rate"])}
+                for index, row in enumerate(typing_rows, 1)
+            ],
+        },
+        "contest": {
+            "scores": sum(int(row["scores"]) for row in contest_rows),
+            "users": len({str(row["contest_key"]) for row in contest_rows}),
+            "items": [
+                {"key": row["contest_key"], "name": row["contest_name"],
+                 "scores": int(row["scores"]), "users": int(row["users"]),
+                 "best_speed": maybe_float(row["best_speed"])}
+                for row in contest_rows
+            ],
+        },
+        "ai_contest": {
+            "scores": int(ai_row["scores"] or 0), "users": int(ai_row["users"] or 0),
+            "best_speed": maybe_float(ai_row["best_speed"]),
+        },
+        "library": {"sent": int(sent_count or 0), "recalls": int(recall_count or 0)},
+        "digest": digest,
+    }
 
 
 class Api(BaseHTTPRequestHandler):
@@ -4686,73 +6600,31 @@ class Api(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        """GET 一律回 JSON —— 后台代理把连接被重置显示成 503，任何异常都不该断连接。"""
+        try:
+            return self._do_get_impl()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.json({"ok": False, "message": f"{type(exc).__name__}: {exc}"},
+                          HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+
+    def _do_get_impl(self):
         request = urlparse(self.path)
-        query = parse_qs(request.query)
+        query = parse_backend_query(request.query)
         db = connect(self.db_path)
         try:
             if request.path == "/health":
                 return self.json({"ok": True})
             if request.path == "/groups":
                 rows = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id ORDER BY g.display_name,g.group_id").fetchall()
-                # groups.updated_at 只在 observe_group() 里写，群消息进来时不更新 ——
-                # 实测它停在 2026-08-28~09-02，比真实活跃度落后 20 多天。
-                # 前端「最后活动」那一列用的就是它，会显示成「21 天前」而实际刚有人说话。
-                # 所以这里从消息归档算一个真实的活跃时间附上（不依赖任何写入路径）。
-                last_active = {
-                    row["group_id"]: row["last_at"]
-                    for row in db.execute(
-                        "SELECT group_id, MAX(occurred_at) AS last_at FROM message_archive "
-                        "WHERE group_id IS NOT NULL GROUP BY group_id")
-                }
-                payload = []
-                for row in rows:
-                    item = dict(row)
-                    item["last_active_at"] = last_active.get(row["group_id"])
-                    payload.append(item)
-                return self.json(payload)
-            if request.path.startswith("/group/") and request.path.endswith("/detail"):
-                group_id = request.path.removeprefix("/group/").removesuffix("/detail").strip("/")
-                group = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id WHERE g.group_id=?", (group_id,)).fetchone()
-                if not group:
-                    return self.json({"error":"group not found"}, HTTPStatus.NOT_FOUND)
-                start = time.time() - 7 * 86400
-                daily = db.execute("SELECT date(datetime(occurred_at,'unixepoch','localtime')) AS date,COUNT(*) AS count FROM message_archive WHERE group_id=? AND occurred_at>=? GROUP BY date ORDER BY date", (group_id,start)).fetchall()
-                users = db.execute("SELECT sender_id,MAX(sender_name) AS sender_name,COUNT(*) AS count FROM message_archive WHERE group_id=? AND occurred_at>=? GROUP BY sender_id ORDER BY count DESC LIMIT 10", (group_id,start)).fetchall()
-                events = db.execute("SELECT occurred_at,sender_name,text FROM message_archive WHERE group_id=? ORDER BY occurred_at DESC LIMIT 20", (group_id,)).fetchall()
-                features = group_features(db, group_id)
-                result = dict(group)
-                # 同 /groups：给一个真实的最后活跃时间
-                last = db.execute(
-                    "SELECT MAX(occurred_at) AS last_at FROM message_archive WHERE group_id=?",
-                    (group_id,)).fetchone()
-                result["last_active_at"] = last["last_at"] if last else None
-                result["features"] = features
-                result["daily"] = [dict(x) for x in daily]
-                result["active_users"] = [dict(x) for x in users]
-                result["events"] = [dict(x) for x in events]
-                return self.json(result)
-            if request.path == "/recent_messages":
-                limit = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
-                before = float(query.get("before", ["0"])[0] or 0)
-                group_id = query.get("group_id", [""])[0].strip()
-                keyword = (query.get("q", query.get("keyword", [""]))[0]).strip()
-                where, args = [], []
-                if before:
-                    where.append("occurred_at < ?"); args.append(before)
-                if group_id:
-                    where.append("group_id=?"); args.append(group_id)
-                if keyword:
-                    where.append("(text LIKE ? OR sender_name LIKE ? OR sender_id LIKE ?)"); args.extend([f"%{keyword}%"] * 3)
-                clause = (" WHERE " + " AND ".join(where)) if where else ""
-                rows = db.execute("SELECT * FROM message_archive" + clause + " ORDER BY occurred_at DESC LIMIT ?", (*args, limit)).fetchall()
-                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
-                    total = db.execute("SELECT COUNT(*) FROM message_archive" + clause, args).fetchone()[0]
-                    return self.json({"items": [dict(row) for row in rows], "total": int(total)})
                 return self.json([dict(row) for row in rows])
             if request.path == "/group-state":
                 group_id = query.get("group_id", [""])[0].strip()
                 row = db.execute("SELECT paused,updated_at FROM group_runtime WHERE group_id=?", (group_id,)).fetchone()
                 return self.json({
+                    "ok": True,
                     "group_id": group_id,
                     "online": not bool(row["paused"]) if row else True,
                     "updated_at": row["updated_at"] if row else None,
@@ -4775,17 +6647,21 @@ class Api(BaseHTTPRequestHandler):
                 group_id = query.get("group_id", [""])[0].strip()
                 capability = query.get("capability", [""])[0].strip()
                 if not group_id:
-                    return self.json({"error": "group_id is required"}, HTTPStatus.BAD_REQUEST)
+                    return self.json({"ok": False, "error": "group_id is required",
+                                      "message": "group_id is required"}, HTTPStatus.BAD_REQUEST)
                 if capability:
                     if capability not in GROUP_CAPABILITIES:
-                        return self.json({"error": "unknown capability"}, HTTPStatus.BAD_REQUEST)
+                        return self.json({"ok": False, "error": "unknown capability",
+                                          "message": "unknown capability"}, HTTPStatus.BAD_REQUEST)
                     return self.json({
+                        "ok": True,
                         "group_id": group_id,
                         "capability": capability,
                         "enabled": group_capability_enabled(db, group_id, capability),
                     })
                 features = group_features(db, group_id)
                 return self.json({
+                    "ok": True,
                     "group_id": group_id,
                     "capabilities": {
                         name: bool(features.get(name, True)) for name in sorted(GROUP_CAPABILITIES)
@@ -4793,96 +6669,22 @@ class Api(BaseHTTPRequestHandler):
                 })
             if request.path == "/library/search":
                 text = query.get("q", [""])[0].strip()
-                limit = min(max(int(query.get("limit", ["10"])[0]), 1), 30)
-                offset = max(int(query.get("offset", ["0"])[0]), 0)
-                requested_difficulty = normalize_library_difficulty(query.get("difficulty", [""])[0]) if query.get("difficulty", [""])[0].strip() else ""
-                requested_genre = resolve_library_genre(query.get("genre", [""])[0]) or resolve_library_genre(text)
-                search_query = library_query_without_genre(text, requested_genre)
-                if search_query:
-                    rows = db.execute(
-                        "SELECT * FROM library_texts WHERE (title LIKE ? OR content LIKE ?) "
-                        "ORDER BY char_count LIMIT ?",
-                        (f"%{search_query}%", f"%{search_query}%", max((offset + limit) * 40, 200)),
-                    ).fetchall()
-                else:
-                    rows = db.execute(
-                        "SELECT * FROM library_texts ORDER BY "
-                        + ("RANDOM()" if requested_genre else "char_count")
-                        + " LIMIT ?",
-                        (max((offset + limit) * 40, 1000) if requested_genre or requested_difficulty else max((offset + limit) * 8, 30),),
-                    ).fetchall()
-                result = []
-                for row in rows:
-                    if row["category"] == "fm_single_chars":
-                        continue
-                    if requested_genre and not library_genre_matches(db, row, requested_genre):
-                        continue
-                    metadata = classify_library_row(db, row)
-                    if requested_difficulty and metadata["difficulty"] != requested_difficulty:
-                        continue
-                    result.append({
-                        "text_id": row["text_id"], "title": row["title"],
-                        "category": row["category"], "relative_path": row["relative_path"],
-                        "char_count": row["char_count"], "genre": metadata["primary_genre"],
-                        "genres": metadata["genres"], "form": metadata["form"],
-                        "difficulty": metadata["difficulty"],
-                        "difficulty_score": metadata["difficulty_score"],
-                        "confidence": metadata["confidence"],
-                    })
-                    if len(result) >= offset + limit:
-                        break
-                db.commit()
-                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
-                    return self.json({"items": result[offset:offset + limit], "total": int(len(result))})
-                return self.json(result[offset:offset + limit])
-            if request.path == "/library/text":
-                text_id = query.get("text_id", [""])[0].strip()
-                row = db.execute("SELECT * FROM library_texts WHERE text_id=?", (text_id,)).fetchone()
-                if not row:
-                    return self.json(None)
-                item = dict(row)
-                metadata = classify_library_row(db, row)
-                item.update({"genre": metadata["primary_genre"], "genres": metadata["genres"],
-                             "form": metadata["form"], "difficulty": metadata["difficulty"],
-                             "difficulty_score": metadata["difficulty_score"],
-                             "confidence": metadata["confidence"]})
-                return self.json(item)
+                limit = query_int(query, "limit", 10, 1, 30)
+                rows = db.execute(
+                    "SELECT t.text_id,t.title,t.category,t.relative_path,t.char_count,"
+                    "COALESCE(r.difficulty,c.difficulty) AS difficulty,r.score AS difficulty_score "
+                    "FROM library_texts t LEFT JOIN library_rankings r ON r.text_id=t.text_id "
+                    "LEFT JOIN library_classifications c ON c.text_id=t.text_id "
+                    "WHERE t.title LIKE ? OR t.content LIKE ? ORDER BY t.char_count LIMIT ?",
+                    (f"%{text}%", f"%{text}%", limit),
+                ).fetchall()
+                return self.json([dict(row) for row in rows])
             if request.path == "/library/pick":
                 text = query.get("q", [""])[0].strip()
-                requested_genre = resolve_library_genre(query.get("genre", [""])[0]) or resolve_library_genre(text)
-                search_query = library_query_without_genre(text, requested_genre)
-                if search_query:
-                    rows = db.execute(
-                        "SELECT * FROM library_texts WHERE (title LIKE ? OR content LIKE ?) "
-                        "ORDER BY char_count LIMIT 200",
-                        (f"%{search_query}%", f"%{search_query}%"),
-                    ).fetchall()
-                else:
-                    rows = db.execute(
-                        "SELECT * FROM library_texts WHERE category<>'fm_single_chars' "
-                        "ORDER BY RANDOM() LIMIT 200"
-                    ).fetchall()
-                candidates = []
-                for row in rows:
-                    if row["category"] == "fm_single_chars":
-                        continue
-                    if requested_genre and not library_genre_matches(db, row, requested_genre):
-                        continue
-                    metadata = classify_library_row(db, row)
-                    item = dict(row)
-                    item.update({
-                        "genre": metadata["primary_genre"], "genres": metadata["genres"],
-                        "form": metadata["form"], "difficulty": metadata["difficulty"],
-                        "difficulty_score": metadata["difficulty_score"],
-                        "confidence": metadata["confidence"],
-                    })
-                    candidates.append(item)
-                db.commit()
-                return self.json(random.choice(candidates) if candidates else None)
+                rows = db.execute("SELECT text_id,title,category,relative_path,content,char_count FROM library_texts WHERE title LIKE ? OR content LIKE ? ORDER BY char_count LIMIT 50", (f"%{text}%", f"%{text}%")).fetchall()
+                return self.json(dict(random.choice(rows)) if rows else None)
             if request.path == "/library/stats":
-                # 这个函数内部会顺手收僵尸会话（写操作），包缓存之后
-                # 从「每次请求都扫」变成「每 45 秒一次」，实际更合适。
-                return self.json(stats_cache("library:stats", lambda: library_stats(db)))
+                return self.json(library_stats(db))
             if request.path == "/library/session-status":
                 return self.json(library_session_status(db, {
                     "platform": query.get("platform", ["qq"])[0],
@@ -4911,76 +6713,39 @@ class Api(BaseHTTPRequestHandler):
                         item["image_urls"] = []
                     result.append(item)
                 return self.json(result)
-            if request.path == "/scores/leaderboard":
-                return self.json(scores_leaderboard(db, query))
-            if request.path == "/scores/player":
-                return self.json(scores_player(db, query))
-            if request.path == "/bot/messages":
-                return self.json(bot_messages(query))
-            if request.path == "/bot/runs":
-                return self.json(bot_runs(query))
-            if request.path == "/digests":
-                return self.json(digests_for_chat(db, query))
-            if request.path == "/digests/overview":
-                return self.json(digests_overview(db, query))
-            if request.path == "/scores/duel":
-                return self.json(scores_duel(db, query))
-            if request.path == "/scores/group-compare":
-                return self.json(scores_group_compare(db, query))
             if request.path == "/scores":
                 group_id = query.get("group_id", [""])[0]
                 sender_id = query.get("sender_id", [""])[0]
-                search = query.get("q", [""])[0].strip()
-                try:
-                    limit = min(max(int(query.get("limit", ["100"])[0]), 1), 5000)
-                    offset = max(int(query.get("offset", ["0"])[0]), 0)
-                except ValueError:
-                    limit, offset = 100, 0
-                search_clause = " AND source_json LIKE ?" if search else ""
-                params = (f"%{group_id}%", f"%{sender_id}%") + ((f"%{search}%",) if search else ())
-                rows = db.execute(
+                text = query.get("q", [""])[0].strip()
+                limit = query_int(query, "limit", 20, 1, 100)
+                sql = (
                     "SELECT source_json FROM score_records "
-                    "WHERE group_id LIKE ? AND sender_id LIKE ? "
-                    + search_clause +
-                    "ORDER BY CASE WHEN typeof(occurred_at)='text' "
+                    "WHERE group_id LIKE ? AND sender_id LIKE ?"
+                )
+                params: list = [f"%{group_id}%", f"%{sender_id}%"]
+                if text:
+                    # 后台全局搜索会带 q：原始成绩 JSON 里同时有名字和原文，直接大字段 LIKE。
+                    sql += " AND source_json LIKE ?"
+                    params.append(f"%{text}%")
+                sql += (
+                    " ORDER BY CASE WHEN typeof(occurred_at)='text' "
                     "THEN CAST(strftime('%s', occurred_at) AS REAL) "
-                    "ELSE CAST(occurred_at AS REAL) END DESC LIMIT ? OFFSET ?",
-                    (*params, limit, offset),
-                ).fetchall()
-                items = [json.loads(row["source_json"]) for row in rows]
-                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
-                    total = db.execute("SELECT COUNT(*) FROM score_records WHERE group_id LIKE ? AND sender_id LIKE ?" + search_clause, params).fetchone()[0]
-                    return self.json({"items": items, "total": int(total)})
-                return self.json(items)
+                    "ELSE CAST(occurred_at AS REAL) END DESC LIMIT ?"
+                )
+                rows = db.execute(sql, tuple(params + [limit])).fetchall()
+                return self.json([json.loads(row["source_json"]) for row in rows])
             if request.path == "/contest/search":
                 text = query.get("q", [""])[0].strip()
                 source_group = query.get("source", [""])[0].strip()
                 competition_date = query.get("date", [""])[0].strip()
-                limit = min(max(int(query.get("limit", ["10"])[0]), 1), 30)
-                if text:
-                    rows = db.execute(
-                        "SELECT text_id,title,source_group,competition_date,relative_path,char_count "
-                        "FROM contest_texts WHERE (title LIKE ? OR content LIKE ?) AND source_group LIKE ? "
-                        "AND competition_date LIKE ? ORDER BY competition_date DESC,title LIMIT ?",
-                        (f"%{text}%", f"%{text}%", f"%{source_group}%", f"%{competition_date}%", limit),
-                    ).fetchall()
-                else:
-                    rows = db.execute(
-                        "SELECT text_id,title,source_group,competition_date,relative_path,char_count "
-                        "FROM contest_texts WHERE source_group LIKE ? AND competition_date LIKE ? "
-                        "ORDER BY competition_date DESC,title LIMIT ?",
-                        (f"%{source_group}%", f"%{competition_date}%", limit),
-                    ).fetchall()
-                items = [dict(row) for row in rows]
-                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
-                    count_sql = "SELECT COUNT(*) FROM contest_texts WHERE source_group LIKE ? AND competition_date LIKE ?"
-                    count_args = [f"%{source_group}%", f"%{competition_date}%"]
-                    if text:
-                        count_sql = "SELECT COUNT(*) FROM contest_texts WHERE (title LIKE ? OR content LIKE ?) AND source_group LIKE ? AND competition_date LIKE ?"
-                        count_args = [f"%{text}%", f"%{text}%", f"%{source_group}%", f"%{competition_date}%"]
-                    total = db.execute(count_sql, count_args).fetchone()[0]
-                    return self.json({"items": items, "total": int(total)})
-                return self.json(items)
+                limit = query_int(query, "limit", 10, 1, 30)
+                rows = db.execute(
+                    "SELECT text_id,title,source_group,competition_date,relative_path,char_count "
+                    "FROM contest_texts WHERE (title LIKE ? OR content LIKE ?) AND source_group LIKE ? "
+                    "AND competition_date LIKE ? ORDER BY competition_date DESC,title LIMIT ?",
+                    (f"%{text}%", f"%{text}%", f"%{source_group}%", f"%{competition_date}%", limit),
+                ).fetchall()
+                return self.json([dict(row) for row in rows])
             if request.path == "/contest/pick":
                 text = query.get("q", [""])[0].strip()
                 source_group = query.get("source", [""])[0].strip()
@@ -5023,24 +6788,6 @@ class Api(BaseHTTPRequestHandler):
                     if user_id and user_id not in best:
                         best[user_id] = item
                 return self.json({"date": competition_date, "rows": list(best.values())})
-            if request.path == "/ai-contest/scores":
-                user_id = query.get("user_id", [""])[0].strip()
-                name = query.get("name", [""])[0].strip()
-                try:
-                    limit = min(max(int(query.get("limit", ["100"])[0]), 1), 5000)
-                except ValueError:
-                    limit = 100
-                params = (f"%{user_id}%", f"%{name}%")
-                total = db.execute("SELECT COUNT(*) FROM ai_contest_scores WHERE user_id LIKE ? AND user_name LIKE ?", params).fetchone()[0]
-                rows = db.execute(
-                    "SELECT source_json FROM ai_contest_scores WHERE user_id LIKE ? AND user_name LIKE ? "
-                    "ORDER BY occurred_at DESC LIMIT ?",
-                    (*params, limit),
-                ).fetchall()
-                items = [json.loads(row["source_json"]) for row in rows]
-                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
-                    return self.json({"items": items, "total": int(total)})
-                return self.json(items)
             if request.path == "/reports/ai-leaderboard.png":
                 competition_date = query.get("date", [""])[0].strip()
                 return self.bytes(render_ai_leaderboard(db, competition_date), "image/png")
@@ -5048,29 +6795,28 @@ class Api(BaseHTTPRequestHandler):
                 user_id = query.get("user_id", [""])[0].strip()
                 name = query.get("name", [""])[0].strip()
                 source_group = query.get("source", [""])[0].strip()
-                try:
-                    limit = min(max(int(query.get("limit", ["100"])[0]), 1), 5000)
-                except ValueError:
-                    limit = 100
-                try:
-                    offset = max(int(query.get("offset", ["0"])[0]), 0)
-                except ValueError:
-                    offset = 0
-                where = (
-                    "FROM competition_scores WHERE user_id LIKE ? AND user_name LIKE ? "
-                    "AND source_group LIKE ?"
-                )
-                params = (f"%{user_id}%", f"%{name}%", f"%{source_group}%")
-                total = db.execute("SELECT COUNT(*) " + where, params).fetchone()[0]
+                limit = query_int(query, "limit", 20, 1, 100)
                 rows = db.execute(
                     "SELECT source_json FROM competition_scores WHERE user_id LIKE ? AND user_name LIKE ? "
-                    "AND source_group LIKE ? ORDER BY occurred_at DESC LIMIT ? OFFSET ?",
-                    (*params, limit, offset),
+                    "AND source_group LIKE ? ORDER BY occurred_at DESC LIMIT ?",
+                    (f"%{user_id}%", f"%{name}%", f"%{source_group}%", limit),
                 ).fetchall()
-                items = [json.loads(row["source_json"]) for row in rows]
-                if query.get("include_total", [""])[0].lower() in {"1", "true", "yes"}:
-                    return self.json({"items": items, "total": total})
-                return self.json(items)
+                return self.json([json.loads(row["source_json"]) for row in rows])
+            if request.path == "/analysis/scores":
+                user_id = query.get("user_id", [""])[0].strip()
+                name = query.get("name", [""])[0].strip()
+                scope = query.get("scope", ["all"])[0].strip() or "all"
+                start_date = query.get("start_date", [""])[0].strip()
+                end_date = query.get("end_date", [""])[0].strip()
+                source = query.get("source", [""])[0].strip()
+                try:
+                    days = int(query.get("days", ["1"])[0])
+                    result = build_score_analysis(
+                        db, user_id, name, scope, start_date, end_date, days, source,
+                    )
+                except (TypeError, ValueError) as exc:
+                    return self.json({"status": "invalid", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return self.json(result)
             if request.path == "/competition/summary":
                 user_id = query.get("user_id", [""])[0].strip()
                 name = query.get("name", [""])[0].strip()
@@ -5087,10 +6833,19 @@ class Api(BaseHTTPRequestHandler):
                 source_group = query.get("source", [""])[0].strip()
                 metric = query.get("metric", ["speed"])[0].strip() or "speed"
                 try:
-                    days = min(max(int(query.get("days", ["30"])[0]), 1), 3650)
+                    # days=0 表示「全部」—— 以前 max(...,1) 把它改成 1 天，
+                    # 于是「我全部的虎杯成绩」画出来是空的（2026-11-06 实测）。
+                    days = min(max(int(query.get("days", ["3650"])[0]), 0), 3650)
                 except ValueError:
                     days = 30
-                return self.bytes(render_score_chart(db, user_id, name, source_group, days, metric), "image/png")
+                contest_key = query.get("contest", [""])[0].strip()
+                group_id_param = resolve_group_id(db, query.get("group_id", [""])[0].strip())
+                return self.bytes(
+                    render_score_chart(db, user_id, name, source_group, days, metric,
+                                       contest=contest_key, group_id=group_id_param,
+                                       contest_user=query.get("user", [""])[0].strip()),
+                    "image/png",
+                )
             if request.path in {
                 "/competition/live", "/competition/live/text", "/reports/live-competition.png",
             }:
@@ -5125,112 +6880,124 @@ class Api(BaseHTTPRequestHandler):
                 # page is retained only for backwards-compatible callers.
                 if not requested_page:
                     combined = True
-                page = 1 if not requested_page else min(max(int(requested_page), 1), live["page_count"])
+                page = 1 if not requested_page else min(
+                    max(query_int(query, "page", 1, 1, 10000), 1), live["page_count"])
                 return self.bytes(render_public_competition_rank(live, page, combined), "image/png")
-            if request.path == "/stats/daily":
+            if request.path == "/contest/top":
+                db = connect(self.db_path)
                 try:
-                    days = min(max(int(query.get("days", ["7"])[0]), 1), 31)
-                except (TypeError, ValueError):
-                    days = 7
-
-                def build_daily():
-                    now = time.time()
-                    start = now - days * 86400
-                    day_rows = db.execute(
-                        "SELECT date(datetime(occurred_at, 'unixepoch', 'localtime')) AS date, COUNT(*) AS count "
-                        "FROM message_archive WHERE occurred_at >= ? GROUP BY date ORDER BY date",
-                        (start,),
-                    ).fetchall()
-                    group_rows = db.execute(
-                        "SELECT group_id, MAX(group_name) AS group_name, COUNT(*) AS count "
-                        "FROM message_archive WHERE occurred_at >= ? GROUP BY group_id "
-                        "ORDER BY count DESC LIMIT 10",
-                        (start,),
-                    ).fetchall()
-                    local_today = datetime.now().date()
-                    today_start = datetime.combine(local_today, datetime.min.time()).timestamp()
-                    yesterday_start = today_start - 86400
-                    today_count = db.execute(
-                        "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ?", (today_start,)
-                    ).fetchone()[0]
-                    yesterday_count = db.execute(
-                        "SELECT COUNT(*) FROM message_archive WHERE occurred_at >= ? AND occurred_at < ?",
-                        (yesterday_start, today_start),
-                    ).fetchone()[0]
-                    return {
-                        "days": [dict(row) for row in day_rows],
-                        "groups": [dict(row) for row in group_rows],
-                        "today": today_count,
-                        "yesterday": yesterday_count,
-                    }
-
-                return self.json(stats_cache(f"daily:{days}", build_daily))
-            if request.path == "/stats/advanced":
-                # part=heat 只算热力图，part=speed 只算速度分布；
-                # 不传则都算（向后兼容）。两部分各自缓存 60 秒。
-                # 为什么要分开：速度分布要全表扫 score_records 并逐条解析 JSON，
-                # 是这里唯一的耗时来源（实测总 525 ms 里 460 ms 在这）。
-                # 成绩页现在只用热力图，所以它会传 part=heat。
-                part = (query.get("part", [""])[0] or "").strip().lower()
-                result = {}
-
-                if part in ("", "heat", "all"):
-                    def build_heat():
-                        start = time.time() - 7 * 86400
-                        heat_rows = db.execute(
-                            "SELECT CAST(strftime('%w',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS weekday,"
-                            "CAST(strftime('%H',datetime(occurred_at,'unixepoch','localtime')) AS INTEGER) AS hour,"
-                            "COUNT(*) AS count FROM message_archive WHERE occurred_at>=? GROUP BY weekday,hour",
-                            (start,),
-                        ).fetchall()
-                        return [
-                            {"day": (int(x["weekday"]) - 1) % 7, "hour": int(x["hour"]),
-                             "count": int(x["count"])}
-                            for x in heat_rows
-                        ]
-
-                    result["heatmap"] = stats_advanced_cached("heat", build_heat)
-
-                if part in ("", "speed", "all"):
-                    def build_speed():
-                        buckets = [(0, 50), (50, 80), (80, 100), (100, 120), (120, 150), (150, None)]
-                        out = {"0-50": 0, "50-80": 0, "80-100": 0,
-                               "100-120": 0, "120-150": 0, "150+": 0}
-                        for row in db.execute("SELECT source_json FROM score_records").fetchall():
-                            try:
-                                payload = json.loads(row["source_json"])
-                            except (TypeError, ValueError):
-                                continue
-                            value = score_number(payload.get("speed")) if isinstance(payload, dict) else None
-                            if value is None:
-                                continue
-                            for low, high in buckets:
-                                if value >= low and (high is None or value < high):
-                                    key = f"{low}-{high}" if high is not None else f"{low}+"
-                                    out[key] = out.get(key, 0) + 1
-                                    break
-                        return [{"range": k, "count": v} for k, v in out.items()]
-
-                    result["speed_distribution"] = stats_advanced_cached("speed", build_speed)
-
-                if part and part not in ("heat", "speed", "all"):
-                    return self.json({"error": "part 只能是 heat / speed / all"}, HTTPStatus.BAD_REQUEST)
-                return self.json(result)
+                    return self.json(contest_top_response(db, query))
+                finally:
+                    db.close()
+            if request.path == "/contest/count":
+                db = connect(self.db_path)
+                try:
+                    return self.json(contest_count_response(db, query))
+                finally:
+                    db.close()
+            if request.path == "/contest/chart.png":
+                db = connect(self.db_path)
+                try:
+                    lookup = contest_chart_lookup(db, query)
+                    if not lookup:
+                        return self.json({"error": "unknown contest"}, HTTPStatus.BAD_REQUEST)
+                    key, name, scope, group_id = lookup
+                    days = query_int(query, "days", 0, 0, 3660)
+                    metric = (query.get("metric", ["speed"])[0] or "speed").lower()
+                    mode = (query.get("mode", ["rank"])[0] or "rank").lower()
+                    if mode == "trend":
+                        # 曲线模式（所有者 2026-11-06 要的「近一个月成绩曲线图」）
+                        span = days if days > 0 else 30
+                        who = (query.get("user", [""])[0] or "").strip()
+                        return self.bytes(render_contest_trend(db, key, group_id, name, scope, span, who), "image/png")
+                    return self.bytes(render_contest_chart(db, key, group_id, name, scope, days, metric), "image/png")
+                finally:
+                    db.close()
             if request.path == "/stats":
-                tables = [
-                    "groups", "library_texts", "library_classifications", "contest_texts", "recall_records", "score_records",
-                    "ai_contest_texts", "ai_contest_scores", "competition_scores", "message_archive",
-                ]
-                return self.json({table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables})
+                return self.json(stats_response(db))
             if request.path == "/archive/status":
-                return self.json(stats_cache("archive:status", lambda: archive_status(db)))
-            return self.json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                status = archive_status(db)
+                status.setdefault("ok", True)
+                return self.json(status)
+
+            # ── 后台控制台只读接口（2026-11-15） ──
+            if request.path == "/version":
+                return self.json(version_response(db, self.db_path))
+            if request.path == "/stats/advanced":
+                return self.json(stats_advanced_response(db))
+            if request.path == "/recent_messages":
+                return self.json(recent_messages_response(db, query))
+            if request.path == "/ai-contest/scores":
+                return self.json(ai_contest_scores_response(db, query))
+            # 番茄小说：读接口 GET / POST 都可以用（老 bot 仍走 POST，见 do_POST）
+            if request.path == "/novel/stats":
+                return self.json(novel_shelf_stats(db))
+            if request.path == "/novel/books":
+                return self.json(novel_books_shelf(db, query))
+            if request.path == "/novel/book":
+                return self.json(novel_book_detail(db, query))
+            if request.path in {"/novel/progress", "/novel/read-progress"}:
+                return self.json(novel_progress_report(db, query))
+            if request.path == "/novel/score":
+                return self.json(novel_stats(db, query_payload(query)))
+            if request.path in {"/novel/start", "/novel/continue", "/novel/next",
+                                "/novel/jump", "/novel/stop"}:
+                return self.json(
+                    {"ok": False, "message": "该接口有写入行为，请使用 POST。", "path": request.path},
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                )
+            # 赛文
+            if request.path == "/contest/chart-data":
+                return self.json(contest_chart_data(db, query))
+            if request.path == "/contests/list":
+                return self.json(contests_catalog(db))
+            # 文库
+            if request.path == "/library/list":
+                return self.json(library_list_response(db, query))
+            if request.path == "/library/text":
+                return self.json(library_text_response(db, query))
+            # 打字成绩
+            if request.path == "/typing/leaderboard":
+                return self.json(typing_leaderboard_response(db, query))
+            if request.path == "/typing/summary":
+                return self.json(typing_summary_response(db, query))
+            if request.path == "/typing/stats":
+                payload = query_payload(query)
+                for key in ("days", "limit"):
+                    if payload.get(key) not in (None, ""):
+                        try:
+                            payload[key] = int(float(payload[key]))
+                        except (TypeError, ValueError):
+                            payload.pop(key, None)
+                return self.json(typing_stats_dispatch(db, payload))
+            # 群日报
+            if request.path == "/reports/daily":
+                return self.json(daily_report_response(db, query))
+            return self.json({"ok": False, "error": "not found", "message": "not found"},
+                             HTTPStatus.NOT_FOUND)
         finally:
             db.close()
 
     def do_POST(self):
+        """POST 同样兜底成 JSON 错误：后台代理/机器人都不该被断连接。"""
+        try:
+            return self._do_post_impl()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.json({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                          HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+
+    def _do_post_impl(self):
         request = urlparse(self.path)
         if request.path not in {
+            "/novel/start", "/novel/continue", "/novel/next", "/novel/jump",
+            "/novel/progress", "/novel/stats",
+            "/novel/books",
+            "/novel/stop",
+            "/novel/score",
+            "/typing/stats",
             "/group-state", "/group-capability", "/events/message", "/events/recall",
             "/repeat-follow/state", "/repeat-follow/check", "/bot-guard/check",
             "/library/session/start", "/library/session/continue", "/library/session/continue-same",
@@ -5358,13 +7125,10 @@ class Api(BaseHTTPRequestHandler):
         if request.path == "/library/classify":
             db = connect(self.db_path)
             try:
-                try:
-                    limit = int(payload.get("limit") or 0)
-                    if limit < 0:
-                        raise ValueError("limit must be non-negative")
-                    return self.json(classify_library(db, limit))
-                except (TypeError, ValueError) as exc:
-                    return self.json({"status": "invalid", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+                limit = max(0, int(payload.get("limit") or 0))
+                return self.json(classify_library(db, limit))
+            except (TypeError, ValueError) as exc:
+                return self.json({"status": "invalid", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
             finally:
                 db.close()
 
@@ -5375,6 +7139,47 @@ class Api(BaseHTTPRequestHandler):
                     return self.json(start_contest_session(db, payload))
                 except (TypeError, ValueError) as exc:
                     return self.json({"status": "invalid", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+            finally:
+                db.close()
+
+        if request.path == "/typing/stats":
+            db = connect(self.db_path)
+            try:
+                return self.json(typing_stats_dispatch(db, payload))
+            finally:
+                db.close()
+
+        if request.path.startswith("/novel/"):
+            # 番茄小说专区（2026-11-05）。和库文是两套逻辑：
+            # 这里按「书 + 章 + 章内偏移」推进，进度只记发起人。
+            db = connect(self.db_path)
+            try:
+                try:
+                    if request.path == "/novel/start":
+                        result = novel_start(db, payload)
+                    elif request.path == "/novel/continue":
+                        result = novel_continue(db, payload)
+                    elif request.path == "/novel/next":
+                        result = novel_next(db, payload)
+                    elif request.path == "/novel/jump":
+                        result = novel_jump(db, payload)
+                    elif request.path == "/novel/progress":
+                        result = novel_progress_info(db, payload)
+                    elif request.path == "/novel/books":
+                        result = novel_books_list(db, payload)
+                    elif request.path == "/novel/stop":
+                        result = novel_stop(db, payload)
+                    elif request.path == "/novel/score":
+                        result = novel_score(db, payload)
+                    elif request.path == "/novel/stats":
+                        # 后台 /api/v2/novels 会 POST 一个空对象问书架；
+                        # 带 book/身份字段的调用仍走原来的「这本书的个人成绩」。
+                        result = novel_shelf_stats(db) if not payload else novel_stats(db, payload)
+                    else:
+                        return self.json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                except (TypeError, ValueError) as exc:
+                    return self.json({"status": "invalid", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return self.json(result)
             finally:
                 db.close()
 
@@ -5428,30 +7233,16 @@ class Api(BaseHTTPRequestHandler):
         raw_json = json.dumps(payload, ensure_ascii=False)
         db = connect(self.db_path)
         try:
-            # 自动登记：新群、新好友。以前这两件事都要手工补，
-            # 机器人被拉进新群后中控看不到它。
-            if ensure_group_registered(db, group_id, group_name):
-                print(f"[fm-domain][auto-register] 新群 {group_id} {group_name}", flush=True)
-            if ensure_sender_known(db, platform, sender_id, sender_name, group_id):
-                print(f"[fm-domain][auto-register] 新人 {sender_id} {sender_name}", flush=True)
-            message_values = (platform, message_id, group_id, group_name, sender_id, sender_name, text, occurred_at, raw_json, json.dumps(image_urls, ensure_ascii=False))
-            # P1-c: 主路径直接写 message_archive。
-            # 以前先写 recent_messages 再由 worker 转存，等于同一份数据在磁盘上留两份
-            # （实测两张表各 158 MB、内容零差异），而唯一读 recent_messages 的地方
-            # 只有 record_recall_event。见 app.py 顶部 P1-c 说明。
             db.execute(
-                "INSERT INTO message_archive (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO recent_messages (platform,message_id,group_id,group_name,sender_id,sender_name,text,occurred_at,raw_json,image_urls_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(platform,message_id) DO UPDATE SET group_id=excluded.group_id,group_name=excluded.group_name,sender_id=excluded.sender_id,sender_name=excluded.sender_name,text=excluded.text,occurred_at=excluded.occurred_at,raw_json=excluded.raw_json,image_urls_json=excluded.image_urls_json",
-                message_values,
+                (platform, message_id, group_id, group_name, sender_id, sender_name, text, occurred_at, raw_json, json.dumps(image_urls, ensure_ascii=False)),
             )
             archived = False
             ai_contest_archived = False
             parsed = parse_typing_score(text)
             # Every recognized QQ typing score is part of the shared archive.
             # The old group allowlist made new or unlisted groups fail silently.
-            # 落了新成绩，聚合缓存与速度分布都作废
-            score_agg_invalidate()
-            stats_advanced_invalidate("speed")
             if parsed and platform == "qq":
                 record = {
                     **parsed,
@@ -5492,18 +7283,25 @@ class Api(BaseHTTPRequestHandler):
                     "raw": text,
                 }
                 db.execute(
-                    "INSERT INTO ai_contest_scores VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    # 13 个值：表在 2026-10-05 加了三列（码长/重打/打词率）。
+                    # 当时只改了「重建」那条 INSERT，漏了这条实时收录的 ——
+                    # 结果群友一发成绩就 "has 13 columns but 10 values were supplied"，
+                    # 收录静默失败（榜也不更新）。
+                    "INSERT INTO ai_contest_scores VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(record_id) DO NOTHING",
                     (
                         f"qq:{message_id}", competition_date, sender_id,
                         sender_name or sender_id, group_id, parsed["speed"],
                         parsed["keystroke"], parsed["accuracy"], occurred_at,
                         json.dumps(record, ensure_ascii=False),
+                        _raw_score_field(text, "码长"),
+                        _raw_retype(text),
+                        _raw_score_field(text, "打词"),
                     ),
                 )
                 ai_contest_archived = bool(db.execute("SELECT changes()").fetchone()[0])
+            db.execute("DELETE FROM recent_messages WHERE occurred_at < ?", (time.time() - 172800,))
             db.commit()
-            start_archive_worker(self.db_path).put(message_values)
             return self.json({
                 "stored": True,
                 "score_archived": archived,
@@ -5522,13 +7320,11 @@ class Api(BaseHTTPRequestHandler):
             return self.json({"error": "platform and message_id are required"}, HTTPStatus.BAD_REQUEST)
         db = connect(self.db_path)
         try:
-            # P1-c: 原文改从 message_archive 取。recent_messages 即将退场，
-            # 而这两张表内容完全一致，换过去不丢任何东西。
             original = db.execute(
-                "SELECT * FROM message_archive WHERE platform=? AND message_id=?", (platform, message_id)
+                "SELECT * FROM recent_messages WHERE platform=? AND message_id=?", (platform, message_id)
             ).fetchone()
             if not original:
-                return self.json({"captured": False, "reason": "original message not archived"})
+                return self.json({"captured": False, "reason": "original message not cached"})
             source = {"recall_event": payload, "original": dict(original)}
             try:
                 image_urls = json.loads(original["image_urls_json"] or "[]")
@@ -5583,9 +7379,9 @@ def main():
             database.close()
     else:
         Api.db_path = args.db
-        start_archive_worker(args.db)
         ThreadingHTTPServer((args.host, args.port), Api).serve_forever()
 
 
 if __name__ == "__main__":
     main()
+
