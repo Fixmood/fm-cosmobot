@@ -391,20 +391,33 @@ contestTopQuickHandler =
         groupValue = case message.kind of
           ChatGroup -> fromMaybe "" (show <$> message.chatId)
           _ -> ""
-    -- 2026-11-15 所有者：不要生成排行榜图（只想要文字榜）。
-    response <- HTTP.runReq $
-      req GET (http "172.20.0.4" /: "contest" /: "top") NoReqBody jsonResponse
-        ( "contest" =: (contestKey :: Text)
-            <> "group_id" =: (groupValue :: Text)
-            <> "days" =: (Text.pack (show days) :: Text)
-            <> "limit" =: ("5" :: Text)
-            <> port 8077
-        )
-    case AesonTypes.parseMaybe
-      (Aeson.withObject "FM contest top" \o -> o Aeson..:? "message" Aeson..!= "")
-      (responseBody response) of
-      Just reply | not (Text.null (Text.strip reply)) -> sendStandalone message reply
-      _ -> sendStandalone message "没查到排名，可能这个赛文还没有数据。"
+    -- 2026-11-15 所有者：成绩图统一用「FM AI赛文排行榜」那种表格风格。
+    -- 555 有专门的当日 AI 榜渲染器；其它赛文用同风格的通用排行表。
+    let chartUrl
+          | contestKey == "555" =
+              "http://172.20.0.4:8077/reports/ai-leaderboard.png?_="
+                <> maybe "0" (Text.pack . show) message.messageId
+          | otherwise =
+              "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
+                <> "&group_id=" <> urlEncodeText groupValue
+                <> "&days=" <> Text.pack (show days)
+                <> "&limit=12"
+                <> "&_=" <> maybe "0" (Text.pack . show) message.messageId
+    sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective chartUrl)
+    when (null (rights sent)) do
+      response <- HTTP.runReq $
+        req GET (http "172.20.0.4" /: "contest" /: "top") NoReqBody jsonResponse
+          ( "contest" =: (contestKey :: Text)
+              <> "group_id" =: (groupValue :: Text)
+              <> "days" =: (Text.pack (show days) :: Text)
+              <> "limit" =: ("5" :: Text)
+              <> port 8077
+          )
+      case AesonTypes.parseMaybe
+        (Aeson.withObject "FM contest top" \o -> o Aeson..:? "message" Aeson..!= "")
+        (responseBody response) of
+        Just reply | not (Text.null (Text.strip reply)) -> sendStandalone message reply
+        _ -> sendStandalone message "没查到排名，可能这个赛文还没有数据。"
 
 isContestTopQuick :: IncomingMessage -> Bool
 isContestTopQuick message =
