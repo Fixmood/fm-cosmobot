@@ -5621,16 +5621,33 @@ def maybe_float(value, digits: int = 2):
 # ── 番茄小说（novel_*） ──────────────────────────────────
 
 def novel_book_dict(row: sqlite3.Row) -> dict:
-    return {
-        "book_id": str(row["book_id"]),
+    """统一的书目形状：book_id（novel_books 主键）同时以 id 暴露，方便通用表格按 id 取值。"""
+    book_id = str(row["book_id"])
+    item = {
+        "book_id": book_id,
+        "id": book_id,
         "title": row["title"],
         "author": row["author"] or "",
         "total_chapters": int(row["total_chapters"] or 0),
+        "chapters": int(row["total_chapters"] or 0),
         "word_count": int(row["word_count"] or 0),
         "source": row["source"] or "fanqie",
         "imported_at": row["imported_at"],
         "imported_at_text": epoch_text(row["imported_at"]),
     }
+    try:
+        item["internal_id"] = int(row["internal_id"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        pass
+    return item
+
+
+def novel_internal_id(db: sqlite3.Connection, book_id: str) -> int | None:
+    try:
+        row = db.execute("SELECT rowid FROM novel_books WHERE book_id=?", (book_id,)).fetchone()
+        return int(row[0]) if row else None
+    except sqlite3.Error:
+        return None
 
 
 def novel_shelf_stats(db: sqlite3.Connection) -> dict:
@@ -5640,7 +5657,8 @@ def novel_shelf_stats(db: sqlite3.Connection) -> dict:
     progress = table_count(db, "novel_progress") or 0
     records = table_count(db, "novel_records") or 0
     rows = db.execute(
-        "SELECT b.book_id,b.title,b.author,b.total_chapters,b.word_count,b.source,b.imported_at,"
+        "SELECT b.rowid AS internal_id,b.book_id,b.title,b.author,b.total_chapters,b.word_count,"
+        "b.source,b.imported_at,"
         "(SELECT COUNT(*) FROM novel_chapters c WHERE c.book_id=b.book_id) AS chapter_count,"
         "(SELECT COUNT(*) FROM novel_progress p WHERE p.book_id=b.book_id) AS progress_records,"
         "(SELECT COUNT(DISTINCT p.requester_id) FROM novel_progress p WHERE p.book_id=b.book_id) AS progress_users "
@@ -5667,8 +5685,9 @@ def novel_books_shelf(db: sqlite3.Connection, query: dict | None = None) -> dict
         clause = " WHERE b.title LIKE ? OR b.author LIKE ?"
         params = [f"%{text}%", f"%{text}%"]
     rows = db.execute(
-        "SELECT b.book_id,b.title,b.author,b.total_chapters,b.word_count,b.source,b.imported_at "
-        "FROM novel_books b" + clause + " ORDER BY b.word_count DESC, b.title LIMIT 500",
+        "SELECT b.rowid AS internal_id,b.book_id,b.title,b.author,b.total_chapters,b.word_count,"
+        "b.source,b.imported_at FROM novel_books b" + clause +
+        " ORDER BY b.word_count DESC, b.title LIMIT 500",
         tuple(params),
     ).fetchall()
     items = [novel_book_dict(row) for row in rows]
@@ -5676,23 +5695,59 @@ def novel_books_shelf(db: sqlite3.Connection, query: dict | None = None) -> dict
 
 
 def novel_book_detail(db: sqlite3.Connection, query: dict) -> dict:
-    """GET /novel/book?book_id=：书 + 章节目录 + 每人进度 + 单章成绩。"""
-    raw_id = query_value(query, "book_id").strip()
+    """GET /novel/book：书 + 章节目录 + 每人进度 + 单章成绩。
+
+    入参二选一（都支持）：
+      * book_id / id / internal_id / rowid —— novel_books 主键（也认内部 rowid）
+      * q / book / title —— 书名关键词（“斩神” 这种）
+    chapters 支持 offset/limit（默认 200，上限 1000），返回 total / truncated。
+    找不到返回 404 + {"ok": false, "message": ...}（后台 v3 抽屉按 404 显示未就绪原因）。
+    """
+    raw_id = (query_value(query, "book_id").strip()
+              or query_value(query, "id").strip()
+              or query_value(query, "internal_id").strip()
+              or query_value(query, "rowid").strip())
+    # 客户端偶尔把 JSON 的引号一起带过来（?book_id="6982..."），这里统一去掉。
+    raw_id = raw_id.strip().strip('"').strip("'").strip()
+    keyword = (query_value(query, "q").strip()
+               or query_value(query, "book").strip()
+               or query_value(query, "title").strip()).strip().strip('"').strip("'").strip()
     book = None
     if raw_id:
-        book = db.execute("SELECT * FROM novel_books WHERE book_id=?", (raw_id,)).fetchone()
+        book = db.execute(
+            "SELECT rowid AS internal_id,* FROM novel_books WHERE book_id=?", (raw_id,)
+        ).fetchone()
+        # 兼容「内部 id」：novel_books 的 rowid（1~N 这种短数字）
+        if book is None and raw_id.isdigit() and len(raw_id) <= 9:
+            book = db.execute(
+                "SELECT rowid AS internal_id,* FROM novel_books WHERE rowid=?", (int(raw_id),)
+            ).fetchone()
+    if book is None and keyword:
+        book = novel_find_book(db, keyword)
+    if book is None and raw_id:
+        book = novel_find_book(db, raw_id)
     if book is None:
-        keyword = query_value(query, "book").strip() or query_value(query, "title").strip() or raw_id
-        if keyword:
-            book = novel_find_book(db, keyword)
-    if book is None:
-        return {"ok": False, "message": "书库里没有这本书。", "book_id": raw_id,
-                "chapters": [], "progress": []}
+        if not raw_id and not keyword:
+            return {"ok": False, "status": 400,
+                    "message": "缺少 book_id 参数（也支持 id / q 书名关键词），例如 /novel/book?book_id=6982529841564224526"}
+        received = raw_id or keyword
+        return {"ok": False, "status": 404, "book_id": raw_id, "query": keyword,
+                "message": f"书库里没有 {received} 这本书（可用 book_id/id 主键或 q=书名关键词查询）",
+                "items": [], "chapters": [], "progress": []}
 
     book_id = str(book["book_id"])
+    internal_id = novel_internal_id(db, book_id)
     user = query_value(query, "user").strip() or query_value(query, "requester_id").strip()
-    limit = query_int(query, "limit", 500, 1, 3000)
-    offset = query_int(query, "offset", 0, 0, 200000)
+    limit = query_int(query, "limit", 0, 0, 1000)
+    if not query_value(query, "limit").strip():
+        limit = query_int(query, "chapter_limit", 0, 0, 1000)
+    if limit <= 0:
+        limit = 200
+    offset = query_int(query, "offset", -1, 0, 200000)
+    if not query_value(query, "offset").strip():
+        offset = query_int(query, "chapter_offset", 0, 0, 200000)
+    if offset < 0:
+        offset = 0
     total_chapters = int(
         db.execute("SELECT COUNT(*) FROM novel_chapters WHERE book_id=?", (book_id,)).fetchone()[0]
     )
@@ -5706,6 +5761,7 @@ def novel_book_detail(db: sqlite3.Connection, query: dict) -> dict:
          "word_count": int(row["word_count"] or 0)}
         for row in chapter_rows
     ]
+    truncated = offset + len(chapters) < total_chapters
 
     chapter_scores: list[dict] = []
     try:
@@ -5764,10 +5820,17 @@ def novel_book_detail(db: sqlite3.Connection, query: dict) -> dict:
          "last_recorded_at_text": epoch_text(row["last_recorded_at"])}
         for row in progress_rows
     ]
+    book_payload = novel_book_dict(book)
+    if internal_id is not None:
+        book_payload["internal_id"] = internal_id
     return {
-        "ok": True, "book": novel_book_dict(book), "total_chapters": total_chapters,
-        "chapters": chapters, "chapter_offset": offset, "chapter_limit": limit,
-        "chapters_truncated": offset + len(chapters) < total_chapters,
+        "ok": True, "book": book_payload, "book_id": book_id,
+        # 章节分页：total/truncated 是 v3 后台要的字段，其余为兼容旧字段
+        "total": total_chapters, "truncated": truncated,
+        "offset": offset, "limit": limit, "count": len(chapters),
+        "chapters": chapters,
+        "total_chapters": total_chapters, "chapter_offset": offset,
+        "chapter_limit": limit, "chapters_truncated": truncated,
         "progress": progress, "progress_count": len(progress),
         "chapter_scores": chapter_scores,
     }
@@ -6935,7 +6998,10 @@ class Api(BaseHTTPRequestHandler):
             if request.path == "/novel/books":
                 return self.json(novel_books_shelf(db, query))
             if request.path == "/novel/book":
-                return self.json(novel_book_detail(db, query))
+                result = novel_book_detail(db, query)
+                status = result.pop("status", None)
+                code = HTTPStatus(status) if status in (400, 404) else HTTPStatus.OK
+                return self.json(result, code)
             if request.path in {"/novel/progress", "/novel/read-progress"}:
                 return self.json(novel_progress_report(db, query))
             if request.path == "/novel/score":
