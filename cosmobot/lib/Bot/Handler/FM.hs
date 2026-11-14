@@ -383,16 +383,13 @@ contestTopQuickHandler =
           _ -> ""
     -- 2026-11-15 所有者：成绩图统一用「FM AI赛文排行榜」那种表格风格。
     -- 555 有专门的当日 AI 榜渲染器；其它赛文用同风格的通用排行表。
-    let chartUrl
-          | contestKey == "555" =
-              "http://172.20.0.4:8077/reports/ai-leaderboard.png?_="
-                <> maybe "0" (Text.pack . show) message.messageId
-          | otherwise =
-              "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
-                <> "&group_id=" <> urlEncodeText groupValue
-                <> "&days=" <> Text.pack (show days)
-                <> "&limit=12"
-                <> "&_=" <> maybe "0" (Text.pack . show) message.messageId
+    -- 2026-11-15 所有者：555 也要用统一表格风格（不要老的 AI 榜样式）。
+    let chartUrl =
+          "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
+            <> "&group_id=" <> urlEncodeText groupValue
+            <> "&days=" <> Text.pack (show days)
+            <> "&limit=12"
+            <> "&_=" <> maybe "0" (Text.pack . show) message.messageId
     sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective chartUrl)
     when (null (rights sent)) do
       response <- HTTP.runReq $

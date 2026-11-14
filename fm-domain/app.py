@@ -7714,7 +7714,7 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     if scope == "group" and group_label:
         where_text = f"  |  {group_label}"
     elif scope != "group":
-        where_text = "  |  全群"
+        where_text = f"  |  {label}" if key == "555" else "  |  全群"
     title_prefix = "本群" if scope == "group" else label
     subtitle = f"{today}{where_text}  |  {when}  |  {source_label}"
 
@@ -7777,7 +7777,7 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     draw.text((48, height - 62), footer, font=font(18), fill=DIMMED)
     legend = f"数据来源：{source_label} · 颜色：速度分档 · 键准 ≥98 绿、<90 红"
     if not show_retype:
-        legend += " · 本赛文不能重打，未列重打"
+        legend += " · 本赛文不能重打，未列重打" if key in no_retype_contests else " · 今日暂无重打数据，未列"
     draw.text((48, height - 36), legend, font=font(15), fill=(96, 106, 122))
     output = io.BytesIO()
     image.save(output, "PNG", optimize=True)
