@@ -461,10 +461,11 @@
     },
   ];
 
+  /* v4：导航分区由 console.js 的 NAV 统一编排（本文件只提供视图，不再改 NAV），
+     这里只保证 NAV_INDEX 对每个 v3 视图都有回退信息。 */
   EXTRA_SECTIONS.forEach(function (section) {
-    NAV.push(section);
     section.items.forEach(function (item) {
-      NAV_INDEX[item.id] = Object.assign({ section: section.label }, item);
+      if (!NAV_INDEX[item.id]) NAV_INDEX[item.id] = Object.assign({ section: section.label }, item);
     });
   });
 
@@ -3802,7 +3803,7 @@
   /* ── 21. 启动挂钩 / 对外自检入口 ───────────────────────────────────── */
 
   function bootstrapV3() {
-    injectThemeButton();
+    /* v4：主题按钮由 console.js 的顶栏统一提供（#theme-toggle），这里不再注入 */
     updateThemeButtons();
     V3.pages = Object.keys(VIEWS);
     V3.navSections = EXTRA_SECTIONS.map(function (section) { return section.label; });

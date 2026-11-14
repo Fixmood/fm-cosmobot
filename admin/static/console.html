@@ -1,60 +1,82 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="dark" data-density="comfy">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#07090d">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#06080e">
 <meta name="robots" content="noindex,nofollow">
-<title>FM Console · 后台控制台</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Ctext x='16' y='22' font-family='Segoe UI,sans-serif' font-size='14' font-weight='700' fill='%23070a10' text-anchor='middle'%3EFM%3C/text%3E%3C/svg%3E">
+<title>FM Console · 运营控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c9dff'/%3E%3Cstop offset='1' stop-color='%23a78bfa'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Ctext x='16' y='22' font-family='Segoe UI,sans-serif' font-size='13' font-weight='800' fill='%23070a12' text-anchor='middle'%3EFM%3C/text%3E%3C/svg%3E">
 <script>
-/* 主题引导：在样式表之前恢复用户偏好，避免浅色/深色闪烁（v3） */
+/* 主题引导：样式表加载前恢复偏好，避免浅色/深色闪烁 */
 try {
   var savedTheme = localStorage.getItem('fm-console-theme');
-  document.documentElement.setAttribute('data-theme', savedTheme === 'light' ? 'light' : 'dark');
-} catch (err) { /* 隐私模式：保持默认深色 */ }
+  if (savedTheme === 'light' || savedTheme === 'dark') document.documentElement.setAttribute('data-theme', savedTheme);
+  var savedNav = localStorage.getItem('fm-console-nav');
+  if (savedNav === 'collapsed') document.documentElement.setAttribute('data-nav', 'collapsed');
+  var savedDensity = localStorage.getItem('fm-console-density');
+  if (savedDensity === 'compact') document.documentElement.setAttribute('data-density', 'compact');
+} catch (err) { /* 隐私模式：保持默认 */ }
 </script>
+<link rel="stylesheet" href="/static/design-system.css">
 <link rel="stylesheet" href="/static/console.css">
 </head>
 <body>
 
-<!-- ── 图标集（内联 SVG，零外部依赖） ───────────────────────────── -->
-<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true" focusable="false">
+<!-- ══ 图标集（内联 SVG，零外部依赖，stroke 统一 1.7px） ══════════════════ -->
+<svg xmlns="http://www.w3.org/2000/svg" class="icon-sprite" aria-hidden="true" focusable="false">
   <defs>
-    <g id="i-dash"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></g>
-    <g id="i-groups"><path d="M17 21v-1.5a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4V21"/><circle cx="9.5" cy="7.5" r="3.5"/><path d="M22 21v-1.5a4 4 0 0 0-3-3.87"/><path d="M16 3.6a3.5 3.5 0 0 1 0 6.8"/></g>
+    <g id="i-dash"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></g>
+    <g id="i-analytics"><path d="M3 3v18h18"/><path d="M7 15l3.5-4.5 3 2.5L18 7"/><circle cx="18" cy="7" r="1.4"/></g>
+    <g id="i-groups"><path d="M17 21v-1.6a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4V21"/><circle cx="9.5" cy="7.5" r="3.5"/><path d="M22 21v-1.6a4 4 0 0 0-3-3.87"/><path d="M16 3.6a3.5 3.5 0 0 1 0 6.8"/></g>
     <g id="i-members"><circle cx="12" cy="8" r="4"/><path d="M5 21v-1a6 6 0 0 1 6-6h2a6 6 0 0 1 6 6v1"/></g>
+    <g id="i-message"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/><path d="M8 10h8M8 14h5"/></g>
     <g id="i-search"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></g>
     <g id="i-spark"><path d="M12 3v4"/><path d="M12 17v4"/><path d="M3 12h4"/><path d="M17 12h4"/><path d="m5.6 5.6 2.8 2.8"/><path d="m15.6 15.6 2.8 2.8"/><path d="m18.4 5.6-2.8 2.8"/><path d="m8.4 15.6-2.8 2.8"/></g>
+    <g id="i-sparkles"><path d="M11 3.5 12.7 8l4.5 1.7-4.5 1.7L11 16l-1.7-4.6L4.8 9.7 9.3 8Z"/><path d="M18 14.5l.9 2.4 2.4.9-2.4.9-.9 2.4-.9-2.4-2.4-.9 2.4-.9Z"/></g>
     <g id="i-wand"><path d="m4 20 9.5-9.5"/><path d="M14.5 4.5 16 6"/><path d="M18 3l.7 1.8L20.5 5.5 18.7 6.2 18 8l-.7-1.8L15.5 5.5l1.8-.7Z"/><path d="M20 14l.6 1.5 1.5.6-1.5.6L20 18l-.6-1.3-1.5-.6 1.5-.6Z"/><path d="M5 4l.5 1.3L6.8 5.8 5.5 6.3 5 7.6l-.5-1.3L3.2 5.8l1.3-.5Z"/></g>
-    <g id="i-cpu"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></g>
+    <g id="i-cpu"><rect x="6" y="6" width="12" height="12" rx="2.5"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></g>
     <g id="i-wrench"><path d="M14.5 6.5a4.5 4.5 0 0 0 5.6 5.6l-8.6 8.6a2.4 2.4 0 0 1-3.4-3.4Z"/><path d="M14.5 6.5 17 4l3 3-2.5 2.5"/></g>
     <g id="i-book"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5Z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20v3H6.5"/><path d="M8 7h8"/></g>
     <g id="i-database"><ellipse cx="12" cy="5.5" rx="7.5" ry="3"/><path d="M4.5 5.5v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/><path d="M4.5 11.5v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/></g>
-    <g id="i-terminal"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></g>
-    <g id="i-server"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></g>
+    <g id="i-terminal"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></g>
+    <g id="i-server"><rect x="3" y="4" width="18" height="7" rx="2.5"/><rect x="3" y="13" width="18" height="7" rx="2.5"/><path d="M7 7.5h.01M7 16.5h.01"/></g>
     <g id="i-gear"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1Z"/></g>
     <g id="i-refresh"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></g>
+    <g id="i-refresh-cw"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 4v5h-5"/><path d="M3.5 12a8.5 8.5 0 0 0 .6 3.2"/></g>
     <g id="i-chevron-right"><path d="m9 5 7 7-7 7"/></g>
     <g id="i-chevron-down"><path d="m5 9 7 7 7-7"/></g>
+    <g id="i-chevron-up"><path d="m5 15 7-7 7 7"/></g>
+    <g id="i-chevron-left"><path d="m15 5-7 7 7 7"/></g>
     <g id="i-arrow-left"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></g>
+    <g id="i-arrow-right"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></g>
+    <g id="i-arrow-up"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></g>
+    <g id="i-arrow-down"><path d="M12 5v14"/><path d="m5 12 7 7 7-7"/></g>
+    <g id="i-arrow-up-down"><path d="M8 20V4"/><path d="m4 8 4-4 4 4"/><path d="M16 4v16"/><path d="m12 16 4 4 4-4"/></g>
     <g id="i-close"><path d="M18 6 6 18M6 6l12 12"/></g>
     <g id="i-menu"><path d="M4 6h16M4 12h16M4 18h16"/></g>
+    <g id="i-panel-left"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/></g>
     <g id="i-command"><path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3Z"/></g>
     <g id="i-plus"><path d="M12 5v14M5 12h14"/></g>
-    <g id="i-copy"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></g>
+    <g id="i-minus"><path d="M5 12h14"/></g>
+    <g id="i-copy"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></g>
     <g id="i-check"><path d="m4 12.5 5 5L20 6.5"/></g>
+    <g id="i-check-circle"><circle cx="12" cy="12" r="9"/><path d="m8 12.2 2.6 2.6L16 9.6"/></g>
+    <g id="i-x-circle"><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/></g>
     <g id="i-alert"><path d="M12 3 2.5 20h19Z"/><path d="M12 9v5"/><path d="M12 17h.01"/></g>
     <g id="i-info"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></g>
+    <g id="i-help"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.6 2.6 0 0 1 5.1.7c0 1.8-2.6 2.1-2.6 3.8"/><path d="M12 17h.01"/></g>
     <g id="i-external"><path d="M14 4h6v6"/><path d="m20 4-9 9"/><path d="M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/></g>
     <g id="i-logout"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></g>
     <g id="i-key"><circle cx="8" cy="15" r="4"/><path d="m10.5 13.5 8-8"/><path d="m17 5 3 3"/><path d="m14.5 7.5 3 3"/></g>
     <g id="i-shield"><path d="M12 3 4.5 6v6c0 4.5 3.2 7.6 7.5 9 4.3-1.4 7.5-4.5 7.5-9V6Z"/><path d="m9 12 2 2 4-4"/></g>
+    <g id="i-shield-check"><path d="M12 3 4.5 6v6c0 4.5 3.2 7.6 7.5 9 4.3-1.4 7.5-4.5 7.5-9V6Z"/><path d="m9 11.8 2.2 2.2L15.5 10"/></g>
     <g id="i-clock"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></g>
+    <g id="i-calendar"><rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M8 3v4M16 3v4M3 10h18"/></g>
     <g id="i-trending"><path d="m3 17 6-6 4 4 8-8"/><path d="M15 7h6v6"/></g>
-    <g id="i-message"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8Z"/><path d="M8 10h8M8 14h5"/></g>
     <g id="i-chart"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></g>
+    <g id="i-gauge"><path d="M12 21a9 9 0 1 1 9-9"/><path d="m12 12 4.5-3.5"/><circle cx="12" cy="12" r="1.4"/></g>
     <g id="i-send"><path d="m21 3-9 18-2-8-8-2Z"/><path d="m21 3-11 11"/></g>
     <g id="i-inbox"><path d="M3 12h5l1.5 3h5L16 12h5"/><path d="M5.5 4h13l2.5 8v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6Z"/></g>
     <g id="i-filter"><path d="M3 5h18l-7 8v6l-4 2v-8Z"/></g>
@@ -65,15 +87,37 @@ try {
     <g id="i-eye"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></g>
     <g id="i-link"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></g>
     <g id="i-download"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 19h16"/></g>
+    <g id="i-upload"><path d="M12 21V9"/><path d="m7 14 5-5 5 5"/><path d="M4 5h16"/></g>
     <g id="i-moon"><path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10Z"/></g>
+    <g id="i-sun"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></g>
     <g id="i-zap"><path d="M13 2 4 14h6l-1 8 9-12h-6Z"/></g>
     <g id="i-user"><circle cx="12" cy="8" r="4"/><path d="M4.5 21a7.5 7.5 0 0 1 15 0"/></g>
-    <g id="i-robot"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 3v4"/><path d="M8 13h.01M16 13h.01"/><path d="M9 17h6"/></g>
+    <g id="i-robot"><rect x="4" y="7" width="16" height="12" rx="3.5"/><path d="M12 3v4"/><path d="M8 13h.01M16 13h.01"/><path d="M9 17h6"/></g>
     <g id="i-globe"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18Z"/></g>
     <g id="i-list"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></g>
-    <g id="i-lock"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></g>
+    <g id="i-grid"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></g>
+    <g id="i-layers"><path d="m12 3 8.5 4.5L12 12 3.5 7.5Z"/><path d="m3.5 12.5 8.5 4.5 8.5-4.5"/><path d="m3.5 17 8.5 4.5L20.5 17"/></g>
+    <g id="i-folder"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4l2 2.5h7A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5Z"/></g>
+    <g id="i-file"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></g>
+    <g id="i-lock"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></g>
     <g id="i-wifi-off"><path d="M2 2l20 20"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M5 12.5a10 10 0 0 1 3-2"/><path d="M16 10.5a10 10 0 0 1 3 2"/><path d="M2 8.5a15 15 0 0 1 6-3"/><path d="M16 5.6a15 15 0 0 1 6 2.9"/><path d="M12 20h.01"/></g>
+    <g id="i-wifi"><path d="M2 8.5a15 15 0 0 1 20 0"/><path d="M5 12.5a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M12 20h.01"/></g>
     <g id="i-activity"><path d="M3 12h4l2.5-7 5 14L17 12h4"/></g>
+    <g id="i-heart-pulse"><path d="M20.8 6.6a5 5 0 0 0-7.1 0L12 8.3l-1.7-1.7a5 5 0 1 0-7.1 7.1L12 22l8.8-8.3a5 5 0 0 0 0-7.1Z"/><path d="M2.5 12h4l2-3 3 6 2-3h8"/></g>
+    <g id="i-sort"><path d="M7 4v16"/><path d="m3 8 4-4 4 4"/><path d="M17 20V4"/><path d="m13 16 4 4 4-4"/></g>
+    <g id="i-columns"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 10h18M9 10v10M15 10v10"/></g>
+    <g id="i-more"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></g>
+    <g id="i-palette"><path d="M12 3a9 9 0 1 0 0 18c1.1 0 2-.9 2-2 0-.5-.2-1-.6-1.4-.3-.4-.5-.8-.5-1.3 0-.9.7-1.6 1.6-1.6H16a5 5 0 0 0 5-5c0-3.9-4-6.7-9-6.7Z"/><circle cx="7.5" cy="10.5" r="1"/><circle cx="12" cy="7.5" r="1"/><circle cx="16.5" cy="10.5" r="1"/></g>
+    <g id="i-maximize"><path d="M9 3H5a2 2 0 0 0-2 2v4"/><path d="M15 3h4a2 2 0 0 1 2 2v4"/><path d="M21 15v4a2 2 0 0 1-2 2h-4"/><path d="M3 15v4a2 2 0 0 0 2 2h4"/></g>
+    <g id="i-loader"><path d="M12 3v4"/><path d="M12 17v4"/><path d="M5.6 5.6 8.4 8.4"/><path d="m15.6 15.6 2.8 2.8"/><path d="M3 12h4"/><path d="M17 12h4"/><path d="m5.6 18.4 2.8-2.8"/><path d="M15.6 8.4l2.8-2.8"/></g>
+    <g id="i-star"><path d="m12 3 2.9 5.9 6.5.9-4.7 4.6 1.1 6.5-5.8-3.1-5.8 3.1 1.1-6.5L2.6 9.8l6.5-.9Z"/></g>
+    <g id="i-pin"><path d="M12 17v5"/><path d="M9 3h6l-1 6 3.5 3v2H6.5v-2L10 9Z"/></g>
+    <g id="i-code"><path d="m8 6-6 6 6 6"/><path d="m16 6 6 6-6 6"/></g>
+    <g id="i-git-branch"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7"/><path d="M18 10.5c0 4-6 3-6 7.5"/></g>
+    <g id="i-alarm"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 1.5"/><path d="m5 3-2 2M19 3l2 2"/></g>
+    <g id="i-target"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4"/></g>
+    <g id="i-flame"><path d="M12 22c4 0 7-2.8 7-6.5 0-4.5-4-6-4-10.5-2 1-3 2.5-3 5-1.5-1-2-2.5-2-4.5-3 2-5 5-5 9.5C5 19.2 8 22 12 22Z"/></g>
+    <g id="i-copy-check"><path d="M9 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z"/><path d="M15 5.5V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h.5"/><path d="m12.5 15 1.8 1.8 3.2-3.6"/></g>
   </defs>
 </svg>
 
@@ -82,76 +126,132 @@ try {
 <div class="app" id="app">
   <div class="nav-backdrop" id="nav-backdrop" hidden></div>
 
-  <!-- ── 侧边栏 ─────────────────────────────────────────────── -->
+  <!-- ── 侧边栏 ───────────────────────────────────────────────────────── -->
   <aside class="sidebar" id="sidebar" aria-label="主导航">
     <div class="brand">
-      <div class="brand-mark">FM</div>
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26"><defs><linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8aa6ff"/><stop offset="1" stop-color="#b18cff"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="url(#bg1)"/><text x="16" y="22" font-family="Segoe UI,Inter,sans-serif" font-size="13" font-weight="800" fill="#0a0d16" text-anchor="middle">FM</text></svg>
+      </div>
       <div class="brand-text">
         <b>Console</b>
-        <span>FM 运营控制台</span>
+        <span>运营控制台</span>
       </div>
-      <button class="icon-btn brand-close" id="nav-close" type="button" aria-label="关闭导航">
+      <button class="icon-btn nav-collapse-btn" id="nav-collapse" type="button" title="收起导航 (Ctrl+B)" aria-label="收起导航">
+        <svg class="ico"><use href="#i-panel-left"/></svg>
+      </button>
+      <button class="icon-btn nav-close-btn" id="nav-close" type="button" aria-label="关闭导航">
         <svg class="ico"><use href="#i-close"/></svg>
       </button>
     </div>
-    <nav class="nav" id="nav"></nav>
-    <div class="sidebar-foot">
-      <div class="sidebar-status" id="sidebar-status">
-        <span class="dot" data-tone="muted"></span>
-        <span id="sidebar-status-text">未连接</span>
-      </div>
-      <a class="sidebar-link" href="/classic" target="_blank" rel="noopener">
-        <svg class="ico"><use href="#i-external"/></svg><span>旧版后台</span>
-      </a>
-      <a class="sidebar-link" href="/now" target="_blank" rel="noopener">
-        <svg class="ico"><use href="#i-activity"/></svg><span>状态页 /now</span>
-      </a>
-      <button class="sidebar-link sidebar-logout" id="sidebar-logout" type="button">
-        <svg class="ico"><use href="#i-logout"/></svg><span>退出登录</span>
+
+    <div class="nav-filter">
+      <svg class="ico nav-filter-ico"><use href="#i-search"/></svg>
+      <input id="nav-filter" type="text" placeholder="筛选页面…" autocomplete="off" spellcheck="false" aria-label="筛选导航">
+      <button class="nav-filter-clear" id="nav-filter-clear" type="button" hidden aria-label="清空筛选">
+        <svg class="ico"><use href="#i-close"/></svg>
       </button>
-      <div class="sidebar-version">FM Console v3 · <span id="build-stamp">native / 0 构建 · 26 视图</span></div>
+    </div>
+
+    <nav class="nav" id="nav"></nav>
+
+    <div class="sidebar-foot">
+      <button class="env-card" id="env-card" type="button" title="环境状态">
+        <span class="env-card-dot" id="env-dot" data-tone="muted"></span>
+        <span class="env-card-main">
+          <b id="sidebar-status-text">连接中…</b>
+          <small>API <span id="sidebar-latency">—</span></small>
+        </span>
+        <span class="env-card-spark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+      </button>
+      <div class="sidebar-links">
+        <a class="sidebar-link" href="/classic" target="_blank" rel="noopener" title="旧版后台">
+          <svg class="ico"><use href="#i-external"/></svg><span>旧版后台</span>
+        </a>
+        <a class="sidebar-link" href="/now" target="_blank" rel="noopener" title="状态页 /now">
+          <svg class="ico"><use href="#i-activity"/></svg><span>状态页</span>
+        </a>
+        <button class="sidebar-link sidebar-logout" id="sidebar-logout" type="button" title="退出登录">
+          <svg class="ico"><use href="#i-logout"/></svg><span>退出</span>
+        </button>
+      </div>
+      <div class="sidebar-version">FM Console <b>v4</b><span class="sidebar-version-dot"></span><span id="build-stamp">native · 31 视图</span></div>
     </div>
   </aside>
 
-  <!-- ── 主区域 ─────────────────────────────────────────────── -->
+  <!-- ── 主区域 ───────────────────────────────────────────────────────── -->
   <div class="main-wrap">
     <header class="topbar">
       <button class="icon-btn only-mobile" id="nav-open" type="button" aria-label="打开导航">
         <svg class="ico"><use href="#i-menu"/></svg>
       </button>
       <nav class="crumbs" id="crumbs" aria-label="面包屑"></nav>
+
       <div class="topbar-right">
-        <span class="net-badge" id="net-badge" title="连接状态"><span class="dot" data-tone="ok"></span><span id="net-text">在线</span></span>
+        <span class="env-pill" id="env-pill" title="环境与连接状态">
+          <span class="dot" id="env-pill-dot" data-tone="ok"></span>
+          <span class="env-pill-text" id="env-text">在线</span>
+          <span class="env-pill-latency" id="env-latency">—</span>
+        </span>
+
         <button class="btn btn-ghost btn-sm auto-refresh" id="auto-refresh" type="button" title="定时刷新当前页面（10 秒）">
           <svg class="ico"><use href="#i-clock"/></svg><span id="auto-refresh-text">自动刷新</span>
         </button>
-        <button class="btn btn-ghost btn-sm palette-trigger" id="palette-open" type="button" title="快速跳转">
+
+        <button class="palette-trigger" id="palette-open" type="button" title="全局搜索与跳转 (Ctrl+K)">
           <svg class="ico"><use href="#i-search"/></svg>
           <span class="palette-trigger-label">搜索 / 跳转</span>
-          <kbd>Ctrl</kbd><kbd>K</kbd>
+          <kbd class="kbd">Ctrl</kbd><kbd class="kbd">K</kbd>
         </button>
-        <button class="icon-btn" id="refresh" type="button" title="刷新当前页 (r)" aria-label="刷新当前页">
+
+        <button class="icon-btn" id="theme-toggle" type="button" title="切换深色 / 浅色 (T)" aria-label="切换主题">
+          <svg class="ico ico-theme-dark"><use href="#i-moon"/></svg>
+          <svg class="ico ico-theme-light"><use href="#i-sun"/></svg>
+        </button>
+
+        <button class="icon-btn" id="refresh" type="button" title="刷新当前页 (R)" aria-label="刷新当前页">
           <svg class="ico"><use href="#i-refresh"/></svg>
         </button>
-        <a class="user-chip" id="user-chip" href="#/settings" title="账号与设置">
-          <svg class="ico"><use href="#i-user"/></svg>
-          <span id="user-name">admin</span>
-        </a>
+
+        <div class="user-menu-wrap">
+          <button class="user-chip" id="user-chip" type="button" aria-haspopup="menu" aria-expanded="false" title="账号菜单">
+            <span class="user-avatar" id="user-avatar">A</span>
+            <span class="user-name" id="user-name">admin</span>
+            <svg class="ico user-caret"><use href="#i-chevron-down"/></svg>
+          </button>
+          <div class="user-menu" id="user-menu" hidden role="menu">
+            <div class="user-menu-head">
+              <span class="user-avatar lg" id="user-avatar-lg">A</span>
+              <div><b id="user-menu-name">admin</b><small id="user-menu-role">只读令牌</small></div>
+            </div>
+            <button class="user-menu-item" data-goto="#/settings" role="menuitem" type="button">
+              <svg class="ico"><use href="#i-gear"/></svg>账号与设置
+            </button>
+            <button class="user-menu-item" data-goto="#/selftest" role="menuitem" type="button">
+              <svg class="ico"><use href="#i-shield-check"/></svg>接口自检
+            </button>
+            <button class="user-menu-item" id="menu-shortcuts" role="menuitem" type="button">
+              <svg class="ico"><use href="#i-command"/></svg>快捷键 <kbd class="kbd">?</kbd>
+            </button>
+            <div class="user-menu-sep"></div>
+            <button class="user-menu-item bad" id="user-logout" role="menuitem" type="button">
+              <svg class="ico"><use href="#i-logout"/></svg>退出登录
+            </button>
+          </div>
+        </div>
       </div>
     </header>
 
     <main class="main" id="main" tabindex="-1">
       <div class="boot-skeleton" aria-hidden="true">
         <div class="sk sk-title"></div>
-        <div class="sk-row">
-          <div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div>
-        </div>
-        <div class="sk sk-block"></div>
+        <div class="sk-row"><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div><div class="sk sk-card"></div></div>
+        <div class="sk-row"><div class="sk sk-block"></div><div class="sk sk-block narrow"></div></div>
+        <div class="sk sk-block" style="height:220px"></div>
       </div>
     </main>
 
     <footer class="footer">
-      <span id="footer-left">FM 运营控制台 · 数据来自中控 + Cosmobot RPC + FM Domain</span>
+      <span id="footer-left">FM 运营控制台 · 中控 + Cosmobot RPC + FM Domain 实时数据</span>
       <span class="footer-right">
         <span id="footer-latency"></span>
         <span id="footer-time"></span>
@@ -160,33 +260,38 @@ try {
   </div>
 </div>
 
-<!-- ── 命令面板 ───────────────────────────────────────────────── -->
+<!-- ── 全局搜索 / 命令面板 ─────────────────────────────────────────── -->
 <div class="overlay palette-overlay" id="palette" hidden>
-  <div class="palette-box" role="dialog" aria-modal="true" aria-label="快速跳转与搜索">
+  <div class="palette-box" role="dialog" aria-modal="true" aria-label="全局搜索与命令">
     <div class="palette-input-wrap">
       <svg class="ico"><use href="#i-search"/></svg>
       <input id="palette-input" type="text" autocomplete="off" spellcheck="false"
-             placeholder="跳转页面、找群 / 成员 / 消息、打开接口…" aria-label="搜索">
+             placeholder="搜索页面 / 群 / 成员 / 消息 / 文档，或输入命令…" aria-label="搜索与命令">
+      <span class="palette-scope" id="palette-scope">全部</span>
       <button class="icon-btn" id="palette-close" type="button" aria-label="关闭">
         <svg class="ico"><use href="#i-close"/></svg>
       </button>
     </div>
     <div class="palette-body" id="palette-list"></div>
     <div class="palette-foot">
-      <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
-      <span><kbd>↵</kbd> 打开</span>
-      <span><kbd>Esc</kbd> 关闭</span>
-      <span class="palette-foot-tip" id="palette-tip">输入关键词可跨库搜索（群 / 成员 / 消息 / 文库 / 赛文 / 成绩）</span>
+      <span class="palette-hints">
+        <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
+        <span><kbd>↵</kbd> 打开</span>
+        <span><kbd>Esc</kbd> 关闭</span>
+        <span><kbd>Tab</kbd> 切换范围</span>
+      </span>
+      <span class="palette-foot-tip" id="palette-tip">支持跨库搜索，输入 ≥1 个字符开始</span>
     </div>
   </div>
 </div>
 
-<!-- ── 抽屉 ──────────────────────────────────────────────────── -->
+<!-- ── 详情抽屉 ──────────────────────────────────────────────────────── -->
 <div class="drawer" id="drawer" hidden>
   <div class="drawer-backdrop" data-drawer-close></div>
   <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
     <header class="drawer-head">
       <div class="drawer-heading">
+        <div class="drawer-eyebrow" id="drawer-eyebrow"></div>
         <div class="drawer-title" id="drawer-title">详情</div>
         <div class="drawer-sub" id="drawer-sub"></div>
       </div>
@@ -206,9 +311,11 @@ try {
 
 <div id="modal-root"></div>
 <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+<div class="chart-tooltip-holder" id="chart-tip-holder" hidden></div>
 
-<script src="/static/echarts.min.js"></script>
 <script src="/static/console.js"></script>
+<script src="/static/pages-core.js"></script>
 <script src="/static/pages-v3.js"></script>
+<script src="/static/pages-v4.js"></script>
 </body>
 </html>
