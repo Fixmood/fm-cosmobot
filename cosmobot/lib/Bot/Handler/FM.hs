@@ -826,39 +826,39 @@ allCompetitionRankQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
-        -- 2026-11-15 所有者：全部 = **官网能查的排行榜**（四大赛事 + 各群群赛文 + 555），
-        -- 清单来自 domain /contests/today：今天确实有成绩的才列，没有的不编。
-        response <- HTTP.runReq $
-          req GET (http "172.20.0.4" /: "contests" /: "today") NoReqBody jsonResponse
-            (port 8077)
+        -- 2026-11-15 所有者选 B：全部 = 官网能查的**全部**（含没成绩的），
+        -- 顺序：虎杯 → 锦标赛 → 极速杯 → 极速联赛 → 555 → 六个可查群的群赛文。
+        -- 没成绩的赛文图会自己写「今天还没有这个赛文的成绩」，不编造数据。
         let cacheBase = maybe "0" (Text.pack . show) message.messageId
-            allowed = ["HB" :: Text, "100000", "99999", "100004", "555", "999"]
-            picked =
-              [ pair
-              | pair@(contest, _) <- parseContestTodayItems (responseBody response)
-              , contest `elem` allowed
+            officialContests =
+              [ ("HB" :: Text, "" :: Text)
+              , ("100000", "")
+              , ("99999", "")
+              , ("100004", "")
+              , ("555", "")
               ]
-            -- 2026-11-15 所有者指定的顺序：虎杯 → 锦标赛 → 极速杯 → 极速联赛 → 555 → 群赛文
-            order = ["HB" :: Text, "100000", "99999", "100004", "555", "999"]
-            orderedPicks =
-              [ pair
-              | key <- order
-              , pair@(contest, _) <- picked
-              , contest == key
+            groupContests =
+              [ ("999" :: Text, gid :: Text)
+              | gid <-
+                  [ "776227233" :: Text
+                  , "1021522088"
+                  , "151040026"
+                  , "201323122"
+                  , "391047371"
+                  , "488748631"
+                  ]
               ]
+            picks = officialContests <> groupContests
             urls =
               [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
                   <> "&group_id=" <> urlEncodeText groupId
                   <> "&limit=5&_=" <> cacheBase <> contest <> groupId
-              | (contest, groupId) <- orderedPicks
+              | (contest, groupId) <- picks
               ]
-        if null urls
-          then sendStandalone message "今天还没有任何赛文有成绩，晚点再来看看。"
-          else do
-            let body = Text.unlines (map ReplyBody.imageDirective urls)
-            sent <- Chat.replyTo (standaloneMessage message) body
-            when (null (rights sent)) $
-              sendStandalone message "全部排行榜图片发送失败，稍后再试。"
+        let body = Text.unlines (map ReplyBody.imageDirective urls)
+        sent <- Chat.replyTo (standaloneMessage message) body
+        when (null (rights sent)) $
+          sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
 isAllCompetitionRankQuick message =
