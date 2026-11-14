@@ -7488,11 +7488,13 @@ def merge_contest_rows(rows):
 
 
 def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
-    """赛文排行榜「表格风格」图（与 FM AI赛文排行榜 同一套视觉）。
+    """赛文排行榜「表格风格」图（官网优先；成绩库只用于**当天**兜底）。
 
-    2026-11-15：虎杯/锦标赛不能重打 → 不显示「重打」列；其它赛文有数据才显示。
+    2026-11-15 所有者：排行榜要优先官网实时；成绩库也必须只取今天的记录，不能拿 30 天历史
+    拼一张「今日榜」。群赛文（无官网）默认今天，明确说「最近 N 天」才展开。
     """
     from PIL import Image, ImageDraw, ImageFont
+    from datetime import date
 
     raw_contest = query_value(query, "contest").strip()
     key = resolve_contest_key(raw_contest) or ""
@@ -7500,53 +7502,116 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     group = resolve_group_id(db, query_value(query, "group_id").strip())
     days = query_int(query, "days", 0, 0, 3660)
     limit = query_int(query, "limit", 12, 1, 60)
+    today = date.today().isoformat()
     room = group if scope == "group" else ""
 
-    sql = ("SELECT user_id, user_name, speed, accuracy, code_length, word_rate, raw_text "
-           "FROM contest_scores WHERE contest_key=? AND group_id=?")
-    params = [key, room]
-    if days > 0:
-        from datetime import date, timedelta
-        since = (date.today() - timedelta(days=days - 1)).isoformat()
-        sql += " AND score_date >= ?"
-        params.append(since)
-    sql += " ORDER BY speed DESC"
-    records = db.execute(sql, tuple(params)).fetchall()
+    official = key in ("HB", "100000", "99999", "100004")
+    source_label = ""
+    rows_data = []
 
-    def canonical(value):
-        parts = [p for p in re.split(r"[\u300c\u300d\u300e\u300f\uff08\uff09()\[\]\u3010\u3011\s]+", value or "") if len(p) >= 2]
-        latin = [p for p in parts if re.fullmatch(r"[A-Za-z0-9_]+", p)]
-        return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
+    if official:
+        def canonical_name(value):
+            parts = [p for p in re.split(r"[\u300c\u300d\u300e\u300f\uff08\uff09()\[\]\u3010\u3011\s]+", value or "") if len(p) >= 2]
+            latin = [p for p in parts if re.fullmatch(r"[A-Za-z0-9_]+", p)]
+            return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
 
-    merged = {}
-    for row in records:
-        name = str(row["user_name"] or row["user_id"] or "?")
-        ident = canonical(name) or str(row["user_id"] or name)
-        entry = merged.get(ident)
-        if entry is None:
-            entry = {"user_name": name, "best": 0.0, "accuracy": 0.0, "code_length": 0.0,
-                     "word_rate": 0.0, "key": 0.0, "correction": 0.0, "n": 0}
-            merged[ident] = entry
-        speed = float(row["speed"] or 0)
-        entry["n"] += 1
-        if speed >= float(entry["best"] or 0):
-            entry["best"] = speed
-            if len(name) >= len(str(entry["user_name"] or "")):
-                entry["user_name"] = name
-            entry["accuracy"] = float(row["accuracy"] or 0)
-            entry["code_length"] = float(row["code_length"] or 0)
-            word_rate = float(row["word_rate"] or 0)
-            entry["word_rate"] = word_rate * 100 if word_rate and word_rate <= 1 else word_rate
+        archive = {}
+        for item in db.execute(
+            "SELECT user_name, speed, source_json FROM competition_scores "
+            "WHERE competition_date=? AND source_group=?", (today, label)
+        ).fetchall():
+            name = str(item["user_name"] or "?")
             try:
-                payload = json.loads(row["raw_text"] or "{}")
+                payload = json.loads(item["source_json"] or "{}")
             except (TypeError, ValueError):
                 payload = {}
-            entry["key"] = float(payload.get("key") or payload.get("hit_rate") or 0)
-            entry["correction"] = float(payload.get("correction") or payload.get("correction_count") or 0)
+            word_rate = float(payload.get("word_rate") or payload.get("word_ratio") or 0)
+            archive[canonical_name(name)] = {
+                "user_name": name,
+                "best": float(item["speed"] or 0),
+                "accuracy": float(payload.get("acc") or payload.get("accuracy") or 0),
+                "key": float(payload.get("key") or payload.get("hit_rate") or 0),
+                "code_length": float(payload.get("code_length") or payload.get("kpw") or 0),
+                "word_rate": word_rate * 100 if 0 < word_rate <= 1 else word_rate,
+                "correction": float(payload.get("correction_count") or payload.get("correction") or 0),
+                "n": 1,
+            }
 
-    rows = sorted(merged.values(), key=lambda item: -float(item["best"] or 0))[:limit]
+        live = contest_live_rows(key, room)
+        merged_official = {}
+        for item in live:
+            name = str(item.get("name") or item.get("user_name") or item.get("user_id") or "?")
+            ident = canonical_name(name) or name
+            base = archive.get(ident, {})
+            ratio = float(item.get("word_ratio") or 0)
+            merged_official[ident] = {
+                "user_name": name,
+                "best": float(item.get("speed") or base.get("best") or 0),
+                "accuracy": float(item.get("acc") or base.get("accuracy") or 0),
+                "key": float(item.get("key") or item.get("hit_rate") or base.get("key") or 0),
+                "code_length": float(item.get("code") or base.get("code_length") or 0),
+                "word_rate": float(item.get("word_rate") or base.get("word_rate") or 0) * (100 if ratio and ratio <= 1 else 1),
+                "correction": float(item.get("back") or base.get("correction") or 0),
+                "n": 1,
+            }
+        for ident, base in archive.items():
+            merged_official.setdefault(ident, base)
+        rows_data = sorted(merged_official.values(), key=lambda item: -float(item["best"] or 0))
+        source_label = "官网实时" if live else ("官网成绩（今日）" if rows_data else "官网（今日暂无）")
 
-    # 虎杯 / 锦标赛 不能重打 → 不显示重打列；其它赛文若一条重打数据都没有也隐藏
+    else:
+        # 群赛文 / 555：默认今天；用户明确说最近 N 天才按区间
+        sql = ("SELECT user_id, user_name, speed, accuracy, code_length, word_rate, raw_text "
+               "FROM contest_scores WHERE contest_key=? AND group_id=?")
+        params = [key, room]
+        if days > 0:
+            from datetime import timedelta
+            since = (date.today() - timedelta(days=days - 1)).isoformat()
+            sql += " AND score_date >= ?"
+            params.append(since)
+        else:
+            sql += " AND score_date = ?"
+            params.append(today)
+        sql += " ORDER BY speed DESC"
+        records = db.execute(sql, tuple(params)).fetchall()
+
+        def canonical(value):
+            parts = [p for p in re.split(r"[\u300c\u300d\u300e\u300f\uff08\uff09()\[\]\u3010\u3011\s]+", value or "") if len(p) >= 2]
+            latin = [p for p in parts if re.fullmatch(r"[A-Za-z0-9_]+", p)]
+            return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
+
+        merged = {}
+        for row in records:
+            name = str(row["user_name"] or row["user_id"] or "?")
+            ident = canonical(name) or str(row["user_id"] or name)
+            entry = merged.get(ident)
+            if entry is None:
+                entry = {"user_name": name, "best": 0.0, "accuracy": 0.0, "code_length": 0.0,
+                         "word_rate": 0.0, "key": 0.0, "correction": 0.0, "n": 0}
+                merged[ident] = entry
+            speed = float(row["speed"] or 0)
+            entry["n"] += 1
+            if speed >= float(entry["best"] or 0):
+                entry["best"] = speed
+                if len(name) >= len(str(entry["user_name"] or "")):
+                    entry["user_name"] = name
+                entry["accuracy"] = float(row["accuracy"] or 0)
+                entry["code_length"] = float(row["code_length"] or 0)
+                word_rate = float(row["word_rate"] or 0)
+                entry["word_rate"] = word_rate * 100 if word_rate and word_rate <= 1 else word_rate
+                try:
+                    payload = json.loads(row["raw_text"] or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                entry["key"] = float(payload.get("key") or payload.get("hit_rate") or 0)
+                entry["correction"] = float(payload.get("correction") or payload.get("correction_count") or 0)
+        rows_data = sorted(merged.values(), key=lambda item: -float(item["best"] or 0))
+        source_label = "成绩库（今日）" if days <= 0 else f"成绩库（最近 {days} 天）"
+
+    rows = rows_data[:limit]
+    if official:
+        rows.sort(key=lambda item: -float(item["best"] or 0))
+
     no_retype_contests = {"HB", "100000"}
     show_retype = key not in no_retype_contests and any(float(r.get("correction") or 0) > 0 for r in rows)
 
@@ -7620,9 +7685,9 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         where = f"（{group_display_name(db, group)}）"
     elif scope != "group":
         where = "（全群）"
-    when = "全部时间" if days <= 0 or days >= 3660 else f"最近 {days} 天"
+    when = "今日" if days <= 0 or official else f"最近 {days} 天"
     title = "FM AI赛文排行榜" if key == "555" else f"FM {label}排行榜"
-    subtitle = f"{time.strftime('%Y-%m-%d')}  |  {label}{where}  |  {when}  |  成绩库"
+    subtitle = f"{today}  |  {label}{where}  |  {when}  |  {source_label}"
 
     width = 1240
     row_height = 74
@@ -7645,7 +7710,7 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     for x, name in columns:
         draw.text((x, 168), name, font=font(20), fill=(184, 196, 214))
     if not rows:
-        text = f"最近 {days} 天还没有这个赛文的成绩。" if days > 0 else "还没有这个赛文的成绩记录。"
+        text = "今天官网还没有这个赛文的成绩。" if official else "今天还没有这个赛文的成绩。"
         draw.text((52, 240), text, font=font(24), fill=(200, 120, 120))
     for index, item in enumerate(rows, 1):
         top = 224 + (index - 1) * row_height
@@ -7679,12 +7744,10 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
             draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=correction_color(corr))
         acc = float(item.get("accuracy") or 0)
         draw.text((col_acc, top + 18), f"{acc:.2f}%" if acc > 0 else "—", font=font(22), fill=accuracy_color(acc))
-    footer = f"共 {len(rows)} 人 | 每人保留最高速度（成绩条数 {sum(int(r.get('n') or 0) for r in rows)}）"
+    footer = f"共 {len(rows)} 人 | 每人保留当日最高速度" if official else f"共 {len(rows)} 人 | 每人保留最高速度（成绩条数 {sum(int(r.get('n') or 0) for r in rows)}）"
     draw.text((48, height - 62), footer, font=font(18), fill=DIMMED)
-    legend = "颜色：速度分档（<130 蓝 / <150 青 / <180 金 / <200 橙 / ≥200 粉）· 键准 ≥98 绿、<90 红"
-    if show_retype:
-        legend += " · 重打越多越红"
-    else:
+    legend = f"数据来源：{source_label} · 颜色：速度分档 · 键准 ≥98 绿、<90 红"
+    if not show_retype:
         legend += " · 本赛文不能重打，未列重打"
     draw.text((48, height - 36), legend, font=font(15), fill=(96, 106, 122))
     output = io.BytesIO()
