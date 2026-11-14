@@ -39,6 +39,21 @@ LOGIN_FAILURES: dict[str, list[float]] = {}
 SESSION_TTL = 24 * 60 * 60
 LOGIN_LOCKOUT_AFTER = 5
 LOGIN_LOCKOUT_SECONDS = 60
+# v4：全接口限流（按登录 session 计数；令牌桶 = 平均 RATE_LIMIT_PER_MIN 次/分钟，
+# 突发容量 RATE_LIMIT_BURST）。默认 60 次/分钟 + 突发 120，环境变量可调，
+# 自检/内部探针带 X-FM-Selftest: 1 头不计数。
+RATE_LIMIT_PER_MIN = max(1, int(os.environ.get("FM_ADMIN_RATE_PER_MIN", "60") or 60))
+RATE_LIMIT_BURST = max(
+    RATE_LIMIT_PER_MIN,
+    int(os.environ.get("FM_ADMIN_RATE_BURST", str(RATE_LIMIT_PER_MIN * 2)) or (RATE_LIMIT_PER_MIN * 2)),
+)
+RATE_BUCKETS: dict[str, dict] = {}
+RATE_LOCK = threading.RLock()
+RATE_BUCKET_MAX_KEYS = 500
+RATE_LIMITED_TOTAL = {"count": 0}
+# v4：慢接口日志阈值（>2s 记 error，进 /api/errors/stats；SSE/CSV 流式接口不计）
+SLOW_REQUEST_MS = float(os.environ.get("FM_ADMIN_SLOW_MS", "2000") or 2000)
+SLOW_PATH_SKIP = ("logs/stream", "export/", "selftest")
 COLLECTIONS = {"groups", "triggers", "personas", "models"}
 VERSION_LIMIT = 100
 ERROR_LIMIT = 100
@@ -124,6 +139,114 @@ def login_failed(ip: str) -> None:
 
 def clear_login_failures(ip: str) -> None:
     LOGIN_FAILURES.pop(ip, None)
+
+
+# ══ v4：限流（令牌桶，按 session id / IP）════════════════════════════
+def rate_limit_config() -> dict:
+    return {
+        "per_min": RATE_LIMIT_PER_MIN,
+        "burst": RATE_LIMIT_BURST,
+        "slow_ms": SLOW_REQUEST_MS,
+        "bucket_keys": len(RATE_BUCKETS),
+        "key_max": RATE_BUCKET_MAX_KEYS,
+        "limited_total": int(RATE_LIMITED_TOTAL.get("count") or 0),
+        "env": {"FM_ADMIN_RATE_PER_MIN": os.environ.get("FM_ADMIN_RATE_PER_MIN"),
+                "FM_ADMIN_RATE_BURST": os.environ.get("FM_ADMIN_RATE_BURST"),
+                "FM_ADMIN_SLOW_MS": os.environ.get("FM_ADMIN_SLOW_MS")},
+        "note": "每个登录 session 平均 60 次/分钟（突发 120 个令牌），超出返回 429 + Retry-After；"
+                "自检内部探针带 X-FM-Selftest: 1 头免计数。",
+    }
+
+
+def rate_limit_check(key: str, cost: float = 1.0) -> tuple[bool, int, int]:
+    """令牌桶：返回 (是否放行, 建议重试秒数, 剩余令牌)。"""
+    now = time.time()
+    rate = RATE_LIMIT_PER_MIN / 60.0
+    with RATE_LOCK:
+        bucket = RATE_BUCKETS.get(key)
+        if bucket is None:
+            if len(RATE_BUCKETS) >= RATE_BUCKET_MAX_KEYS:
+                # 简单清理：丢掉两个小时没动过的桶
+                stale = [name for name, item in RATE_BUCKETS.items()
+                         if now - float(item.get("at") or 0) > 7200]
+                for name in stale:
+                    RATE_BUCKETS.pop(name, None)
+                if len(RATE_BUCKETS) >= RATE_BUCKET_MAX_KEYS:
+                    RATE_BUCKETS.clear()
+            bucket = {"tokens": float(RATE_LIMIT_BURST), "at": now}
+            RATE_BUCKETS[key] = bucket
+        elapsed = max(0.0, now - float(bucket.get("at") or now))
+        bucket["tokens"] = min(float(RATE_LIMIT_BURST), float(bucket.get("tokens") or 0.0) + elapsed * rate)
+        bucket["at"] = now
+        if bucket["tokens"] >= cost:
+            bucket["tokens"] -= cost
+            return True, 0, int(bucket["tokens"])
+        needed = (cost - float(bucket["tokens"])) / rate
+        RATE_LIMITED_TOTAL["count"] = int(RATE_LIMITED_TOTAL.get("count") or 0) + 1
+        return False, max(1, int(needed + 0.999)), 0
+
+
+def rate_limit_key_for(session: dict | None, handler: BaseHTTPRequestHandler) -> str:
+    if session and session.get("session_id"):
+        return "session:" + str(session["session_id"])
+    if session and session.get("username"):
+        return "user:" + str(session.get("username"))
+    return "ip:" + client_ip(handler)
+
+
+def kick_admin_session(ident: object, current: dict | None = None, allow_self: bool = False) -> dict:
+    """DELETE /api/v2/sessions/{id}：踢掉一个后台登录会话。
+
+    id 支持三种写法：完整 session id、GET /api/v2/sessions 返回的脱敏形式
+    （abcdef…wxyz，中间是 U+2026）、或前后缀片段。默认不能踢自己（?self=1 放开）。
+    """
+    text = str(ident or "").strip()
+    if not text:
+        raise ValueError("缺少 session id（用 GET /api/v2/sessions 的 session_id，脱敏值也行）")
+    current_id = str((current or {}).get("session_id") or "")
+    plain = text.replace("\u2026", "...")
+
+    def matches(session_id: str) -> bool:
+        if text in (session_id, _mask_session_id(session_id)):
+            return True
+        if "..." in plain:
+            prefix, _, suffix = plain.partition("...")
+            return bool(prefix) and session_id.startswith(prefix) and (not suffix or session_id.endswith(suffix))
+        if len(text) >= 8 and (session_id.startswith(text) or session_id.endswith(text)):
+            return True
+        return False
+
+    with LOCK:
+        candidates = list(SESSIONS.keys())
+    matched = [session_id for session_id in candidates if matches(session_id)]
+    kicked: list[dict] = []
+    skipped: list[dict] = []
+    with LOCK:
+        for session_id in matched:
+            if session_id == current_id and not allow_self:
+                skipped.append({"session_id": _mask_session_id(session_id), "reason": "这是当前会话"})
+                continue
+            session = SESSIONS.pop(session_id, None)
+            if session is None:
+                continue
+            kicked.append({
+                "session_id": _mask_session_id(session_id),
+                "username": str(session.get("username") or ""),
+                "is_admin": bool(session.get("is_admin")),
+                "login_at_text": time.strftime("%Y-%m-%d %H:%M:%S",
+                                               time.localtime(float(session.get("login_time") or 0)))
+                if session.get("login_time") else "",
+            })
+        remaining = len(SESSIONS)
+    return {
+        "requested": text if len(text) <= 40 else text[:40],
+        "matched": len(matched),
+        "kicked": kicked,
+        "count": len(kicked),
+        "skipped": skipped,
+        "remaining": remaining,
+        "note": "被踢的会话立即失效（cookie 仍在浏览器里但服务端已删）。可用 ?self=1 强制踢当前会话。",
+    }
 
 
 def session_from_request(handler: BaseHTTPRequestHandler) -> dict | None:
@@ -1428,8 +1551,9 @@ SELFTEST_HTTP_ROUTES: list[tuple[str, str, bool]] = [
     ("v2:models", "/api/v2/models", True),
     ("v2:group/capability", "/api/v2/group/capability?id=216063968", True),
     ("v2:backup/list", "/api/v2/backup/list", True),
-    ("v2:sessions", "/api/v2/sessions", True),
-    ("v2:tokens", "/api/v2/tokens", True),
+    # sessions/tokens 需要 is_admin 会话；只读 token 调用自检时降级为 warn，不算失败
+    ("v2:sessions", "/api/v2/sessions", False),
+    ("v2:tokens", "/api/v2/tokens", False),
     ("v2:domain?path=/health", "/api/v2/domain?path=/health", True),
     ("v2:domain?path=/stats", "/api/v2/domain?path=/stats", True),
     ("v2:ops/logs", "/api/v2/ops/logs?tail=5", False),
@@ -1450,6 +1574,20 @@ SELFTEST_HTTP_ROUTES: list[tuple[str, str, bool]] = [
     ("v2:domain?path=/version", "/api/v2/domain?path=/version", True),
     ("v2:domain?path=/contest/chart-data", "/api/v2/domain?path=/contest/chart-data&contest=HB&days=7", False),
     ("v2:domain?path=/novel/stats", "/api/v2/domain?path=/novel/stats", True),
+    # ── v4 新增接口（分析 / 内容管理 / 运维 v2 / 健康历史）────────────
+    ("v4:analytics/messages", "/api/v2/analytics/messages?days=7", True),
+    ("v4:analytics/groups", "/api/v2/analytics/groups?days=7&limit=5", True),
+    ("v4:analytics/senders", "/api/v2/analytics/senders?days=7&limit=5", True),
+    ("v4:analytics/latency", "/api/v2/analytics/latency?days=7", True),
+    ("v4:analytics/tokens", "/api/v2/analytics/tokens?days=7", True),
+    ("v4:library", "/api/v2/library?limit=2", True),
+    ("v4:contests", "/api/v2/contests", True),
+    ("v4:members/leaderboard", "/api/v2/members/leaderboard?days=7&limit=3", True),
+    ("v4:novels(cached+q)", "/api/v2/novels?limit=2", False),
+    ("v4:ops/stats", "/api/v2/ops/stats", False),
+    ("v4:ops/cron", "/api/v2/ops/cron", False),
+    ("v4:health/history", "/api/v2/health/history?days=7", False),
+    ("v4:cache/stats", "/api/v2/cache/stats", False),
 ]
 
 # 写接口清单（自检不自动执行，避免副作用；这里登记给「自检」页做验收清单）
@@ -1458,7 +1596,10 @@ SELFTEST_WRITE_ENDPOINTS: list[dict] = [
     {"method": "POST", "path": "/api/v2/memory/file", "note": "写记忆/人设文件（白名单+备份+sha 校验+审计）"},
     {"method": "POST", "path": "/api/v2/models/switch", "note": "切换模型（RPC probe 热切换；改 effort 走文件+重启）"},
     {"method": "POST", "path": "/api/v2/group/capability", "note": "改群能力（代理 domain POST + 回读校验+审计）"},
-    {"method": "POST", "path": "/api/v2/ops/rollback", "note": "回滚镜像（受保护：只校验+人工步骤）"},
+    {"method": "POST", "path": "/api/v2/ops/rollback", "note": "真实安全回滚（需 confirm:true；宿主机代理 stop→rename→run→健康检查→失败自动恢复）"},
+    {"method": "POST", "path": "/api/v2/ops/config-backup", "note": "备份 /runtime/config.toml 到 /opt/fm-admin/data/backups（宿主机代理执行）"},
+    {"method": "POST", "path": "/api/v2/ops/cron-set", "note": "cron 写入未实现（固定返回 501）；只读用 GET /api/v2/ops/cron"},
+    {"method": "DELETE", "path": "/api/v2/sessions/{id}", "note": "踢掉一个后台登录会话（脱敏 id 也可；默认不许踢自己，?self=1 放开）"},
     {"method": "GET", "path": "/api/v2/export/chat", "note": "下载聊天 CSV（流式+审计）"},
     {"method": "GET", "path": "/api/v2/export/audit", "note": "下载审计 CSV（流式+审计）"},
     {"method": "POST", "path": "/api/v2/backup/create", "note": "创建 bot/domain 备份（校验+审计）"},
@@ -1498,6 +1639,41 @@ class Api(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.FORBIDDEN, "只读用户无权执行修改操作。")
             return False
         return True
+
+    # ══ v4：限流闸门 ═════════════════════════════════════════════════
+    def v2_rate_gate(self) -> bool:
+        """每个 /api/v2 请求过令牌桶；超限返回 429（带 Retry-After）。
+
+        自检内部探针（X-FM-Selftest: 1）不计数，否则 40+ 项自检会把自己的限流打爆。
+        """
+        if str(self.headers.get("X-FM-Selftest") or "") == "1":
+            return True
+        session = self.current_session()
+        key = rate_limit_key_for(session, self)
+        allowed, retry_after, remaining = rate_limit_check(key)
+        if allowed:
+            return True
+        payload = json.dumps({
+            "ok": False,
+            "error": "请求过于频繁：每个会话平均 %d 次/分钟（突发 %d），请 %d 秒后重试。"
+                     % (RATE_LIMIT_PER_MIN, RATE_LIMIT_BURST, retry_after),
+            "retry_after": retry_after,
+            "rate_limit": {"per_min": RATE_LIMIT_PER_MIN, "burst": RATE_LIMIT_BURST},
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Retry-After", str(retry_after))
+        self.send_header("X-RateLimit-Limit", str(RATE_LIMIT_PER_MIN))
+        self.send_header("X-RateLimit-Burst", str(RATE_LIMIT_BURST))
+        self.send_header("X-RateLimit-Remaining", str(remaining))
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return False
 
     def handle_login(self) -> None:
         ip = client_ip(self)
@@ -1873,8 +2049,26 @@ class Api(BaseHTTPRequestHandler):
 
 
     def handle_api_v2(self, request) -> None:
+        """v4 包装层：限流闸门 + 慢接口日志（>2s 记 error），业务在 _handle_api_v2。"""
+        started = time.monotonic()
+        if not self.v2_rate_gate():
+            return
+        try:
+            self._handle_api_v2(request)
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            path = str(getattr(request, "path", "") or "")
+            if elapsed_ms >= SLOW_REQUEST_MS and not any(token in path for token in SLOW_PATH_SKIP):
+                try:
+                    record_error("slow", "慢接口 %.0fms（阈值 %.0fms）：%s"
+                                 % (elapsed_ms, SLOW_REQUEST_MS, path), "admin", path)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _handle_api_v2(self, request) -> None:
         """一次性补齐的后台 v2 接口（见 api_v2.py）。"""
         import api_v2 as v2
+        import api_v4 as v4
         query = parse_qs(request.query)
         arg = lambda name, default="": (query.get(name, [default])[0] or default)
         route = request.path[len("/api/v2/"):].strip("/")
@@ -2001,9 +2195,10 @@ class Api(BaseHTTPRequestHandler):
                 else:
                     data = v2.run_action(action_name, payload, None)
             elif route == "novels":
-                data = v2.novels(fetch_domain)
+                # v4：加 30s 缓存 + q 关键字搜索 / 分页（domain /novel/stats 是 POST，缓存 30s）
+                data = v4.novels_cached(fetch_domain, arg("q"), arg("limit", "20"), arg("offset", "0"))
             elif route == "novel":
-                data = v2.novel_detail(arg("id"), fetch_domain)
+                data = v4.novel_detail_cached(fetch_domain, arg("id"))
             # ── v3: 配置编辑（A）──────────────────────────────────────────
             elif route == "config/toml":
                 if self.command == "POST":
@@ -2078,13 +2273,15 @@ class Api(BaseHTTPRequestHandler):
                     return
             # ── v3: 运维监控（E）────────────────────────────────────────
             elif route == "ops/logs":
-                data = v2.ops_logs(arg("tail", "200"), arg("since"))
+                # v4：支持 grep 过滤、最多 500 行
+                data = v4.ops_logs_v2(arg("tail", "200"), arg("since"), arg("grep"))
             elif route == "ops/metrics":
                 data = v2.ops_metrics()
             elif route == "ops/images":
                 data = v2.ops_images(arg("live").lower() in {"1", "true", "yes", "on"})
             elif route == "ops/cron":
-                data = v2.ops_cron()
+                # v4：只读 crontab（解析成 schedule/command；cron_set 未实现→501）
+                data = v4.ops_cron_list()
             elif route == "ops/result":
                 data = v2.ops_result_view(arg("request_id"))
             elif route == "ops/rollback":
@@ -2096,7 +2293,13 @@ class Api(BaseHTTPRequestHandler):
                 payload = self.read_json()
                 if not isinstance(payload, dict):
                     raise v2.ApiError("请求体必须是 JSON 对象")
-                data = v2.ops_rollback(payload.get("image"))
+                # v4：真实安全回滚（宿主机代理 stop→rename→run→健康检查→失败自动恢复），
+                # 必须带 confirm:true；返回结果里带 result_file 路径供审计。
+                data = v4.ops_rollback_safe(
+                    payload.get("image"),
+                    payload.get("confirm"),
+                    payload.get("keep_old", True),
+                )
                 record_audit("rollback", "ops", str(payload.get("image") or ""), actor)
             # ── v3: 导出 CSV（F）────────────────────────────────────────
             elif route == "export/chat":
@@ -2194,6 +2397,54 @@ class Api(BaseHTTPRequestHandler):
                     raise v2.ApiError(str(exc), 403)
                 except RuntimeError as exc:
                     raise v2.ApiError(str(exc), 502)
+            # ══ v4: A. 分析类（sqlite chat_log / audit_log）═════════════════
+            elif route == "analytics/messages":
+                data = v4.analytics_messages(arg("days", "14"))
+            elif route == "analytics/groups":
+                data = v4.analytics_groups(arg("days", "30"), arg("limit", "50"), fetch_domain)
+            elif route == "analytics/senders":
+                data = v4.analytics_senders(arg("days", "7"), arg("limit", "20"), fetch_domain)
+            elif route == "analytics/latency":
+                data = v4.analytics_latency(arg("days", "7"))
+            elif route == "analytics/tokens":
+                data = v4.analytics_tokens(arg("days", "7"))
+            # ══ v4: B. 内容管理（代理 fm-domain + TTL 缓存）════════════════
+            elif route == "library":
+                data = v4.library_list(fetch_domain, arg("limit", "20"), arg("offset", "0"),
+                                       arg("q"), arg("difficulty"), arg("group_id"))
+            elif route == "library/text":
+                data = v4.library_text(fetch_domain, arg("id"))
+            elif route == "contests":
+                data = v4.contests(fetch_domain)
+            elif route == "members/leaderboard":
+                data = v4.members_leaderboard(fetch_domain, arg("days", "7"), arg("limit", "20"),
+                                              arg("group_id"), arg("metric"))
+            # ══ v4: C. 运维增强（宿主机 ops-agent v2）═════════════════════
+            elif route == "ops/stats":
+                data = v4.ops_stats()
+            elif route == "ops/cron-set":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                data = v4.ops_cron_set(payload.get("line") or arg("line"))
+            elif route == "ops/config-backup":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                data = v4.ops_config_backup()
+                record_audit("backup", "config.toml", str(data.get("file") or ""), actor)
+            # ══ v4: D. 健康历史 / 缓存状态 ═════════════════════════════════
+            elif route == "health/history":
+                data = v4.health_history(arg("days", "7"))
+            elif route == "cache/stats":
+                data = v4.cache_stats(rate_limit_config())
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "未知的 v2 接口")
                 return
@@ -2313,11 +2564,16 @@ class Api(BaseHTTPRequestHandler):
             pass
 
     def _selftest_http_checks(self) -> list[dict]:
-        """以当前 cookie 对本机接口发真实 HTTP 请求，拿到每项状态码与耗时。"""
+        """以当前 cookie 对本机接口发真实 HTTP 请求，拿到每项状态码与耗时。
+
+        v4：探针带 X-FM-Selftest: 1 头 → 免限流计数（否则 50+ 项自检会把自己的
+        60 次/分钟限流打爆，自检结果会全是 429）。
+        """
         port = int(getattr(self.server, "server_address", ("", 8090))[1] or 8090)
         cookie = str(self.headers.get("Cookie") or "")
         checks: list[dict] = []
-        for name, path, required in SELFTEST_HTTP_ROUTES:
+
+        def probe(name: str, path: str, required: bool = True) -> None:
             started = time.monotonic()
             status: int | None = None
             body = b""
@@ -2325,6 +2581,7 @@ class Api(BaseHTTPRequestHandler):
             try:
                 request = Request("http://127.0.0.1:%d%s" % (port, path),
                                   headers={"Cookie": cookie, "Accept": "application/json",
+                                           "X-FM-Selftest": "1",
                                            "User-Agent": "fm-admin-selftest/1.0"})
                 with urlopen(request, timeout=25) as response:
                     status = int(response.status)
@@ -2366,11 +2623,31 @@ class Api(BaseHTTPRequestHandler):
                 "required": bool(required),
                 "error": error_text,
             })
+
+        for name, path, required in SELFTEST_HTTP_ROUTES:
+            probe(name, path, required)
+        # v4：文库正文要动态取一个真实 id 才能探（id 是哈希，别硬编码）
+        try:
+            import api_v4 as v4
+            library = v4.library_list(fetch_domain, 1, 0)
+            items = library.get("items") or []
+            text_id = str((items[0] or {}).get("id") or "") if items else ""
+        except Exception:  # noqa: BLE001
+            text_id = ""
+        if text_id:
+            probe("v4:library/text", "/api/v2/library/text?id=" + text_id, True)
+        else:
+            checks.append({
+                "name": "v4:library/text", "kind": "http", "method": "GET", "path": "",
+                "http_status": None, "ms": 0.0, "ok": False, "level": "warn",
+                "required": False, "error": "拿不到文库 id，跳过正文探针（/library/list 无数据）",
+            })
         return checks
 
     def handle_selftest(self) -> None:
         """GET /api/v2/selftest：内部资源项 + 逐接口 HTTP 探针，红/绿/黄色验收清单。"""
         import api_v2 as v2
+        import api_v4 as v4
         started = time.monotonic()
         internal: list[dict] = []
         harness_error = ""
@@ -2378,6 +2655,11 @@ class Api(BaseHTTPRequestHandler):
             internal = v2.selftest_internal(fetch_domain, fetch_rpc)
         except Exception as exc:  # noqa: BLE001  自检本身绝不能 500
             harness_error = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+        try:
+            internal = internal + v4.selftest_v4_checks()
+        except Exception as exc:  # noqa: BLE001
+            harness_error = (harness_error + "; " if harness_error else "") + \
+                "v4 checks: %s: %s" % (type(exc).__name__, str(exc)[:200])
         http_checks = self._selftest_http_checks()
         checks = internal + http_checks
         required_failed = [item for item in checks if item.get("required") and not item.get("ok")]
@@ -2625,6 +2907,32 @@ class Api(BaseHTTPRequestHandler):
             if not self.require_admin():
                 return
             self.handle_token_revoke(request.path.removeprefix("/api/auth/tokens/").strip("/"))
+            return
+        if request.path.startswith("/api/v2/"):
+            # v4：DELETE /api/v2/sessions/{id} 踢会话（id 支持脱敏形式；默认不许踢自己）
+            if not self.v2_rate_gate():
+                return
+            if request.path.startswith("/api/v2/sessions"):
+                if not self.require_admin():
+                    return
+                ident = unquote(request.path[len("/api/v2/sessions"):].strip("/"))
+                query = parse_qs(request.query)
+                allow_self = (query.get("self") or ["0"])[0].lower() in {"1", "true", "yes", "on"}
+                try:
+                    data = kick_admin_session(ident, self.current_session(), allow_self)
+                except ValueError as exc:
+                    self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+                if not data.get("matched"):
+                    self.send_error_json(HTTPStatus.NOT_FOUND,
+                                         "没有匹配的会话：" + str(ident)[:60] +
+                                         "（可用 GET /api/v2/sessions 查看 session_id）")
+                    return
+                actor = (self.headers.get("X-FM-Admin-Actor") or "admin").strip()[:80] or "admin"
+                record_audit("kick", "sessions", "count=%d" % int(data.get("count") or 0), actor)
+                self.send_json(HTTPStatus.OK, {"ok": True, "data": data})
+                return
+            self.send_error_json(HTTPStatus.NOT_FOUND, "未知的 v2 DELETE 接口。")
             return
         if not self.require_admin():
             return

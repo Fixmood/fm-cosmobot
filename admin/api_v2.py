@@ -1220,9 +1220,12 @@ OPS_BASE = os.environ.get("FM_OPS_BASE", "/data").rstrip("/") or "/data"
 OPS_QUEUE = os.path.join(OPS_BASE, "ops-queue")
 OPS_RESULTS = os.path.join(OPS_BASE, "ops-results")
 OPS_STATE = os.path.join(OPS_BASE, "ops-agent-state.json")
-# 白名单 op 必须与宿主机 ops_agent.py 的 ALLOWED_OPS 保持一致（v3 扩展）。
+# 白名单 op 必须与宿主机 ops_agent.py 的 ALLOWED_OPS 保持一致（v3 扩展 + v4 运维增强）。
 OPS_ALLOWED = ("images", "inspect", "restart", "images_detail", "logs", "metrics",
-               "cron", "rollback", "backup_domain")
+               "cron", "rollback", "backup_domain",
+               # v4 新增：stats（多容器 docker stats 快照）/ cron_list（只读）/
+               #          cron_set（写入未实现，代理返回 501）/ config_backup（config.toml 备份）
+               "stats", "cron_list", "cron_set", "config_backup")
 # images 采集在 208 个 30GB 级镜像的机器上要 ~17s，所以后台线程缓存快照、别让 HTTP 等它。
 _OPS_SNAPSHOT: dict[str, Any] = {"data": None, "at": 0.0, "images_at": 0.0, "running_at": 0.0}
 _OPS_SNAPSHOT_LOCK = threading.Lock()
@@ -2288,7 +2291,15 @@ def ops_request(op: object, params: object = None, timeout: float = 15.0,
                        % (timeout, op_text, request_id, request_id), 504)
     if not result.get("ok"):
         error = str(result.get("error") or "")[:400]
-        raise ApiError("运维操作 %s 失败：%s（request_id=%s）" % (op_text, error or "未知错误", request_id), 502)
+        # v4：宿主机代理可以带 error_status（如 cron_set 固定 501），透传成对应 HTTP 状态。
+        try:
+            error_status = int(result.get("error_status") or 502)
+        except (TypeError, ValueError):
+            error_status = 502
+        if error_status < 400 or error_status > 599:
+            error_status = 502
+        raise ApiError("运维操作 %s 失败：%s（request_id=%s）" % (op_text, error or "未知错误", request_id),
+                       error_status)
     payload = result.get("result")
     return {
         "op": op_text,
