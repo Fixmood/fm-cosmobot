@@ -10,14 +10,24 @@
 from __future__ import annotations
 
 import calendar
+import csv
+import hashlib
+import io
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
 from typing import Any, Callable
+from urllib.parse import urlencode
+
+try:  # Python 3.11+ 自带 tomllib；admin 容器与宿主机运维代理都是 3.11。
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - 老版本 Python 兜底
+    tomllib = None  # type: ignore[assignment]
 
 RUNTIME = "/runtime"
 BOT_DB = os.path.join(RUNTIME, "cosmobot.sqlite3")
@@ -1210,7 +1220,9 @@ OPS_BASE = os.environ.get("FM_OPS_BASE", "/data").rstrip("/") or "/data"
 OPS_QUEUE = os.path.join(OPS_BASE, "ops-queue")
 OPS_RESULTS = os.path.join(OPS_BASE, "ops-results")
 OPS_STATE = os.path.join(OPS_BASE, "ops-agent-state.json")
-OPS_ALLOWED = ("images", "inspect", "restart")
+# 白名单 op 必须与宿主机 ops_agent.py 的 ALLOWED_OPS 保持一致（v3 扩展）。
+OPS_ALLOWED = ("images", "inspect", "restart", "images_detail", "logs", "metrics",
+               "cron", "rollback", "backup_domain")
 # images 采集在 208 个 30GB 级镜像的机器上要 ~17s，所以后台线程缓存快照、别让 HTTP 等它。
 _OPS_SNAPSHOT: dict[str, Any] = {"data": None, "at": 0.0, "images_at": 0.0, "running_at": 0.0}
 _OPS_SNAPSHOT_LOCK = threading.Lock()
@@ -1243,18 +1255,39 @@ def _ops_agent_state() -> dict:
             "note": "未找到 ops-agent 心跳文件（宿主机代理未安装/未运行）"}
 
 
-def _ops_enqueue(op: object, target: object = "") -> str:
+def _ops_enqueue(op: object, target: object = "", params: object = None) -> str:
+    """入队一个白名单运维请求（params 只允许简单标量，防止队列注入）。"""
     op_text = str(op or "").strip().lower()
     target_text = str(target or "").strip().lower()
     if op_text not in OPS_ALLOWED:
-        raise ApiError("不允许的运维操作：" + op_text + "（白名单：" + " / ".join(OPS_ALLOWED) + "）", 400)
+        raise ApiError("不允许的运维操作：%s（白名单：%s）"
+                       % (op_text or "(空)", " / ".join(OPS_ALLOWED)), 400)
     if op_text == "restart" and target_text != "bot":
         raise ApiError("restart 只允许 target=bot", 400)
+    clean_params: dict[str, Any] = {}
+    if isinstance(params, dict):
+        for key, value in params.items():
+            key_text = str(key).strip()[:40]
+            if not re.fullmatch(r"[0-9A-Za-z_.-]{1,40}", key_text):
+                raise ApiError("运维参数名非法：" + key_text, 400)
+            if isinstance(value, bool):
+                clean_params[key_text] = value
+            elif isinstance(value, (int, float)):
+                clean_params[key_text] = value
+            elif isinstance(value, str):
+                if len(value) > 200 or "\x00" in value or "\n" in value or "\r" in value:
+                    raise ApiError("运维参数值非法：" + key_text, 400)
+                clean_params[key_text] = value
+            elif value is None:
+                continue
+            else:
+                raise ApiError("运维参数类型不支持：" + key_text, 400)
     request_id = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
     payload = {
         "id": request_id,
         "op": op_text,
         "target": target_text,
+        "params": clean_params,
         "created_at": time.time(),
         "requested_by": "fm-admin",
     }
@@ -1535,7 +1568,1435 @@ def run_action(name: str, payload: dict, send_message) -> dict:
     return {"ok": False, "error": "未知动作"}
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# v3 扩展（2026-11-15）：配置 / 记忆 / 模型 / 群能力 / 运维监控
+#                       / 导出 / 备份 / 日志流 / 自检 / 会话与 Token
+#
+# 约定：
+#   * 所有写操作先备份、再原子写、再回读校验，失败抛 ApiError（带 HTTP 状态码）；
+#   * 所有返回都是可 JSON 序列化的 dict，交给 app.py 统一包 {"ok":true,"data":...}；
+#   * 只读数据库（/runtime/cosmobot.sqlite3 以 mode=ro 打开），绝不改 bot 自己的表结构。
+# ══════════════════════════════════════════════════════════════════════
+
+CONFIG_TOML_PATH = os.path.join(RUNTIME, "config.toml")
+MODEL_SELECTION_PATH = os.path.join(RUNTIME, "chat-model-selection")
+MEMORY_ROOT = os.path.join(RUNTIME, "memory")
+BACKUP_DIR = os.path.join(OPS_BASE, "backups")
+CONFIG_MAX_BYTES = 512 * 1024
+MEMORY_MAX_BYTES = 256 * 1024
+CHAT_EXPORT_MAX_ROWS = 200000
+LOG_TAIL_MAX = 2000
+
+
+# ── A. 配置编辑：GET/POST /api/v2/config/toml ───────────────────────────
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def _list_runtime_backups(prefix: str, limit: int = 10) -> list[dict]:
+    """列出 /runtime 下某个前缀的备份文件（新→旧）。"""
+    directory = os.path.dirname(prefix)
+    base = os.path.basename(prefix)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    items = []
+    for name in names:
+        if not name.startswith(base):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        items.append({"file": name, "path": path, "size": stat.st_size,
+                      "mtime": int(stat.st_mtime),
+                      "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime))})
+    items.sort(key=lambda item: item["mtime"], reverse=True)
+    return items[:max(1, limit)]
+
+
+def _flatten_toml(value: object, prefix: str = "") -> dict[str, object]:
+    out: dict[str, object] = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            out.update(_flatten_toml(item, prefix + "." + key_text if prefix else key_text))
+    else:
+        out[prefix] = value
+    return out
+
+
+_SECRET_KEY_HINTS = ("api_key", "apikey", "token", "secret", "password", "passwd", "authorization")
+
+
+def _mask_secret_text(text: object) -> object:
+    value = str(text)
+    if len(value) >= 12:
+        return value[:4] + "…" + value[-4:]
+    return "***" if value else ""
+
+
+def _mask_flat_value(key: str, value: object) -> object:
+    lowered = key.lower()
+    if any(hint in lowered for hint in _SECRET_KEY_HINTS) and value not in ("", None, "<missing>"):
+        return _mask_secret_text(value)
+    return value
+
+
+def _config_diff(before: dict[str, object], after: dict[str, object], limit: int = 80) -> dict:
+    keys = sorted(set(before) | set(after))
+    changes = []
+    for key in keys:
+        old = before.get(key, "<missing>")
+        new = after.get(key, "<missing>")
+        if old == new:
+            continue
+        changes.append({"key": key, "before": _mask_flat_value(key, old), "after": _mask_flat_value(key, new)})
+    sections = sorted({item["key"].split(".", 1)[0] for item in changes})
+    return {"count": len(changes), "sections": sections, "changes": changes[:max(1, limit)],
+            "truncated": len(changes) > limit}
+
+
+def _config_parsed() -> tuple[dict | None, str]:
+    if tomllib is None:
+        return None, "服务端缺少 tomllib（需要 Python 3.11+）"
+    try:
+        raw = _read_bytes(CONFIG_TOML_PATH)
+    except OSError as exc:
+        return None, "读取 config.toml 失败：" + str(exc)
+    try:
+        parsed = tomllib.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        return None, "config.toml 不是合法 UTF-8：" + str(exc)
+    except tomllib.TOMLDecodeError as exc:
+        return None, "config.toml 语法错误：" + str(exc)
+    return (parsed if isinstance(parsed, dict) else {}), ""
+
+
+def config_toml_read() -> dict:
+    """GET /api/v2/config/toml：原文 + 行数 + sha256 + 备份列表。"""
+    try:
+        raw = _read_bytes(CONFIG_TOML_PATH)
+    except OSError as exc:
+        raise ApiError("读取 config.toml 失败：" + str(exc), 500)
+    try:
+        text = raw.decode("utf-8")
+        decode_error = ""
+    except UnicodeDecodeError as exc:
+        text = raw.decode("utf-8", "replace")
+        decode_error = str(exc)
+    parsed, parse_error = _config_parsed()
+    stat = os.stat(CONFIG_TOML_PATH)
+    lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+    return {
+        "path": CONFIG_TOML_PATH,
+        "content": text,
+        "lines": lines,
+        "bytes": len(raw),
+        "sha256": _sha256_bytes(raw),
+        "mtime": int(stat.st_mtime),
+        "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+        "mode": oct(stat.st_mode & 0o777),
+        "valid": parsed is not None,
+        "parse_error": decode_error or parse_error,
+        "top_sections": sorted(parsed.keys()) if isinstance(parsed, dict) else [],
+        "chat_providers": sorted(((parsed or {}).get("llm") or {}).get("chat_provider", {}).keys())
+        if isinstance(parsed, dict) else [],
+        "backups": _list_runtime_backups(CONFIG_TOML_PATH + ".bak-admin-", 10),
+        "restart_required_hint": "config.toml 由 bot 启动时加载；保存后需重启 fm-cosmobot 才会生效（POST /api/v2/deploy/act action=restart）。",
+    }
+
+
+def _set_provider_effort(text: str, provider: str, effort: str) -> str:
+    """在 TOML 原文里改某个 chat provider 的 reasoning_effort（保留其余格式/注释）。"""
+    try:
+        section = re.compile(r"^\s*\[\s*llm\.chat_provider\." + re.escape(provider) + r"\s*\]\s*$")
+    except re.error:
+        return text
+    key_re = re.compile(r"^(\s*reasoning_effort\s*=\s*)(.+?)(\s*)$")
+    lines = text.splitlines(keepends=True)
+    in_section = False
+    header_index = -1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = bool(section.match(line))
+            if in_section:
+                header_index = index
+            continue
+        if in_section:
+            match = key_re.match(line)
+            if match:
+                ending = "\n" if line.endswith("\n") else ""
+                lines[index] = match.group(1) + '"' + effort + '"' + ending
+                return "".join(lines)
+    if header_index >= 0:
+        insert_at = header_index + 1
+        indent = "  "
+        lines.insert(insert_at, indent + 'reasoning_effort = "' + effort + '"\n')
+        return "".join(lines)
+    return text
+
+
+def config_toml_write(content: object, actor: str = "admin") -> dict:
+    """POST /api/v2/config/toml：备份 → tomllib 校验 → 原子写 → sha256 回读校验。"""
+    if tomllib is None:
+        raise ApiError("服务端缺少 tomllib（需要 Python 3.11+），无法校验 TOML", 500)
+    if not isinstance(content, str) or not content.strip():
+        raise ApiError("content 不能为空（完整 TOML 文本）")
+    try:
+        raw = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ApiError("content 含有非法字符：" + str(exc))
+    if len(raw) > CONFIG_MAX_BYTES:
+        raise ApiError("配置过大：%d 字节，上限 %d 字节" % (len(raw), CONFIG_MAX_BYTES), 413)
+    try:
+        new_parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError as exc:
+        raise ApiError("TOML 语法错误：%s" % exc)
+    if not isinstance(new_parsed, dict):
+        raise ApiError("TOML 顶层必须是表（table）")
+    required_any = {"llm", "handler", "driver", "storage", "rpc", "memory", "tool", "log"}
+    if not required_any.intersection(new_parsed.keys()):
+        raise ApiError("配置缺少必要顶层段（llm/handler/driver/storage/rpc 至少一个，当前只有 %s）"
+                       % (", ".join(sorted(new_parsed.keys())) or "空"))
+    try:
+        old_raw = _read_bytes(CONFIG_TOML_PATH)
+    except OSError:
+        old_raw = b""
+    before_flat: dict[str, object] = {}
+    if old_raw:
+        try:
+            before_flat = _flatten_toml(tomllib.loads(old_raw.decode("utf-8", "replace")))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+            before_flat = {}
+    new_flat = _flatten_toml(new_parsed)
+    # 同一秒内多次保存时用随机后缀避免备份互相覆盖
+    backup_path = CONFIG_TOML_PATH + ".bak-admin-" + _stamp() + "-" + secrets.token_hex(2)
+    try:
+        os.makedirs(os.path.dirname(CONFIG_TOML_PATH), exist_ok=True)
+        if old_raw:
+            temporary_backup = backup_path + ".tmp"
+            with open(temporary_backup, "wb") as handle:
+                handle.write(old_raw)
+            os.chmod(temporary_backup, 0o600)
+            os.replace(temporary_backup, backup_path)
+    except OSError as exc:
+        raise ApiError("写配置备份失败：" + str(exc), 500)
+    temporary = CONFIG_TOML_PATH + ".tmp-admin-" + secrets.token_hex(4)
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, CONFIG_TOML_PATH)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise ApiError("写 config.toml 失败：" + str(exc) + ("（已备份：" + backup_path + "）" if old_raw else ""), 500)
+    try:
+        readback = _read_bytes(CONFIG_TOML_PATH)
+        readback_text = readback.decode("utf-8")
+        tomllib.loads(readback_text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ApiError("写入后回读/校验失败：%s（已保留备份：%s）" % (exc, backup_path), 500)
+    sha_ok = _sha256_bytes(readback) == _sha256_bytes(raw) and readback == raw
+    if not sha_ok:
+        raise ApiError("写入后 sha256 校验不一致（已保留备份：%s）" % backup_path, 500)
+    return {
+        "path": CONFIG_TOML_PATH,
+        "backup": backup_path if old_raw else "",
+        "bytes": len(readback),
+        "lines": readback_text.count("\n") + (0 if readback_text.endswith("\n") or not readback_text else 1),
+        "sha256": _sha256_bytes(readback),
+        "verified": True,
+        "changed": readback != old_raw,
+        "diff": _config_diff(before_flat, new_flat),
+        "mode": oct(os.stat(CONFIG_TOML_PATH).st_mode & 0o777),
+        "restart_required": True,
+        "applied": False,
+        "note": "已备份并校验；config.toml 在 bot 启动时加载，需要重启 fm-cosmobot 生效（POST /api/v2/deploy/act {\"action\":\"restart\"}）。",
+    }
+
+
+# ── B. 记忆 / 人设文件：/runtime/memory/** ─────────────────────────────
+def _memory_clean_rel(rel_path: object) -> str:
+    raw = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise ApiError("非法路径：不允许出现 ..")
+    if any(part.lower() in (".git", "__pycache__") for part in parts):
+        raise ApiError("不允许访问 .git / __pycache__")
+    return "/".join(parts)
+
+
+def _memory_resolve(rel_path: object, allow_empty: bool = False) -> tuple[str, str]:
+    rel = _memory_clean_rel(rel_path)
+    if not rel and not allow_empty:
+        raise ApiError("缺少 path（相对于 /runtime/memory 的路径）")
+    root_real = os.path.realpath(MEMORY_ROOT)
+    target_real = os.path.realpath(os.path.join(MEMORY_ROOT, rel))
+    if target_real == root_real and rel:
+        raise ApiError("非法路径")
+    if not (target_real == root_real or target_real.startswith(root_real + os.sep)):
+        raise ApiError("路径越界：只允许 /runtime/memory/**", 403)
+    if "/.git/" in target_real + os.sep or target_real.endswith(os.sep + ".git"):
+        raise ApiError("不允许访问 .git", 403)
+    return rel, target_real
+
+
+def memory_tree(rel_path: object = "", max_entries: int = 2000, max_depth: int = 6) -> dict:
+    """GET /api/v2/memory/tree：/runtime/memory 目录树（文件+大小+修改时间）。"""
+    rel = _memory_clean_rel(rel_path)
+    root_real = os.path.realpath(MEMORY_ROOT)
+    base_real = os.path.realpath(os.path.join(MEMORY_ROOT, rel)) if rel else root_real
+    if not (base_real == root_real or base_real.startswith(root_real + os.sep)):
+        raise ApiError("路径越界：只允许 /runtime/memory/**", 403)
+    if not os.path.isdir(base_real):
+        raise ApiError("目录不存在：/runtime/memory/" + rel, 404)
+    entries: list[dict] = []
+    truncated = False
+    queue: list[tuple[str, str, int]] = [(base_real, rel, 0)]
+    while queue:
+        current, current_rel, depth = queue.pop(0)
+        try:
+            names = os.listdir(current)
+        except OSError:
+            continue
+        names.sort(key=lambda name: (not os.path.isdir(os.path.join(current, name)), name.lower()))
+        for name in names:
+            if name.lower() in (".git", "__pycache__"):
+                continue
+            full = os.path.join(current, name)
+            child_rel = (current_rel + "/" + name) if current_rel else name
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            is_dir = os.path.isdir(full)
+            entries.append({
+                "path": child_rel,
+                "name": name,
+                "type": "dir" if is_dir else "file",
+                "depth": depth + 1,
+                "size": 0 if is_dir else stat.st_size,
+                "mtime": int(stat.st_mtime),
+                "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+            })
+            if len(entries) >= max_entries:
+                truncated = True
+                break
+            if is_dir and depth + 1 < max_depth:
+                queue.append((full, child_rel, depth + 1))
+        if truncated:
+            break
+    dirs = sum(1 for item in entries if item["type"] == "dir")
+    return {
+        "root": MEMORY_ROOT,
+        "path": rel,
+        "entries": entries,
+        "count": len(entries),
+        "dirs": dirs,
+        "files": len(entries) - dirs,
+        "truncated": truncated,
+        "max_entries": max_entries,
+        "max_depth": max_depth,
+        "backup_suffix": "*.bak-admin-<时间>",
+        "note": "只允许 /runtime/memory/**；.git / __pycache__ 已隐藏。",
+    }
+
+
+def memory_file_read(rel_path: object) -> dict:
+    """GET /api/v2/memory/file?path=：读 UTF-8 文本（上限 256KB）。"""
+    rel, target = _memory_resolve(rel_path)
+    if os.path.isdir(target):
+        raise ApiError("这是一个目录，不是文件：" + rel)
+    if not os.path.isfile(target):
+        raise ApiError("文件不存在：" + rel, 404)
+    try:
+        stat = os.stat(target)
+        raw = _read_bytes(target)
+    except OSError as exc:
+        raise ApiError("读取文件失败：" + str(exc), 500)
+    if len(raw) > MEMORY_MAX_BYTES:
+        raise ApiError("文件过大：%d 字节，读写上限 %d 字节（可用数据浏览器/文件系统查看）"
+                       % (len(raw), MEMORY_MAX_BYTES), 413)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ApiError("不是 UTF-8 文本文件：" + str(exc), 415)
+    return {
+        "path": rel,
+        "absolute": target,
+        "content": text,
+        "bytes": len(raw),
+        "lines": text.count("\n") + (0 if text.endswith("\n") or not text else 1),
+        "sha256": _sha256_bytes(raw),
+        "mtime": int(stat.st_mtime),
+        "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+        "limit_bytes": MEMORY_MAX_BYTES,
+    }
+
+
+def memory_file_write(rel_path: object, content: object, actor: str = "admin") -> dict:
+    """POST /api/v2/memory/file：白名单路径 + 备份 + 原子写 + sha256 回读校验。"""
+    rel, target = _memory_resolve(rel_path)
+    if os.path.isdir(target):
+        raise ApiError("目标是一个目录，不能写入：" + rel)
+    if not isinstance(content, str):
+        raise ApiError("content 必须是字符串")
+    try:
+        raw = content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ApiError("content 含有非法字符：" + str(exc))
+    if len(raw) > MEMORY_MAX_BYTES:
+        raise ApiError("内容过大：%d 字节，上限 %d 字节" % (len(raw), MEMORY_MAX_BYTES), 413)
+    backup_path = ""
+    try:
+        if os.path.isfile(target):
+            # 同一秒内多次保存时用随机后缀避免备份互相覆盖
+            backup_path = target + ".bak-admin-" + _stamp() + "-" + secrets.token_hex(2)
+            with open(backup_path, "wb") as handle:
+                handle.write(_read_bytes(target))
+    except OSError as exc:
+        raise ApiError("写备份失败：" + str(exc), 500)
+    temporary = target + ".tmp-admin-" + secrets.token_hex(4)
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        os.replace(temporary, target)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise ApiError("写文件失败：" + str(exc), 500)
+    try:
+        readback = _read_bytes(target)
+    except OSError as exc:
+        raise ApiError("写入后回读失败：" + str(exc) + "（备份：" + (backup_path or "无") + "）", 500)
+    verified = readback == raw
+    if not verified:
+        raise ApiError("写入后 sha256 校验不一致（备份：%s）" % (backup_path or "无"), 500)
+    return {
+        "path": rel,
+        "absolute": target,
+        "backup": backup_path,
+        "bytes": len(readback),
+        "sha256": _sha256_bytes(readback),
+        "verified": True,
+        "created": not bool(backup_path),
+        "applied": True,
+        "note": "记忆文件由 bot 运行时直接读取，保存即生效；已保留 .bak-admin-<时间> 备份。",
+    }
+
+
+# ── C. 模型：GET /api/v2/models · POST /api/v2/models/switch ───────────
+def _mask_api_key(value: object) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if len(text) >= 12:
+        return text[:4] + "…" + text[-4:]
+    return "***"
+
+
+def _llm_sections() -> tuple[dict, dict, dict, str]:
+    parsed, error = _config_parsed()
+    if parsed is None:
+        raise ApiError(error or "解析 config.toml 失败", 500)
+    llm = parsed.get("llm") if isinstance(parsed.get("llm"), dict) else {}
+    chat = llm.get("chat_provider") if isinstance(llm.get("chat_provider"), dict) else {}
+    image = llm.get("image_provider") if isinstance(llm.get("image_provider"), dict) else {}
+    audio = llm.get("audio_provider") if isinstance(llm.get("audio_provider"), dict) else {}
+    return chat, image, audio, error
+
+
+def models_overview(rpc: Callable[..., Any] | None = None) -> dict:
+    """GET /api/v2/models：解析 config.toml 的聊天/图片/语音 provider + 当前选择。"""
+    chat, image, audio, error = _llm_sections()
+    selection = _read(MODEL_SELECTION_PATH, 4096).strip()
+    rpc_models: list[dict] = []
+    rpc_error = ""
+    current_provider = ""
+    if callable(rpc):
+        try:
+            status = rpc("config.model", {"action": "status"})
+        except Exception as exc:  # noqa: BLE001
+            status = {"ok": False, "error": str(exc)}
+        if isinstance(status, dict) and status.get("ok"):
+            data = status.get("data") if isinstance(status.get("data"), dict) else {}
+            for item in data.get("models") or []:
+                if not isinstance(item, dict):
+                    continue
+                rpc_models.append({
+                    "provider": str(item.get("provider") or ""),
+                    "model": str(item.get("model") or ""),
+                    "current": bool(item.get("current")),
+                    "configured_default": bool(item.get("configured_default")),
+                })
+                if item.get("current"):
+                    current_provider = str(item.get("provider") or "")
+        else:
+            rpc_error = str(status.get("error") or "") if isinstance(status, dict) else "RPC 返回异常"
+    if not current_provider:
+        current_provider = selection
+    providers = []
+    for name in sorted(chat.keys()):
+        profile = chat.get(name) if isinstance(chat.get(name), dict) else {}
+        providers.append({
+            "provider": name,
+            "model": str(profile.get("model") or ""),
+            "base_url": str(profile.get("base_url") or ""),
+            "reasoning_effort": str(profile.get("reasoning_effort") or ""),
+            "timeout": profile.get("timeout"),
+            "api_key_configured": bool(profile.get("api_key")),
+            "api_key_masked": _mask_api_key(profile.get("api_key")),
+            "current": name == current_provider,
+            "source": "config.toml",
+        })
+    image_providers = []
+    for name in sorted(image.keys()):
+        profile = image.get(name) if isinstance(image.get(name), dict) else {}
+        image_providers.append({
+            "provider": name,
+            "model": str(profile.get("model") or ""),
+            "base_url": str(profile.get("base_url") or ""),
+            "protocol": str(profile.get("protocol") or ""),
+            "timeout": profile.get("timeout"),
+            "api_key_configured": bool(profile.get("api_key")),
+            "api_key_masked": _mask_api_key(profile.get("api_key")),
+        })
+    audio_providers = []
+    for name in sorted(audio.keys()):
+        profile = audio.get(name) if isinstance(audio.get(name), dict) else {}
+        audio_providers.append({
+            "provider": name,
+            "model": str(profile.get("model") or ""),
+            "base_url": str(profile.get("base_url") or ""),
+            "api_key_configured": bool(profile.get("api_key")),
+            "api_key_masked": _mask_api_key(profile.get("api_key")),
+        })
+    current_entry = next((item for item in providers if item["provider"] == current_provider), None)
+    return {
+        "config_path": CONFIG_TOML_PATH,
+        "selection_path": MODEL_SELECTION_PATH,
+        "selection_file": {"path": MODEL_SELECTION_PATH, "content": selection, "exists": os.path.isfile(MODEL_SELECTION_PATH)},
+        "current_provider": current_provider,
+        "current_model": (current_entry or {}).get("model", ""),
+        "current_effort": (current_entry or {}).get("reasoning_effort", ""),
+        "chat_providers": providers,
+        "image_providers": image_providers,
+        "audio_providers": audio_providers,
+        "chat_provider_names": [item["provider"] for item in providers],
+        "efforts": ["low", "medium", "high"],
+        "rpc": {"ok": not bool(rpc_error), "error": rpc_error, "models": rpc_models,
+                "endpoint": "config.model action=status"},
+        "switch_endpoint": "POST /api/v2/models/switch {provider, effort?}",
+        "note": "切 model 走 RPC config.model switch（带 probe，热生效）；只改 reasoning_effort 时写 config.toml 并需要重启 bot。",
+    }
+
+
+def models_switch(provider: object, effort: object, rpc: Callable[..., Any] | None) -> dict:
+    """POST /api/v2/models/switch：RPC 在线切换（via=rpc）或改 config.toml 的 effort（via=file，需重启）。"""
+    name = str(provider or "").strip()
+    if not name:
+        raise ApiError("缺少 provider（例如 deepseek-flash / deepseek-flash-high）")
+    chat, _, _, _ = _llm_sections()
+    if name not in chat:
+        raise ApiError("未知 chat provider：%s（可用：%s）" % (name, "、".join(sorted(chat)) or "无"), 400)
+    profile = chat.get(name) if isinstance(chat.get(name), dict) else {}
+    file_effort = str(profile.get("reasoning_effort") or "")
+    wanted_effort = str(effort or "").strip().lower()
+    if wanted_effort and wanted_effort not in ("low", "medium", "high"):
+        raise ApiError("effort 只支持 low / medium / high")
+    # 只改 effort（且和配置文件不同）→ 文件模式，必须重启
+    if wanted_effort and wanted_effort != file_effort:
+        try:
+            text = _read_bytes(CONFIG_TOML_PATH).decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ApiError("读取 config.toml 失败：" + str(exc), 500)
+        new_text = _set_provider_effort(text, name, wanted_effort)
+        if new_text == text:
+            raise ApiError("在 config.toml 里找不到 provider %s 的 reasoning_effort 行，无法修改" % name, 500)
+        saved = config_toml_write(new_text, "admin")
+        return {
+            "via": "file",
+            "provider": name,
+            "previous_effort": file_effort,
+            "effort": wanted_effort,
+            "restart_required": True,
+            "applied": False,
+            "saved": saved,
+            "note": "reasoning_effort 已写入 config.toml（含备份+校验），需要重启 fm-cosmobot 生效。",
+        }
+    if not callable(rpc):
+        raise ApiError("Cosmobot RPC 未启用，无法在线切换模型；可改 config.toml 后重启 bot。", 502)
+    switch = rpc("config.model", {"action": "switch", "target": name})
+    switch_ok = isinstance(switch, dict) and bool(switch.get("ok"))
+    switch_error = str(switch.get("error") or "") if isinstance(switch, dict) else "RPC 返回异常"
+    # 探测 + 选择可能超过 4s 默认超时：超时后回读状态再判断是否已经切换成功。
+    current, current_model, current_effort = "", "", ""
+    status = rpc("config.model", {"action": "status"})
+    if isinstance(status, dict) and status.get("ok"):
+        data = status.get("data") if isinstance(status.get("data"), dict) else {}
+        for item in data.get("models") or []:
+            if not isinstance(item, dict) or not item.get("current"):
+                continue
+            current = str(item.get("provider") or "")
+            current_model = str(item.get("model") or "")
+            break
+    if not switch_ok and current != name:
+        raise ApiError("在线切换模型失败：" + (switch_error or "RPC 返回失败"), 502)
+    switch_data = switch.get("data") if isinstance(switch, dict) and isinstance(switch.get("data"), dict) else {}
+    applied = current == name
+    current_entry = next((value for key, value in chat.items() if key == current), {})
+    current_effort = str((current_entry or {}).get("reasoning_effort") or "") if isinstance(current_entry, dict) else ""
+    return {
+        "via": "rpc",
+        "provider": name,
+        "effort": current_effort or file_effort,
+        "selected_model": current_model or str(profile.get("model") or ""),
+        "restart_required": not applied,
+        "applied": applied,
+        "rpc_response": {"saved": bool(switch_data.get("saved", applied)),
+                         "applied": bool(switch_data.get("applied", applied)),
+                         "error": switch_error},
+        "verify": {"current_provider": current, "matched": applied,
+                   "probe": "bot 侧 probeChatModel 通过后才会切换"},
+        "note": "" if applied else "RPC 已返回但状态回读未确认切换，请到 /api/v2/models 复查。",
+    }
+
+
+# ── D. 群能力：代理 fm-domain /group-capability ────────────────────────
+GROUP_CAPABILITIES: list[dict] = [
+    {"id": "agent", "label": "AI Agent"},
+    {"id": "library", "label": "文库"},
+    {"id": "contest", "label": "赛文"},
+    {"id": "ai_contest", "label": "AI 赛文"},
+    {"id": "scores", "label": "成绩"},
+    {"id": "recall", "label": "撤回"},
+    {"id": "repeat", "label": "复读"},
+    {"id": "poke", "label": "拍一拍"},
+    {"id": "score_archive", "label": "成绩归档"},
+]
+GROUP_CAPABILITY_IDS = [item["id"] for item in GROUP_CAPABILITIES]
+
+
+def group_capability_read(group_id: object, domain: Callable[..., Any] | None) -> dict:
+    gid = str(group_id or "").strip()
+    if not gid:
+        raise ApiError("缺少 group_id（QQ 群号）")
+    if not callable(domain):
+        raise ApiError("domain 客户端未注入", 500)
+    result = domain("/group-capability", urlencode({"group_id": gid}))
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = str(result.get("error") or "") if isinstance(result, dict) else ""
+        raise ApiError("读取群能力失败（fm-domain）：" + (error or "未知错误"), 502)
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    capabilities = data.get("capabilities") if isinstance(data.get("capabilities"), dict) else {}
+    return {
+        "group_id": gid,
+        "capabilities": {key: bool(capabilities.get(key, True)) for key in GROUP_CAPABILITY_IDS},
+        "raw": data,
+        "catalog": GROUP_CAPABILITIES,
+        "source": "domain:/group-capability",
+    }
+
+
+def group_capability_write(group_id: object, capability: object, enabled: object,
+                           domain: Callable[..., Any] | None,
+                           domain_post: Callable[..., Any] | None) -> dict:
+    gid = str(group_id or "").strip()
+    feature = str(capability or "").strip()
+    if not gid:
+        raise ApiError("缺少 group_id（QQ 群号）")
+    if feature not in GROUP_CAPABILITY_IDS:
+        raise ApiError("未知能力：%s（可用：%s）" % (feature, " / ".join(GROUP_CAPABILITY_IDS)), 400)
+    if not isinstance(enabled, bool):
+        raise ApiError("enabled 必须是布尔值 true/false")
+    if not callable(domain_post):
+        raise ApiError("domain POST 客户端未注入", 500)
+    result = domain_post("/group-capability", {"group_id": gid, "capability": feature, "enabled": enabled})
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = str(result.get("error") or "") if isinstance(result, dict) else ""
+        raise ApiError("写入群能力失败（fm-domain）：" + (error or "未知错误"), 502)
+    readback_ok = False
+    verified = False
+    if callable(domain):
+        check = domain("/group-capability", urlencode({"group_id": gid, "capability": feature}))
+        if isinstance(check, dict) and check.get("ok"):
+            readback_ok = True
+            payload = check.get("data") if isinstance(check.get("data"), dict) else {}
+            verified = bool(payload.get("enabled")) == enabled
+    if not readback_ok:
+        # 回读失败时退回全量能力表再看一次
+        check_all = domain("/group-capability", urlencode({"group_id": gid})) if callable(domain) else None
+        if isinstance(check_all, dict) and check_all.get("ok"):
+            payload = check_all.get("data") if isinstance(check_all.get("data"), dict) else {}
+            capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
+            verified = bool(capabilities.get(feature)) == enabled
+    return {
+        "group_id": gid,
+        "capability": feature,
+        "enabled": enabled,
+        "saved": True,
+        "verified": verified,
+        "response": result.get("data"),
+        "readback": readback_ok,
+        "source": "domain:/group-capability",
+        "note": "" if verified else "domain 已接受写入，但回读未确认（可能被默认继承覆盖），请刷新复查。",
+    }
+
+
+# ── E. 运维监控增强：宿主机 ops-agent 扩展 op ─────────────────────────
+# 说明：入队函数 _ops_enqueue(op, target, params) 在下面被统一扩展（见 v3 patch），
+# 队列内容只允许 id/op/target/params 四个字段 + 简单标量参数。
+
+
+def ops_request(op: object, params: object = None, timeout: float = 15.0,
+                target: object = "") -> dict:
+    """入队 + 等待结果；代理离线/超时/执行失败都转成带状态码的 ApiError。"""
+    op_text = str(op or "").strip().lower()
+    if op_text not in OPS_ALLOWED:
+        raise ApiError("不允许的运维操作：" + op_text, 400)
+    agent = _ops_agent_state()
+    if not agent.get("online"):
+        raise ApiError("宿主机运维代理离线（最后心跳 %s 秒前），无法执行 op=%s。"
+                       % (agent.get("age_seconds"), op_text), 503)
+    started = time.time()
+    request_id = _ops_enqueue(op_text, target, params)
+    results = _ops_wait([request_id], timeout=max(1.0, float(timeout)))
+    result = results.get(request_id)
+    elapsed_ms = round((time.time() - started) * 1000)
+    if result is None:
+        raise ApiError("宿主机运维代理 %.1fs 内未完成 op=%s（request_id=%s；可轮询 GET /api/v2/ops/result?request_id=%s）"
+                       % (timeout, op_text, request_id, request_id), 504)
+    if not result.get("ok"):
+        error = str(result.get("error") or "")[:400]
+        raise ApiError("运维操作 %s 失败：%s（request_id=%s）" % (op_text, error or "未知错误", request_id), 502)
+    payload = result.get("result")
+    return {
+        "op": op_text,
+        "request_id": request_id,
+        "agent_online": True,
+        "elapsed_ms": elapsed_ms,
+        "duration_ms": result.get("duration_ms"),
+        "started_at": result.get("started_at"),
+        "finished_at": result.get("finished_at"),
+        "agent": result.get("agent"),
+        "result": payload if isinstance(payload, dict) else {"value": payload},
+    }
+
+
+def ops_result_view(request_id: object) -> dict:
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise ApiError("缺少 request_id")
+    if not re.fullmatch(r"[0-9A-Za-z._-]{1,80}", rid):
+        raise ApiError("request_id 格式不正确")
+    result = _ops_result(rid)
+    agent = _ops_agent_state()
+    return {
+        "request_id": rid,
+        "done": result is not None,
+        "ok": bool(result.get("ok")) if isinstance(result, dict) else None,
+        "result": result,
+        "agent_online": bool(agent.get("online")),
+        "agent_age_seconds": agent.get("age_seconds"),
+    }
+
+
+def ops_logs(tail: object = 200, since: object = "") -> dict:
+    """GET /api/v2/ops/logs：docker logs fm-cosmobot --tail/--since（经宿主机代理）。"""
+    tail_n = _int_param(tail, 200, 1, LOG_TAIL_MAX)
+    since_text = str(since or "").strip()
+    if since_text and not re.fullmatch(r"[0-9A-Za-z:._+T-]{4,64}", since_text):
+        raise ApiError("since 参数格式不正确（应为 docker 支持的 RFC3339 时间戳或 unix 秒）")
+    out = ops_request("logs", {"tail": tail_n, "since": since_text}, timeout=15.0)
+    payload = out.get("result") or {}
+    lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+    return {
+        "container": payload.get("container") or "fm-cosmobot",
+        "tail": tail_n,
+        "since": since_text,
+        "lines": lines,
+        "count": len(lines),
+        "truncated": bool(payload.get("truncated")),
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "duration_ms": out.get("duration_ms"),
+        "source": "host-ops-agent:docker logs",
+    }
+
+
+def ops_metrics() -> dict:
+    """GET /api/v2/ops/metrics：宿主机负载/内存/磁盘/uptime + 容器 docker stats。"""
+    out = ops_request("metrics", {}, timeout=20.0)
+    payload = out.get("result") or {}
+    return {
+        "host": payload.get("host") or {},
+        "docker": payload.get("docker") or {},
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "duration_ms": out.get("duration_ms"),
+        "source": "host-ops-agent",
+    }
+
+
+def ops_images(live: bool = False) -> dict:
+    """GET /api/v2/ops/images：镜像 tag/大小/创建时间。
+
+    默认复用后台线程缓存的 docker 快照（docker images 全量枚举在这台机器上要 ~17s），
+    live=true 时才现场让宿主机代理跑 images_detail。
+    """
+    if not live:
+        with _OPS_SNAPSHOT_LOCK:
+            snapshot = dict(_OPS_SNAPSHOT.get("data") or {})
+            snapshot_at = float(_OPS_SNAPSHOT.get("at") or 0.0)
+        images = snapshot.get("images") if isinstance(snapshot.get("images"), list) else []
+        if images:
+            return {
+                "source": "host-ops-agent(cache)",
+                "live": False,
+                "images": images,
+                "count": len(images),
+                "stale_seconds": round(time.time() - snapshot_at, 1) if snapshot_at else None,
+                "agent_online": snapshot.get("agent_online"),
+                "note": "缓存快照；加 ?live=1 可现场重新采集（约数秒）。",
+            }
+        # 缓存还没就绪：触发后台采集但绝不阻塞 HTTP（docker images 首采约 20 秒）。
+        _ensure_ops_worker()
+        _OPS_WAKE.set()
+        return {
+            "source": "host-ops-agent(cache-warming)",
+            "live": False,
+            "images": [],
+            "count": 0,
+            "warming": True,
+            "note": "镜像缓存首次采集约 20 秒，稍后刷新本接口；需要立即拿到结果可加 ?live=1。",
+        }
+    out = ops_request("images_detail", {}, timeout=90.0)
+    payload = out.get("result") or {}
+    images = payload.get("images") if isinstance(payload.get("images"), list) else []
+    return {
+        "source": "host-ops-agent:images_detail",
+        "live": True,
+        "images": images,
+        "count": len(images),
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "duration_ms": out.get("duration_ms"),
+        "note": "",
+    }
+
+
+def ops_cron() -> dict:
+    """GET /api/v2/ops/cron：宿主机 crontab -l（只读）。"""
+    out = ops_request("cron", {}, timeout=15.0)
+    payload = out.get("result") or {}
+    lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+    return {
+        "lines": lines,
+        "count": len(lines),
+        "raw": payload.get("raw") or "",
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "source": "host-ops-agent:crontab -l",
+        "note": "只读展示，后台不提供改 crontab 的接口。",
+    }
+
+
+def ops_rollback(image: object) -> dict:
+    """POST /api/v2/ops/rollback：校验镜像存在后返回「受保护，需人工执行」的安全计划。
+
+    不自动重建容器（会中断 QQ 会话/需要完整 run 参数），宿主机代理只做只读校验，
+    返回当前容器参数 + 人工回滚步骤，避免后台一键搞挂 bot。
+    """
+    image_text = str(image or "").strip()
+    if not re.fullmatch(r"fm-cosmobot:runtime-[A-Za-z0-9._-]{1,90}", image_text):
+        raise ApiError("image 必须形如 fm-cosmobot:runtime-<tag>（只允许回滚到 runtime 镜像）")
+    out = ops_request("rollback", {"image": image_text}, timeout=30.0)
+    payload = out.get("result") or {}
+    return {
+        "image": image_text,
+        "protected": bool(payload.get("protected", True)),
+        "executed": bool(payload.get("executed", False)),
+        "image_exists": bool(payload.get("image_exists")),
+        "image_id": payload.get("image_id") or "",
+        "image_created": payload.get("image_created") or "",
+        "image_size": payload.get("image_size") or "",
+        "current": payload.get("current") or {},
+        "manual_steps": payload.get("manual_steps") or [],
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "note": payload.get("note") or "回滚受保护：自动重建容器会中断 QQ 会话，必须人工按步骤执行。",
+    }
+
+
+# ── F. 导出 CSV ────────────────────────────────────────────────────────
+def export_chat_csv(days: object = 7, chat: object = "", limit_rows: int = CHAT_EXPORT_MAX_ROWS) -> Any:
+    """GET /api/v2/export/chat：聊天记录 CSV（分页拼接，逐块 yield str）。"""
+    days_value, since, _ = _day_window(_int_param(days, 7, 1, 90))
+    chat_text = str(chat or "").strip()
+    limit_rows = max(1, min(CHAT_EXPORT_MAX_ROWS, int(limit_rows)))
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+
+    def flush() -> str:
+        chunk = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return chunk
+
+    yield "\ufeff"
+    writer.writerow(["id", "recorded_at_utc", "recorded_at_local", "chat_id", "chat_kind",
+                     "sender_id", "sender_username", "is_bot", "text", "image_urls"])
+    yield flush()
+    emitted = 0
+    cursor = 0
+    while emitted < limit_rows:
+        sql = ("SELECT id, recorded_at, chat_id, kind_key, sender_id, sender_username, is_bot, "
+               "body_text, image_urls FROM chat_log WHERE id > ? AND substr(recorded_at,1,19) >= ?")
+        params: list[Any] = [cursor, since]
+        if chat_text:
+            sql += " AND CAST(chat_id AS TEXT) = ?"
+            params.append(chat_text)
+        sql += " ORDER BY id ASC LIMIT 2000"
+        rows = _query(sql, tuple(params))
+        if not rows:
+            break
+        for row in rows:
+            cursor = max(cursor, int(row.get("id") or 0))
+            writer.writerow([
+                int(row.get("id") or 0),
+                str(row.get("recorded_at") or "")[:19],
+                _local_time(row.get("recorded_at")),
+                str(row.get("chat_id") or ""),
+                str(row.get("kind_key") or ""),
+                str(row.get("sender_id") or ""),
+                str(row.get("sender_username") or ""),
+                1 if row.get("is_bot") else 0,
+                str(row.get("body_text") or ""),
+                str(row.get("image_urls") or ""),
+            ])
+            emitted += 1
+            if emitted >= limit_rows:
+                break
+        yield flush()
+        if len(rows) < 2000:
+            break
+
+
+def export_audit_csv(audit_items: list[dict], days: object = 7) -> Any:
+    """GET /api/v2/export/audit：后台审计日志 CSV（最近审计窗口）。"""
+    days_value = _int_param(days, 7, 1, 365)
+    since = time.time() - days_value * 86400
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    yield "\ufeff"
+    writer.writerow(["at_epoch", "at_local", "action", "collection", "item_id", "actor"])
+    yield buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate(0)
+    count = 0
+    for item in reversed(audit_items or []):
+        try:
+            at = float(item.get("at") or 0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if at < since:
+            continue
+        writer.writerow([int(at), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)),
+                         str(item.get("action") or ""), str(item.get("collection") or ""),
+                         str(item.get("item_id") or ""), str(item.get("actor") or "")])
+        count += 1
+        if count % 200 == 0:
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+    yield buffer.getvalue()
+
+
+# ── G. 备份：/api/v2/backup/list · /api/v2/backup/create ───────────────
+def _human_size(size: object) -> str:
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return ("%.0f %s" if unit == "B" else "%.1f %s") % (value, unit)
+        value /= 1024.0
+    return "-"
+
+
+def _verify_sqlite_file(path: str) -> dict:
+    result = {"ok": False, "error": "", "quick_check": "", "tables": [], "table_count": 0}
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=15)
+        try:
+            quick = connection.execute("PRAGMA quick_check").fetchone()
+            result["quick_check"] = str(quick[0]) if quick else ""
+            tables = [str(row[0]) for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
+            result["tables"] = tables
+            result["table_count"] = len(tables)
+            result["ok"] = result["quick_check"] == "ok"
+            if not result["ok"]:
+                result["error"] = "quick_check=" + result["quick_check"]
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def _prune_dir_backups(prefix: str, keep: int, keep_name: str = "") -> list[str]:
+    """按 mtime 保留最近 keep 个 <prefix>*.sqlite3，其它删除；返回被删文件名。"""
+    try:
+        names = [name for name in os.listdir(BACKUP_DIR)
+                 if name.startswith(prefix) and name.endswith(".sqlite3")]
+    except OSError:
+        return []
+    items = []
+    for name in names:
+        path = os.path.join(BACKUP_DIR, name)
+        try:
+            items.append((os.path.getmtime(path), name))
+        except OSError:
+            continue
+    items.sort(reverse=True)
+    pruned = []
+    for _mtime, name in items[max(0, keep):]:
+        if name == keep_name:
+            continue
+        try:
+            os.unlink(os.path.join(BACKUP_DIR, name))
+            pruned.append(name)
+        except OSError:
+            continue
+    return pruned
+
+
+def backup_list() -> dict:
+    """GET /api/v2/backup/list：/data/backups/*.sqlite3 列表 + 剩余空间。"""
+    items = []
+    try:
+        names = os.listdir(BACKUP_DIR)
+    except OSError:
+        names = []
+    now = time.time()
+    for name in names:
+        if not name.endswith(".sqlite3"):
+            continue
+        path = os.path.join(BACKUP_DIR, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        database = "bot" if name.startswith("cosmobot") else "domain" if name.startswith("fm-domain") else "other"
+        items.append({
+            "file": name,
+            "path": path,
+            "db": database,
+            "size": stat.st_size,
+            "size_human": _human_size(stat.st_size),
+            "mtime": int(stat.st_mtime),
+            "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+            "age_seconds": int(now - stat.st_mtime),
+        })
+    items.sort(key=lambda item: item["mtime"], reverse=True)
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        usage = shutil.disk_usage(BACKUP_DIR)
+        free = usage.free
+        total = usage.total
+    except OSError:
+        free = total = 0
+    return {
+        "dir": BACKUP_DIR,
+        "backups": items,
+        "count": len(items),
+        "total_size": sum(item["size"] for item in items),
+        "total_size_human": _human_size(sum(item["size"] for item in items)),
+        "free_bytes": free,
+        "free_human": _human_size(free),
+        "disk_total_human": _human_size(total),
+        "note": "bot 备份在后台容器内直接用 sqlite3 在线备份；domain 备份由宿主机 ops-agent 完成（容器里看不到 domain 数据目录）。",
+    }
+
+
+def backup_create_bot(actor: str = "admin") -> dict:
+    """POST /api/v2/backup/create {db:"bot"}：sqlite3 在线备份 + quick_check 校验。"""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except OSError as exc:
+        raise ApiError("无法创建备份目录 " + BACKUP_DIR + "：" + str(exc), 500)
+    try:
+        source_size = os.path.getsize(BOT_DB)
+        free = shutil.disk_usage(BACKUP_DIR).free
+    except OSError as exc:
+        raise ApiError("读取数据库/磁盘信息失败：" + str(exc), 500)
+    if free < source_size * 1.3 + 50 * 1024 * 1024:
+        raise ApiError("磁盘剩余空间不足：%s，备份需要约 %s" % (_human_size(free), _human_size(source_size * 1.3)), 507)
+    name = "cosmobot-" + _stamp() + ".sqlite3"
+    path = os.path.join(BACKUP_DIR, name)
+    started = time.time()
+    try:
+        source = _bot_db()
+        try:
+            target = sqlite3.connect(path, timeout=30)
+            try:
+                source.backup(target, pages=8192, sleep=0.001)
+            finally:
+                target.close()
+        finally:
+            source.close()
+    except sqlite3.Error as exc:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise ApiError("bot 数据库备份失败：" + str(exc), 500)
+    size = os.path.getsize(path)
+    verify = _verify_sqlite_file(path)
+    if not verify["ok"]:
+        raise ApiError("备份文件校验失败：%s（文件保留：%s）" % (verify.get("error") or "未知", path), 500)
+    pruned = _prune_dir_backups("cosmobot-", 5, keep_name=name)
+    return {
+        "db": "bot",
+        "source": BOT_DB,
+        "path": path,
+        "file": name,
+        "size": size,
+        "size_human": _human_size(size),
+        "source_size": source_size,
+        "duration_ms": round((time.time() - started) * 1000),
+        "verify": verify,
+        "verified": True,
+        "pruned": pruned,
+        "keep": 5,
+        "note": "在线备份（sqlite3 backup API），已 quick_check 校验；超过 5 份的旧 bot 备份已自动清理。",
+    }
+
+
+def backup_create_domain(actor: str = "admin") -> dict:
+    """POST /api/v2/backup/create {db:"domain"}：经宿主机代理备份 /opt/fm-domain/data/fm-domain.sqlite3。"""
+    out = ops_request("backup_domain", {}, timeout=180.0)
+    payload = out.get("result") or {}
+    if not payload.get("file"):
+        raise ApiError("domain 备份未返回文件信息", 500)
+    file_name = str(payload.get("file") or "")
+    return {
+        "db": "domain",
+        "source": payload.get("source") or "/opt/fm-domain/data/fm-domain.sqlite3",
+        "path": os.path.join(BACKUP_DIR, file_name),
+        "host_path": payload.get("path") or "",
+        "file": file_name,
+        "size": payload.get("size") or 0,
+        "size_human": payload.get("size_human") or _human_size(payload.get("size")),
+        "duration_ms": payload.get("duration_ms"),
+        "verify": payload.get("verify") or {},
+        "verified": bool(payload.get("verified")),
+        "pruned": payload.get("pruned") or [],
+        "keep": 3,
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "note": "domain 备份由宿主机 root cron 代理执行（后台容器没有 domain 数据目录），已 quick_check 校验。",
+    }
+
+
+# ── H. 自检矩阵内部项（HTTP 自检在 app.py 里做，这样每项都有真实 HTTP 状态码）──
+def selftest_internal(domain: Callable[..., Any] | None, rpc: Callable[..., Any] | None) -> list[dict]:
+    checks: list[dict] = []
+
+    def run(name: str, fn: Callable[[], Any], required: bool = True) -> None:
+        started = time.monotonic()
+        detail: Any = None
+        error = ""
+        ok = False
+        try:
+            detail = fn()
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)[:400]
+        checks.append({
+            "name": name,
+            "kind": "internal",
+            "method": "INTERNAL",
+            "path": "",
+            "http_status": None,
+            "ms": round((time.monotonic() - started) * 1000, 1),
+            "ok": ok,
+            "level": "ok" if ok else ("fail" if required else "warn"),
+            "required": required,
+            "error": error,
+            "detail": detail,
+        })
+
+    def sqlite_count(table: str) -> dict:
+        rows = _query(f"SELECT COUNT(*) n FROM {table}")
+        if not rows:
+            raise RuntimeError("查询失败（表不存在或数据库不可读）：" + table)
+        return {"table": table, "rows": int(rows[0]["n"])}
+
+    run("sqlite:chat_log", lambda: sqlite_count("chat_log"))
+    run("sqlite:audit_log", lambda: sqlite_count("audit_log"))
+    run("sqlite:scheduled_messages", lambda: sqlite_count("scheduled_messages"))
+    run("sqlite:media_files", lambda: sqlite_count("media_files"))
+
+    def check_config() -> dict:
+        parsed, error = _config_parsed()
+        if parsed is None:
+            raise RuntimeError(error or "解析失败")
+        llm = parsed.get("llm") if isinstance(parsed.get("llm"), dict) else {}
+        return {"path": CONFIG_TOML_PATH, "top_sections": sorted(parsed.keys()),
+                "chat_providers": sorted((llm.get("chat_provider") or {}).keys()),
+                "bytes": os.path.getsize(CONFIG_TOML_PATH)}
+
+    run("runtime:config.toml", check_config)
+
+    def check_memory() -> dict:
+        total = 0
+        directories = 0
+        for _root, dirs, files in os.walk(MEMORY_ROOT):
+            dirs[:] = [name for name in dirs if name not in (".git", "__pycache__")]
+            directories += len(dirs)
+            total += len(files)
+            if total > 50000:
+                break
+        if total == 0:
+            raise RuntimeError("memory 目录里没有文件：" + MEMORY_ROOT)
+        return {"root": MEMORY_ROOT, "files": total, "dirs": directories}
+
+    run("runtime:memory", check_memory)
+
+    def check_runtime_writes() -> dict:
+        probe = os.path.join(RUNTIME, ".fm-admin-selftest-" + secrets.token_hex(4))
+        try:
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok")
+            os.unlink(probe)
+        except OSError as exc:
+            raise RuntimeError("/runtime 不可写：" + str(exc))
+        return {"path": RUNTIME, "writable": True}
+
+    run("runtime:write", check_runtime_writes, required=False)
+
+    def check_ops_agent() -> dict:
+        agent = _ops_agent_state()
+        if not agent.get("online"):
+            raise RuntimeError("宿主机运维代理离线：最后心跳 %s 秒前" % agent.get("age_seconds"))
+        return {"online": True, "age_seconds": agent.get("age_seconds"), "scans": agent.get("scans"),
+                "allowed_ops": agent.get("allowed_ops")}
+
+    run("ops:agent-heartbeat", check_ops_agent)
+
+    def check_ops_queue() -> dict:
+        probe = os.path.join(OPS_QUEUE, ".selftest-" + secrets.token_hex(4))
+        try:
+            os.makedirs(OPS_QUEUE, exist_ok=True)
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok")
+            os.unlink(probe)
+        except OSError as exc:
+            raise RuntimeError("运维队列不可写：" + str(exc))
+        return {"queue": OPS_QUEUE, "results": OPS_RESULTS, "writable": True}
+
+    run("ops:queue-writable", check_ops_queue)
+
+    def check_ops_result_dir() -> dict:
+        try:
+            names = [name for name in os.listdir(OPS_RESULTS) if name.endswith(".json")]
+        except OSError as exc:
+            raise RuntimeError("读运维结果目录失败：" + str(exc))
+        return {"results": OPS_RESULTS, "json_files": len(names)}
+
+    run("ops:results", check_ops_result_dir, required=False)
+
+    def check_backup_dir() -> dict:
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            usage = shutil.disk_usage(BACKUP_DIR)
+            probe = os.path.join(BACKUP_DIR, ".selftest-" + secrets.token_hex(4))
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok")
+            os.unlink(probe)
+        except OSError as exc:
+            raise RuntimeError("备份目录不可写：" + str(exc))
+        return {"dir": BACKUP_DIR, "free_human": _human_size(usage.free), "writable": True}
+
+    run("backup:dir-writable", check_backup_dir)
+
+    def check_auth_file() -> dict:
+        # 不 import app（app.py 以 __main__ 运行，重复 import 会造出第二个模块实例）；
+        # 直接按环境变量推导 auth.json 路径读脱敏统计。
+        state_path = os.environ.get("FM_ADMIN_STATE", "/data/fm-admin-state.json")
+        auth_path = os.environ.get("FM_ADMIN_AUTH") or os.path.join(os.path.dirname(state_path), "auth.json")
+        try:
+            with open(auth_path, "r", encoding="utf-8") as handle:
+                auth = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("读取 auth.json 失败：" + str(exc))
+        tokens = auth.get("tokens") or [] if isinstance(auth, dict) else []
+        return {"path": auth_path, "token_count": len(tokens),
+                "enabled_tokens": sum(1 for token in tokens if isinstance(token, dict) and token.get("enabled", True)),
+                "admin_tokens": sum(1 for token in tokens if isinstance(token, dict)
+                                    and token.get("is_admin") and token.get("enabled", True))}
+
+    run("security:auth-file", check_auth_file, required=False)
+
+    if callable(rpc):
+        def check_rpc_snapshot() -> dict:
+            result = rpc("config.snapshot")
+            if not isinstance(result, dict) or not result.get("ok"):
+                error = str(result.get("error") or "") if isinstance(result, dict) else ""
+                raise RuntimeError("RPC config.snapshot 失败：" + (error or "未知"))
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            return {"models": len(data.get("models") or []),
+                    "image_models": len(data.get("image_models") or []),
+                    "triggers": len(data.get("triggers") or [])}
+
+        run("rpc:config.snapshot", check_rpc_snapshot)
+
+        def check_rpc_model() -> dict:
+            result = rpc("config.model", {"action": "status"})
+            if not isinstance(result, dict) or not result.get("ok"):
+                error = str(result.get("error") or "") if isinstance(result, dict) else ""
+                raise RuntimeError("RPC config.model status 失败：" + (error or "未知"))
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            models = data.get("models") if isinstance(data.get("models"), list) else []
+            return {"models": len(models),
+                    "current": next((item.get("provider") for item in models if item.get("current")), "")}
+
+        run("rpc:config.model", check_rpc_model)
+
+    if callable(domain):
+        def domain_health() -> dict:
+            result = domain("/health")
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /health 失败"))
+            return {"data": result.get("data")}
+
+        run("domain:/health", domain_health)
+
+        def domain_stats() -> dict:
+            result = domain("/stats")
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /stats 失败"))
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            return {key: data.get(key) for key in ("groups", "library_texts", "contest_texts", "score_records") if key in data}
+
+        run("domain:/stats", domain_stats)
+
+        def domain_groups() -> dict:
+            result = domain("/groups")
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /groups 失败"))
+            data = result.get("data")
+            groups = data if isinstance(data, list) else []
+            return {"groups": len(groups)}
+
+        run("domain:/groups", domain_groups)
+
+        def domain_capability() -> dict:
+            result = domain("/group-capability", urlencode({"group_id": "216063968"}))
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /group-capability 失败"))
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            capabilities = data.get("capabilities") if isinstance(data.get("capabilities"), dict) else {}
+            return {"group_id": data.get("group_id"), "capabilities": len(capabilities)}
+
+        run("domain:/group-capability", domain_capability)
+
+        def domain_archive() -> dict:
+            result = domain("/archive/status")
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /archive/status 失败"))
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            return {"status": data.get("status"), "sources": len(data.get("sources") or {})}
+
+        run("domain:/archive/status", domain_archive)
+
+        def domain_library() -> dict:
+            result = domain("/library/search", urlencode({"q": "", "limit": 2}))
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /library/search 失败"))
+            data = result.get("data")
+            return {"rows": len(data) if isinstance(data, list) else 0}
+
+        run("domain:/library/search", domain_library)
+
+        def domain_contest() -> dict:
+            result = domain("/contest/search", urlencode({"q": "", "limit": 2}))
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /contest/search 失败"))
+            data = result.get("data")
+            return {"rows": len(data) if isinstance(data, list) else 0}
+
+        run("domain:/contest/search", domain_contest)
+
+        def domain_scores() -> dict:
+            result = domain("/scores", urlencode({"limit": 2}))
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise RuntimeError(str(result.get("error") or "domain /scores 失败"))
+            data = result.get("data")
+            return {"rows": len(data) if isinstance(data, list) else 0}
+
+        run("domain:/scores", domain_scores)
+
+        # 领域侧新接口（domain-api 已在 2026-11-15 上线；/version、/contests/list、
+        # /library/list、/typing/summary、/reports/daily 视为必需项，chart-data 仍可选）。
+        optional_domain = [
+            ("domain:/version", "/version", "", True),
+            ("domain:/contests/list", "/contests/list", "", True),
+            ("domain:/library/list", "/library/list", urlencode({"limit": 2}), True),
+            ("domain:/typing/summary", "/typing/summary", urlencode({"days": 7}), True),
+            ("domain:/reports/daily", "/reports/daily", "", True),
+            ("domain:/contest/chart-data", "/contest/chart-data", urlencode({"contest": "HB", "days": 7}), False),
+        ]
+        for name, path, query, required_flag in optional_domain:
+            def optional_probe(path: str = path, query: str = query) -> dict:
+                result = domain(path, query)
+                if not isinstance(result, dict) or not result.get("ok"):
+                    raise RuntimeError(str(result.get("error") or ("domain %s 失败" % path)))
+                data = result.get("data")
+                if isinstance(data, dict) and data.get("error") == "not found":
+                    raise RuntimeError("domain 尚未实现该接口（其他线在补）")
+                return {"path": path, "type": type(data).__name__,
+                        "size": len(data) if isinstance(data, (list, dict)) else None}
+            run(name, optional_probe, required=required_flag)
+
+    return checks
+
+
+# ── I. 通用只读 domain 代理（app.py 里做路径白名单 + query 透传）─────────
+DOMAIN_PROXY_ALLOW = (
+    "/novel/", "/contests/", "/contest/", "/library/", "/typing/", "/reports/",
+    "/groups", "/group-state", "/group-capability", "/scores", "/stats",
+    "/archive/", "/health", "/version", "/recalls", "/competition/", "/analysis/",
+    "/ai-contest/", "/repeat-follow/", "/bot-guard/", "/recent_messages",
+)
+
+
+# ── v3 ROUTES 注册（真正分派在 app.py handle_api_v2，这里同步登记便于查表）──
 ROUTES: dict[str, Callable[..., dict]] = {
+    # v2（保留）
     "overview": overview,
     "humanlike": humanlike_state,
     "members": member_search,
@@ -1561,4 +3022,17 @@ ROUTES: dict[str, Callable[..., dict]] = {
     "browse/tables": browse_tables,
     "members/all": all_members,
     "actions": action_catalog,
+    # v3 新增（GET 读取器；写操作在 app.py 分派里单独接）
+    "config/toml": config_toml_read,
+    "memory/tree": memory_tree,
+    "memory/file": memory_file_read,
+    "models": models_overview,
+    "group/capability": group_capability_read,
+    "ops/logs": ops_logs,
+    "ops/metrics": ops_metrics,
+    "ops/images": ops_images,
+    "ops/cron": ops_cron,
+    "ops/result": ops_result_view,
+    "backup/list": backup_list,
+    "selftest": selftest_internal,
 }

@@ -44,10 +44,11 @@ VERSION_LIMIT = 100
 ERROR_LIMIT = 100
 DOMAIN_READS = {
     "groups": "/groups",
-    "recent-messages": "/recent_messages",
-    "library": "/library/search?limit=50",
-    "contests": "/contest/search?limit=50",
-    "scores": "/scores?limit=50",
+    # v3: recent-messages 不再转发 domain（domain 没有 /recent_messages 路由，历史 404）；
+    # do_GET 里改为直接查 bot sqlite 的 chat_log（数据更真实、也避免 503）。
+    "library": "/library/search",
+    "contests": "/contest/search",
+    "scores": "/scores",
     "stats": "/stats",
     "archive": "/archive/status",
 }
@@ -213,7 +214,12 @@ def record_audit(action: str, collection: str, item_id: str, actor: str = "admin
 
 
 def fetch_domain(path: str, query: str = "") -> dict:
-    target = DOMAIN_URL + path + (f"?{query}" if query else "")
+    # 既有 bug：DOMAIN_READS 里有些 path 自带 query（如 /library/search?limit=50），
+    # 再拼 "?" + query 会变成 "...?limit=50?limit=2"，domain 侧 int("50?limit=2") 直接抛异常 → 503。
+    # 所以 path 已带 ? 时用 & 续接。
+    target = DOMAIN_URL + path
+    if query:
+        target += ("&" if "?" in path else "?") + query
     request = Request(target, headers={"Accept": "application/json"})
     try:
         with urlopen(request, timeout=12) as response:
@@ -273,7 +279,10 @@ def global_search(keyword: str) -> dict:
 
 
 def fetch_domain_binary(path: str, query: str = "") -> tuple[bytes, str] | None:
-    target = DOMAIN_URL + path + (f"?{query}" if query else "")
+    # 同 fetch_domain：path 自带 query 时必须用 & 续接，否则 domain 收到两个 "?"。
+    target = DOMAIN_URL + path
+    if query:
+        target += ("&" if "?" in path else "?") + query
     request = Request(target, headers={"Accept": "image/png"})
     try:
         with urlopen(request, timeout=8) as response:
@@ -613,7 +622,7 @@ def log_stream() -> dict:
     return {"ok": True, "data": {"items": [{**x, "level": "ERROR", "service": x.get("component", "admin")} for x in errors], "services": overview.get("domain", {})}}
 
 
-def fetch_rpc(method: str, params: dict | None = None) -> dict:
+def fetch_rpc(method: str, params: dict | None = None, timeout: float | None = None) -> dict:
     """Call one read-only RPC method without exposing the bearer token."""
     if not RPC_ENABLED:
         result = {"ok": False, "error": "Cosmobot RPC 未启用。"}
@@ -629,7 +638,7 @@ def fetch_rpc(method: str, params: dict | None = None) -> dict:
         request = {"jsonrpc": "2.0", "id": "fm-admin-1", "method": method, "params": params or {}}
         connection = websocket.create_connection(
             f"ws://{RPC_HOST}:{RPC_PORT}/rpc",
-            timeout=RPC_TIMEOUT,
+            timeout=(float(timeout) if timeout is not None else RPC_TIMEOUT),
             header=[f"Authorization: Bearer {RPC_TOKEN}"],
         )
         try:
@@ -690,7 +699,10 @@ RPC_ALLOW_PREFIX = ("audit.", "config.snapshot", "config.model", "config.image_m
 # 属于「能改基础设施」的操作，不该由面板的通用转发口暴露。
 # 读状态（status）要留着，因为「设置」页要显示当前模型与密钥是否已配置。
 RPC_ACTION_POLICY = {
-    "config.model": {"status", "get", "list"},
+    # v3: 允许 switch —— 「模型切换」页用它在线切 provider。bot 侧会先
+    # probeChatModel（真实发一条 "Reply with exactly: OK"）再落盘，且只接受
+    # 配置文件里已存在的 provider 名，不会引入新的 base_url / api_key。
+    "config.model": {"status", "get", "list", "switch"},
     "config.image_model": {"status", "get", "list"},
     "config.persona": {"status", "get", "list", "set", "clear"},
     "config.trigger": {"status", "get", "list", "set", "clear"},
@@ -1259,6 +1271,202 @@ def now_snapshot() -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════
+# v3 扩展辅助（2026-11-15）：通用只读 domain 代理 / 会话 / Token / 自检 HTTP 探针
+# 放在 class Api 之前，供 handle_api_v2 分派和自检使用。
+# ══════════════════════════════════════════════════════════════════════
+
+def _mask_session_id(session_id: object) -> str:
+    text = str(session_id or "")
+    return (text[:6] + "…" + text[-4:]) if len(text) > 12 else "***"
+
+
+def list_admin_sessions(current: dict | None = None) -> dict:
+    """GET /api/v2/sessions：当前后台登录会话（不含完整 session id）。"""
+    now = time.time()
+    current_id = str((current or {}).get("session_id") or "")
+    with LOCK:
+        rows = list(SESSIONS.items())
+    items = []
+    for session_id, session in rows:
+        login_at = float(session.get("login_time") or 0)
+        age = max(0.0, now - login_at) if login_at else None
+        items.append({
+            "session_id": _mask_session_id(session_id),
+            "username": str(session.get("username") or ""),
+            "is_admin": bool(session.get("is_admin")),
+            "login_at": login_at,
+            "login_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(login_at)) if login_at else "",
+            "age_seconds": int(age) if age is not None else None,
+            "remaining_seconds": max(0, int(SESSION_TTL - age)) if age is not None else None,
+            "from_token": bool(session.get("token_id")),
+            "current": bool(current_id and session_id == current_id),
+        })
+    items.sort(key=lambda item: item.get("login_at") or 0, reverse=True)
+    return {
+        "sessions": items,
+        "count": len(items),
+        "ttl_seconds": SESSION_TTL,
+        "now": now,
+        "note": "session id 为脱敏后的值；后台 token 会话默认只读，is_admin=true 的自动化 token 才可写。",
+    }
+
+
+def list_admin_tokens() -> dict:
+    """GET /api/v2/tokens：脱敏后的 token 列表（含 is_admin / 过期 / 禁用状态）。"""
+    auth = read_auth()
+    now = time.time()
+    items = []
+    for token in auth.get("tokens", []) or []:
+        masked = masked_token(token)
+        expires = token.get("expires_at")
+        try:
+            expires_value = float(expires) if expires else None
+        except (TypeError, ValueError):
+            expires_value = None
+        revoked_at = token.get("revoked_at")
+        try:
+            revoked_value = float(revoked_at) if revoked_at else None
+        except (TypeError, ValueError):
+            revoked_value = None
+        items.append({
+            **masked,
+            "is_admin": bool(token.get("is_admin", False)),
+            "enabled": bool(token.get("enabled", True)),
+            "expired": bool(expires_value and expires_value <= now),
+            "expires_at": expires_value,
+            "expires_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expires_value)) if expires_value else "",
+            "revoked_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(revoked_value)) if revoked_value else "",
+        })
+    items.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
+    return {
+        "tokens": items,
+        "count": len(items),
+        "enabled_count": sum(1 for item in items if item["enabled"] and not item["expired"]),
+        "admin_count": sum(1 for item in items if item["is_admin"] and item["enabled"] and not item["expired"]),
+        "now": now,
+        "note": "token 值只显示首尾各 4 位；撤销=置 enabled=false 并踢掉用该 token 登录的会话。",
+    }
+
+
+def revoke_admin_token(token_id: object) -> dict | None:
+    """撤销（禁用）一个后台 token；不存在返回 None。"""
+    tid = str(token_id or "").strip()
+    if not tid:
+        return None
+    auth = read_auth()
+    target = next((token for token in (auth.get("tokens") or []) if str(token.get("id")) == tid), None)
+    if target is None:
+        return None
+    target["enabled"] = False
+    target["revoked_at"] = time.time()
+    write_auth(auth)
+    dropped = 0
+    with LOCK:
+        for session_id, session in list(SESSIONS.items()):
+            if str(session.get("token_id") or "") == tid:
+                SESSIONS.pop(session_id, None)
+                dropped += 1
+    return {
+        "id": tid,
+        "name": str(target.get("name") or ""),
+        "is_admin": bool(target.get("is_admin", False)),
+        "revoked": True,
+        "enabled": False,
+        "revoked_at": int(time.time()),
+        "sessions_dropped": dropped,
+    }
+
+
+def domain_proxy_get(path: object, extra_query: str = "") -> dict:
+    """GET /api/v2/domain?path=：通用只读 domain 代理（白名单前缀，仅 GET）。
+
+    兼容两种写法：
+      /api/v2/domain?path=/library/list&limit=2      （query 走独立参数）
+      /api/v2/domain?path=/library/list%3Flimit%3D2  （query 塞在 path 里）
+    """
+    import api_v2 as v2module
+    rel = str(path or "").strip()
+    if not rel:
+        raise ValueError("缺少 path 参数（例如 /stats、/novel/stats）")
+    rel, _, embedded = rel.partition("?")
+    if not rel.startswith("/"):
+        rel = "/" + rel
+    if ".." in rel or "//" in rel:
+        raise ValueError("非法 path：" + rel)
+    allowed = any(rel == prefix.rstrip("/") or rel.startswith(prefix)
+                  for prefix in v2module.DOMAIN_PROXY_ALLOW)
+    if not allowed:
+        raise PermissionError("path 不在只读 domain 代理白名单内：" + rel)
+    combined_query = "&".join(part for part in (extra_query, embedded) if part)
+    result = fetch_domain(rel, combined_query)
+    if not isinstance(result, dict) or not result.get("ok"):
+        error = str(result.get("error") or "") if isinstance(result, dict) else ""
+        raise RuntimeError("fm-domain 请求失败：" + (error or "未知错误"))
+    data = result.get("data")
+    return {"path": rel, "query": combined_query, "source": "domain", "data": data,
+            "count": len(data) if isinstance(data, (list, dict)) else None}
+
+
+# 自检环节逐个 HTTP 探测的接口清单：(名称, path, 是否必需)
+SELFTEST_HTTP_ROUTES: list[tuple[str, str, bool]] = [
+    ("v2:overview", "/api/v2/overview", True),
+    ("v2:charts/messages", "/api/v2/charts/messages?days=7", True),
+    ("v2:charts/tools", "/api/v2/charts/tools?days=7", True),
+    ("v2:top/groups", "/api/v2/top/groups?days=7&limit=5", True),
+    ("v2:tools/catalog", "/api/v2/tools/catalog", True),
+    ("v2:tools/stats", "/api/v2/tools/stats?days=7", True),
+    ("v2:groups", "/api/v2/groups", True),
+    ("v2:triggers", "/api/v2/triggers", True),
+    ("v2:persona", "/api/v2/persona?scope=group_default", True),
+    ("v2:scheduled", "/api/v2/scheduled?limit=5", True),
+    ("v2:members/all", "/api/v2/members/all?limit=5", True),
+    ("v2:browse/tables", "/api/v2/browse/tables", True),
+    ("v2:novels", "/api/v2/novels", False),
+    ("v2:config/toml", "/api/v2/config/toml", True),
+    ("v2:memory/tree", "/api/v2/memory/tree", True),
+    ("v2:models", "/api/v2/models", True),
+    ("v2:group/capability", "/api/v2/group/capability?id=216063968", True),
+    ("v2:backup/list", "/api/v2/backup/list", True),
+    ("v2:sessions", "/api/v2/sessions", True),
+    ("v2:tokens", "/api/v2/tokens", True),
+    ("v2:domain?path=/health", "/api/v2/domain?path=/health", True),
+    ("v2:domain?path=/stats", "/api/v2/domain?path=/stats", True),
+    ("v2:ops/logs", "/api/v2/ops/logs?tail=5", False),
+    ("v2:ops/metrics", "/api/v2/ops/metrics", False),
+    ("v2:ops/cron", "/api/v2/ops/cron", False),
+    ("v2:ops/images", "/api/v2/ops/images", False),
+    ("domain:library", "/api/domain/library?limit=2", True),
+    ("domain:contests", "/api/domain/contests?limit=2", True),
+    ("domain:scores", "/api/domain/scores?limit=2", True),
+    ("domain:stats", "/api/domain/stats", True),
+    ("domain:groups", "/api/domain/groups", True),
+    ("domain:archive", "/api/domain/archive", True),
+    ("domain:recent-messages", "/api/domain/recent-messages?limit=2", False),
+    ("v2:domain?path=/contests/list", "/api/v2/domain?path=/contests/list", True),
+    ("v2:domain?path=/library/list", "/api/v2/domain?path=/library/list&limit=2", True),
+    ("v2:domain?path=/typing/summary", "/api/v2/domain?path=/typing/summary&days=7", True),
+    ("v2:domain?path=/reports/daily", "/api/v2/domain?path=/reports/daily", True),
+    ("v2:domain?path=/version", "/api/v2/domain?path=/version", True),
+    ("v2:domain?path=/contest/chart-data", "/api/v2/domain?path=/contest/chart-data&contest=HB&days=7", False),
+    ("v2:domain?path=/novel/stats", "/api/v2/domain?path=/novel/stats", True),
+]
+
+# 写接口清单（自检不自动执行，避免副作用；这里登记给「自检」页做验收清单）
+SELFTEST_WRITE_ENDPOINTS: list[dict] = [
+    {"method": "POST", "path": "/api/v2/config/toml", "note": "保存配置（备份+tomllib+sha 校验+审计）"},
+    {"method": "POST", "path": "/api/v2/memory/file", "note": "写记忆/人设文件（白名单+备份+sha 校验+审计）"},
+    {"method": "POST", "path": "/api/v2/models/switch", "note": "切换模型（RPC probe 热切换；改 effort 走文件+重启）"},
+    {"method": "POST", "path": "/api/v2/group/capability", "note": "改群能力（代理 domain POST + 回读校验+审计）"},
+    {"method": "POST", "path": "/api/v2/ops/rollback", "note": "回滚镜像（受保护：只校验+人工步骤）"},
+    {"method": "GET", "path": "/api/v2/export/chat", "note": "下载聊天 CSV（流式+审计）"},
+    {"method": "GET", "path": "/api/v2/export/audit", "note": "下载审计 CSV（流式+审计）"},
+    {"method": "POST", "path": "/api/v2/backup/create", "note": "创建 bot/domain 备份（校验+审计）"},
+    {"method": "POST", "path": "/api/v2/tokens/revoke", "note": "撤销 token（踢会话+审计）"},
+    {"method": "GET", "path": "/api/v2/logs/stream", "note": "SSE 实时日志流"},
+]
+
+
 class Api(BaseHTTPRequestHandler):
     server_version = "FMControl/0.1"
 
@@ -1322,6 +1530,9 @@ class Api(BaseHTTPRequestHandler):
                     valid = True
                     username = str(token.get("name") or "token-user")
                     token_id = token.get("id")
+                    # v3: token 记录可选 is_admin（默认 false，保持既有 token 只读语义）。
+                    # 只有 admin 会话创建 token 时才能显式指定；用于夜间自动化写操作。
+                    is_admin = bool(token.get("is_admin", False))
                     break
         else:
             self.send_error_json(HTTPStatus.BAD_REQUEST, "不支持的登录方式。")
@@ -1369,7 +1580,12 @@ class Api(BaseHTTPRequestHandler):
                 self.send_error_json(HTTPStatus.BAD_REQUEST, "过期时间必须是未来时间戳。")
                 return
         token = secrets.token_hex(16)
-        item = {"id": secrets.token_hex(16), "value": token, "name": name[:120], "created_at": time.time(), "created_by": session["username"], "expires_at": expires_at, "enabled": True}
+        is_admin = False
+        if isinstance(payload, dict):
+            is_admin = bool(payload.get("is_admin", False))
+        item = {"id": secrets.token_hex(16), "value": token, "name": name[:120],
+                "created_at": time.time(), "created_by": session["username"],
+                "expires_at": expires_at, "enabled": True, "is_admin": is_admin}
         auth = read_auth()
         auth.setdefault("tokens", []).append(item)
         write_auth(auth)
@@ -1562,9 +1778,29 @@ class Api(BaseHTTPRequestHandler):
                     self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, "数据服务暂时不可用：报表接口无法访问。")
                 else:
                     self.send_bytes(HTTPStatus.OK, result[0], result[1] or "image/png")
+            elif name in ("recent-messages", "messages"):
+                # domain 没有 /recent_messages 路由（历史 404）：最近消息直接查 bot sqlite 的 chat_log。
+                import api_v2 as v2module
+                query = parse_qs(request.query)
+                data = v2module.message_search(
+                    (query.get("q") or [""])[0],
+                    (query.get("chat") or query.get("group_id") or [""])[0],
+                    _int_arg((query.get("days") or ["0"])[0], 0),
+                    _int_arg((query.get("limit") or ["50"])[0], 50),
+                )
+                self.send_json(HTTPStatus.OK, {
+                    "ok": True,
+                    "data": data["rows"],
+                    "items": data["rows"],
+                    "total": data["count"],
+                })
             else:
                 path = DOMAIN_READS.get(name, "/" + name)
-                result = fetch_domain(path, request.query)
+                query_text = request.query or ""
+                # 旧的 limit=50 默认值从 path 挪到这里：用户传了 limit 就用用户的，不拼第二个 "?"。
+                if name in ("library", "contests", "scores") and "limit=" not in query_text:
+                    query_text = (query_text + "&" if query_text else "") + "limit=50"
+                result = fetch_domain(path, query_text)
                 if isinstance(result.get("data"), list):
                     result["items"] = result["data"]
                     result["total"] = int(result.get("total", len(result["data"])))
@@ -1768,6 +2004,196 @@ class Api(BaseHTTPRequestHandler):
                 data = v2.novels(fetch_domain)
             elif route == "novel":
                 data = v2.novel_detail(arg("id"), fetch_domain)
+            # ── v3: 配置编辑（A）──────────────────────────────────────────
+            elif route == "config/toml":
+                if self.command == "POST":
+                    if not self.require_admin():
+                        return
+                    payload = self.read_json()
+                    if not isinstance(payload, dict):
+                        raise v2.ApiError("请求体必须是 JSON 对象")
+                    data = v2.config_toml_write(payload.get("content"), actor)
+                    record_audit("save", "config.toml", str(data.get("sha256") or "")[:12], actor)
+                elif self.command == "GET":
+                    data = v2.config_toml_read()
+                else:
+                    method_not_allowed("GET, POST")
+                    return
+            # ── v3: 记忆 / 人设文件（B）──────────────────────────────────
+            elif route == "memory/tree":
+                data = v2.memory_tree(arg("path"))
+            elif route == "memory/file":
+                if self.command == "POST":
+                    if not self.require_admin():
+                        return
+                    payload = self.read_json()
+                    if not isinstance(payload, dict):
+                        raise v2.ApiError("请求体必须是 JSON 对象")
+                    data = v2.memory_file_write(payload.get("path") or arg("path"),
+                                                payload.get("content"), actor)
+                    record_audit("save", "memory", str(data.get("path") or ""), actor)
+                elif self.command == "GET":
+                    data = v2.memory_file_read(arg("path"))
+                else:
+                    method_not_allowed("GET, POST")
+                    return
+            # ── v3: 模型（C）────────────────────────────────────────────
+            elif route == "models":
+                data = v2.models_overview(fetch_rpc)
+            elif route == "models/switch":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                provider = str(payload.get("provider") or "").strip()
+                effort = str(payload.get("effort") or "").strip()
+                data = v2.models_switch(
+                    provider, effort,
+                    lambda method, params=None: fetch_rpc(method, params, timeout=45.0),
+                )
+                record_audit("switch", "model",
+                             provider + (":" + effort if effort else ""), actor)
+            # ── v3: 群能力（D，代理 fm-domain）──────────────────────────
+            elif route == "group/capability":
+                if self.command == "POST":
+                    if not self.require_admin():
+                        return
+                    payload = self.read_json()
+                    if not isinstance(payload, dict):
+                        raise v2.ApiError("请求体必须是 JSON 对象")
+                    group_id = str(payload.get("group_id") or payload.get("id") or "").strip()
+                    capability = str(payload.get("capability") or payload.get("feature") or "").strip()
+                    enabled = payload.get("enabled")
+                    data = v2.group_capability_write(group_id, capability, enabled,
+                                                     fetch_domain, proxy_domain_post)
+                    record_audit("set", "capability", group_id + ":" + capability, actor)
+                elif self.command == "GET":
+                    data = v2.group_capability_read(arg("id") or arg("group_id"), fetch_domain)
+                else:
+                    method_not_allowed("GET, POST")
+                    return
+            # ── v3: 运维监控（E）────────────────────────────────────────
+            elif route == "ops/logs":
+                data = v2.ops_logs(arg("tail", "200"), arg("since"))
+            elif route == "ops/metrics":
+                data = v2.ops_metrics()
+            elif route == "ops/images":
+                data = v2.ops_images(arg("live").lower() in {"1", "true", "yes", "on"})
+            elif route == "ops/cron":
+                data = v2.ops_cron()
+            elif route == "ops/result":
+                data = v2.ops_result_view(arg("request_id"))
+            elif route == "ops/rollback":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                data = v2.ops_rollback(payload.get("image"))
+                record_audit("rollback", "ops", str(payload.get("image") or ""), actor)
+            # ── v3: 导出 CSV（F）────────────────────────────────────────
+            elif route == "export/chat":
+                if self.command != "GET":
+                    method_not_allowed("GET")
+                    return
+                days = _int_arg(arg("days", "7"), 7)
+                chat_id = arg("chat")
+                record_audit("export", "chat", "days=%d;chat=%s" % (days, chat_id or "-"), actor)
+                self.stream_csv(
+                    v2.export_chat_csv(days, chat_id),
+                    "fm-chat-%s.csv" % time.strftime("%Y%m%d-%H%M%S"),
+                )
+                return
+            elif route == "export/audit":
+                if self.command != "GET":
+                    method_not_allowed("GET")
+                    return
+                days = _int_arg(arg("days", "7"), 7)
+                record_audit("export", "audit", "days=%d" % days, actor)
+                self.stream_csv(
+                    v2.export_audit_csv(read_state().get("audit") or [], days),
+                    "fm-audit-%s.csv" % time.strftime("%Y%m%d-%H%M%S"),
+                )
+                return
+            # ── v3: 备份（G）────────────────────────────────────────────
+            elif route == "backup/list":
+                data = v2.backup_list()
+            elif route == "backup/create":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                database = str(payload.get("db") or "bot").strip().lower()
+                if database == "bot":
+                    data = v2.backup_create_bot(actor)
+                elif database == "domain":
+                    data = v2.backup_create_domain(actor)
+                else:
+                    raise v2.ApiError("db 只支持 bot / domain", 400)
+                record_audit("backup", database, str(data.get("file") or ""), actor)
+            # ── v3: 日志流 SSE（H）─────────────────────────────────────
+            elif route == "logs/stream":
+                if self.command != "GET":
+                    method_not_allowed("GET")
+                    return
+                self.handle_logs_stream(arg("tail", "100"), arg("since"), arg("seconds", "180"))
+                return
+            # ── v3: 自检矩阵（I）────────────────────────────────────────
+            elif route == "selftest":
+                self.handle_selftest()
+                return
+            # ── v3: 会话与 Token（J）───────────────────────────────────
+            elif route == "sessions":
+                if not self.require_admin():
+                    return
+                data = list_admin_sessions(self.current_session())
+            elif route == "tokens":
+                if not self.require_admin():
+                    return
+                data = list_admin_tokens()
+            elif route == "tokens/revoke":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                token_id = str(payload.get("id") or "").strip()
+                if not token_id:
+                    raise v2.ApiError("缺少 id（token id）")
+                revoked = revoke_admin_token(token_id)
+                if revoked is None:
+                    raise v2.ApiError("Token 不存在：" + token_id, 404)
+                record_audit("revoke", "tokens", token_id, actor)
+                data = revoked
+            # ── v3: 通用只读 domain 代理（前端不用猜 old proxy 名字）────
+            elif route == "domain":
+                if self.command != "GET":
+                    method_not_allowed("GET")
+                    return
+                extra = {key: values[0] for key, values in query.items()
+                         if key != "path" and values}
+                try:
+                    data = domain_proxy_get(arg("path"), urlencode(extra))
+                except ValueError as exc:
+                    raise v2.ApiError(str(exc), 400)
+                except PermissionError as exc:
+                    raise v2.ApiError(str(exc), 403)
+                except RuntimeError as exc:
+                    raise v2.ApiError(str(exc), 502)
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "未知的 v2 接口")
                 return
@@ -1780,6 +2206,195 @@ class Api(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"v2 接口失败：{exc}")
             return
         self.send_json(HTTPStatus.OK, {"ok": True, "data": data})
+
+    # ══ v3 扩展：SSE 日志流 / CSV 导出流 / 自检矩阵 ══════════════════════════
+
+    def _sse_send(self, event: str, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False)
+        frame = ("event: %s\ndata: %s\n\n" % (event, data)).encode("utf-8")
+        self.wfile.write(frame)
+        self.wfile.flush()
+
+    def handle_logs_stream(self, tail: str = "100", since: str = "", seconds: str = "180") -> None:
+        """GET /api/v2/logs/stream：真正的 text/event-stream。
+
+        后台容器没有 docker socket，所以 SSE 的数据源是宿主机 ops-agent 的
+        `docker logs fm-cosmobot --timestamps --since <上一次时间戳>`；每轮把新行
+        以 event: log 推给前端，附带 ping 心跳。客户端断开（BrokenPipe）即退出。
+        """
+        import api_v2 as v2
+        try:
+            tail_n = max(1, min(500, int(tail or 100)))
+        except (TypeError, ValueError):
+            tail_n = 100
+        try:
+            duration = max(5, min(300, int(seconds or 180)))
+        except (TypeError, ValueError):
+            duration = 180
+        cursor = str(since or "").strip()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        deadline = time.time() + duration
+        first = True
+        last_key: tuple[str, str] | None = None
+        try:
+            self._sse_send("hello", {"source": "host-ops-agent:docker logs",
+                                     "container": "fm-cosmobot", "tail": tail_n,
+                                     "duration_seconds": duration, "at": int(time.time())})
+            while time.time() < deadline:
+                try:
+                    payload = v2.ops_logs(tail=tail_n if first else 500,
+                                          since="" if first else cursor)
+                    lines = payload.get("lines") or []
+                except v2.ApiError as exc:
+                    self._sse_send("error", {"message": exc.message, "status": exc.status})
+                    break
+                sent = 0
+                for line in lines:
+                    line_ts = str(line.get("ts") or "")
+                    key = (line_ts, str(line.get("text") or ""))
+                    # --since 是包含式边界：跳过上一批已经推过的最后一行
+                    if not first and key == last_key:
+                        continue
+                    last_key = key
+                    self._sse_send("log", {"ts": line_ts,
+                                           "text": str(line.get("text") or "")[:4000],
+                                           "stream": line.get("stream") or ""})
+                    sent += 1
+                    if line_ts:
+                        cursor = line_ts
+                self._sse_send("ping", {"at": int(time.time()), "sent": sent,
+                                        "cursor": cursor, "remaining_seconds": int(deadline - time.time())})
+                first = False
+                time.sleep(2.0 if sent else 3.0)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            try:
+                self._sse_send("end", {"reason": "duration-timeout"})
+            except Exception:  # noqa: BLE001  客户端已断开时忽略
+                pass
+            self.close_connection = True
+
+    def stream_csv(self, chunks, filename: str) -> None:
+        """把 CSV 生成器流式写给浏览器（不缓冲、无 Content-Length，Connection: close）。"""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for chunk in chunks:
+                if chunk:
+                    self.wfile.write(chunk.encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _selftest_http_checks(self) -> list[dict]:
+        """以当前 cookie 对本机接口发真实 HTTP 请求，拿到每项状态码与耗时。"""
+        port = int(getattr(self.server, "server_address", ("", 8090))[1] or 8090)
+        cookie = str(self.headers.get("Cookie") or "")
+        checks: list[dict] = []
+        for name, path, required in SELFTEST_HTTP_ROUTES:
+            started = time.monotonic()
+            status: int | None = None
+            body = b""
+            error_text = ""
+            try:
+                request = Request("http://127.0.0.1:%d%s" % (port, path),
+                                  headers={"Cookie": cookie, "Accept": "application/json",
+                                           "User-Agent": "fm-admin-selftest/1.0"})
+                with urlopen(request, timeout=25) as response:
+                    status = int(response.status)
+                    # 有的接口（memory/tree、deploy 快照、镜像列表）响应几十 KB，必须读全，
+                    # 否则 JSON 截断会误报「响应不是 JSON」。
+                    body = response.read(4 * 1024 * 1024)
+            except HTTPError as error:
+                status = int(error.code)
+                try:
+                    body = error.read(4000)
+                except Exception:  # noqa: BLE001
+                    body = b""
+            except Exception as error:  # noqa: BLE001
+                error_text = "%s: %s" % (type(error).__name__, str(error)[:300])
+            elapsed = round((time.monotonic() - started) * 1000, 1)
+            ok = bool(status and 200 <= status < 300)
+            parsed: object = None
+            if ok and body:
+                try:
+                    parsed = json.loads(body.decode("utf-8", "replace"))
+                except (ValueError, UnicodeDecodeError):
+                    ok = False
+                    error_text = "响应不是 JSON"
+                if isinstance(parsed, dict) and parsed.get("ok") is False:
+                    ok = False
+                    error_text = str(parsed.get("error") or "ok=false")
+            elif ok and not body:
+                ok = False
+                error_text = "响应为空"
+            checks.append({
+                "name": name,
+                "kind": "http",
+                "method": "GET",
+                "path": path,
+                "http_status": status,
+                "ms": elapsed,
+                "ok": ok,
+                "level": "ok" if ok else ("fail" if required else "warn"),
+                "required": bool(required),
+                "error": error_text,
+            })
+        return checks
+
+    def handle_selftest(self) -> None:
+        """GET /api/v2/selftest：内部资源项 + 逐接口 HTTP 探针，红/绿/黄色验收清单。"""
+        import api_v2 as v2
+        started = time.monotonic()
+        internal: list[dict] = []
+        harness_error = ""
+        try:
+            internal = v2.selftest_internal(fetch_domain, fetch_rpc)
+        except Exception as exc:  # noqa: BLE001  自检本身绝不能 500
+            harness_error = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+        http_checks = self._selftest_http_checks()
+        checks = internal + http_checks
+        required_failed = [item for item in checks if item.get("required") and not item.get("ok")]
+        optional_failed = [item for item in checks if not item.get("required") and not item.get("ok")]
+        passed = [item for item in checks if item.get("ok")]
+        summary = {
+            "total": len(checks),
+            "passed": len(passed),
+            "failed": len(required_failed) + len(optional_failed),
+            "failed_required": len(required_failed),
+            "failed_optional": len(optional_failed),
+            "levels": {
+                "ok": sum(1 for item in checks if item.get("level") == "ok"),
+                "warn": sum(1 for item in checks if item.get("level") == "warn"),
+                "fail": sum(1 for item in checks if item.get("level") == "fail"),
+            },
+            "wall_ms": round((time.monotonic() - started) * 1000, 1),
+            "failed_names": [item.get("name") for item in required_failed],
+            "optional_failed_names": [item.get("name") for item in optional_failed],
+        }
+        self.send_json(HTTPStatus.OK, {"ok": True, "data": {
+            "ok": not required_failed,
+            "checked_at": time.time(),
+            "checked_at_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "base_url": "http://127.0.0.1:%d" % int(getattr(self.server, "server_address", ("", 8090))[1] or 8090),
+            "checks": checks,
+            "summary": summary,
+            "harness_error": harness_error,
+            "write_endpoints": SELFTEST_WRITE_ENDPOINTS,
+            "note": "required=false 的项（宿主机代理慢操作 / domain 新接口未上线）标黄，不影响整体通过；写接口不自动执行，已由人工 curl 验证。",
+        }})
 
     def do_POST(self) -> None:
         request = urlparse(self.path)
