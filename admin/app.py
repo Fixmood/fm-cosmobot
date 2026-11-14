@@ -2421,7 +2421,7 @@ class Api(BaseHTTPRequestHandler):
                                               arg("group_id"), arg("metric"))
             # ══ v4: C. 运维增强（宿主机 ops-agent v2）═════════════════════
             elif route == "ops/stats":
-                data = v4.ops_stats()
+                data = v4.ops_stats(arg("force"))
             elif route == "ops/cron-set":
                 if self.command != "POST":
                     method_not_allowed("POST")
@@ -2578,12 +2578,15 @@ class Api(BaseHTTPRequestHandler):
             status: int | None = None
             body = b""
             error_text = ""
+            # 宿主机代理类接口（ops/*）要走队列 + docker 命令，最坏情况要等一个 cron 周期；
+            # 给它们更长的超时，避免自检把「代理正在两轮之间」误报成失败（仍是 optional 项）。
+            probe_timeout = 70 if path.startswith("/api/v2/ops/") else 25
             try:
                 request = Request("http://127.0.0.1:%d%s" % (port, path),
                                   headers={"Cookie": cookie, "Accept": "application/json",
                                            "X-FM-Selftest": "1",
                                            "User-Agent": "fm-admin-selftest/1.0"})
-                with urlopen(request, timeout=25) as response:
+                with urlopen(request, timeout=probe_timeout) as response:
                     status = int(response.status)
                     # 有的接口（memory/tree、deploy 快照、镜像列表）响应几十 KB，必须读全，
                     # 否则 JSON 截断会误报「响应不是 JSON」。

@@ -50,6 +50,7 @@ CACHE_TTLS: dict[str, float] = {
     "novels": 30.0,
     "novel": 30.0,
     "health/history": 15.0,
+    "ops/stats": 15.0,
 }
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -869,20 +870,41 @@ def novel_detail_cached(domain: Any, book_id: object = "") -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 # 4. C. 运维增强（宿主机 ops-agent v2 白名单）
 # ═══════════════════════════════════════════════════════════════════════
-def ops_stats() -> dict:
-    """GET /api/v2/ops/stats：docker stats（bot/domain/admin）+ 磁盘 + 负载 + 内存快照。"""
-    out = v2.ops_request("stats", {}, timeout=90.0)
-    payload = out.get("result") or {}
-    return {
-        "host": payload.get("host") or {},
-        "containers": payload.get("containers") or [],
-        "collected_at": payload.get("collected_at"),
-        "collected_at_text": payload.get("collected_at_text") or "",
-        "request_id": out.get("request_id"),
-        "elapsed_ms": out.get("elapsed_ms"),
-        "duration_ms": out.get("duration_ms"),
-        "source": "host-ops-agent:docker stats(+host /proc)",
-    }
+def ops_stats(force: object = False) -> dict:
+    """GET /api/v2/ops/stats：docker stats（bot/domain/admin）+ 磁盘 + 负载 + 内存快照。
+
+    宿主机 docker stats 每次约 2~3s，运维页/selftest 会重复拉，所以结果缓存 15s；
+    ?force=1 时绕过缓存现场采集。
+    """
+    ttl = 15.0
+    force_flag = force if isinstance(force, bool) else str(force or "").strip().lower() in {
+        "1", "true", "yes", "on"}
+
+    def build() -> dict:
+        out = v2.ops_request("stats", {}, timeout=90.0)
+        payload = out.get("result") or {}
+        return {
+            "host": payload.get("host") or {},
+            "containers": payload.get("containers") or [],
+            "summary": payload.get("summary") or {},
+            "collected_at": payload.get("collected_at"),
+            "collected_at_text": payload.get("collected_at_text") or "",
+            "request_id": out.get("request_id"),
+            "elapsed_ms": out.get("elapsed_ms"),
+            "duration_ms": out.get("duration_ms"),
+            "source": "host-ops-agent:docker stats(+host /proc)",
+        }
+
+    if force_flag:
+        data = build()
+        cache_set(_cache_key("ops/stats"), data)
+        cached, age = False, 0.0
+    else:
+        wrapped = cache_wrap("ops/stats", (), ttl, build)
+        data = dict(wrapped["value"])
+        cached, age = wrapped["cached"], wrapped["age_seconds"]
+    data.update({"cached": cached, "cache_age_seconds": age, "cache_ttl": ttl})
+    return data
 
 
 def ops_logs_v2(tail: object = 200, since: object = "", grep: object = "") -> dict:
