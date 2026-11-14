@@ -7005,6 +7005,13 @@ class Api(BaseHTTPRequestHandler):
                 return self.json(status)
 
             # ── 后台控制台只读接口（2026-11-15） ──
+            if request.path == "/contests/today":
+                db = connect(self.db_path)
+                try:
+                    room = (query.get("group_id", [""])[0] or "").strip()
+                    return self.json(contests_today_payload(db, room))
+                finally:
+                    db.close()
             if request.path == "/version":
                 return self.json(version_response(db, self.db_path))
             if request.path == "/stats/advanced":
@@ -7688,14 +7695,27 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     except Exception:
         font = lambda size: ImageFont.load_default()
 
+    group_label = group_display_name(db, group) if scope == "group" and group else ""
     where = ""
-    if scope == "group" and group:
-        where = f"（{group_display_name(db, group)}）"
+    if scope == "group" and group_label:
+        where = f"（{group_label}）"
     elif scope != "group":
         where = "（全群）"
     when = "今日" if days <= 0 or official else f"最近 {days} 天"
-    title = "FM AI赛文排行榜" if key == "555" else f"FM {label}排行榜"
-    subtitle = f"{today}  |  {label}{where}  |  {when}  |  {source_label}"
+    # 2026-11-15 所有者：群赛文标题用**群名**（FM 梦幻打字阁赛文排行榜）。
+    if key == "555":
+        title = "FM AI赛文排行榜"
+    elif scope == "group" and group_label:
+        title = f"FM {group_label}赛文排行榜"
+    else:
+        title = f"FM {label}排行榜"
+    where_text = ""
+    if scope == "group" and group_label:
+        where_text = f"  |  {group_label}"
+    elif scope != "group":
+        where_text = "  |  全群"
+    title_prefix = "本群" if scope == "group" else label
+    subtitle = f"{today}{where_text}  |  {when}  |  {source_label}"
 
     width = 1240
     row_height = 74
@@ -7887,6 +7907,43 @@ def render_all_ranks(db, group_id: str, limit: int = 5) -> bytes:
     output = io.BytesIO()
     image.save(output, "PNG", optimize=True)
     return output.getvalue()
+
+
+
+
+def contests_today_payload(db, group_id: str) -> dict:
+    """今日有成绩的全部赛文清单（后台/机器人「全部排行榜」用）。"""
+    from datetime import date, timedelta
+    today = date.today().isoformat()
+    group = (group_id or "").strip()
+    official = {"HB", "100000", "99999", "100004"}
+    items = []
+    for key, (label, scope) in CONTEST_LABELS.items():
+        room = group if scope == "group" else ""
+        count = 0
+        try:
+            if key in official:
+                row = db.execute(
+                    "SELECT COUNT(*) n FROM competition_scores WHERE competition_date=? AND source_group=?",
+                    (today, label),
+                ).fetchone()
+                count = int(row["n"] if row and row["n"] else 0)
+                if count == 0:
+                    live = contest_live_rows(key, room)
+                    count = len(live)
+            else:
+                row = db.execute(
+                    "SELECT COUNT(*) n FROM contest_scores WHERE contest_key=? AND group_id=? AND score_date=?",
+                    (key, room, today),
+                ).fetchone()
+                count = int(row["n"] if row and row["n"] else 0)
+        except Exception:
+            count = 0
+        if count > 0:
+            items.append({"contest": key, "label": label, "scope": scope,
+                          "group_id": room, "count": count})
+    items.sort(key=lambda item: -int(item["count"]))
+    return {"ok": True, "date": today, "count": len(items), "items": items}
 
 
 
