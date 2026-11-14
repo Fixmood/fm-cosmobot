@@ -815,12 +815,31 @@ allCompetitionRankQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
-        -- 2026-11-15：全部排行榜也统一风格（锦标赛/虎杯/极速杯/极速联赛 各一段表格）。
-        let cacheKey = maybe "0" (Text.pack . show) message.messageId
-            imageUrl =
-              "http://172.20.0.4:8077/reports/all-ranks.png?limit=5&_=" <> cacheKey
-        sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
-        when (null (rights sent)) $
+        -- 2026-11-15 所有者：全部排行榜要**分开发**（每个赛文一张图，QQ 会把连续图片折叠成一组），
+        -- 不要拼成一张长图。
+        let cacheBase = maybe "0" (Text.pack . show) message.messageId
+            contests =
+              [ ("100000" :: Text, "锦标赛" :: Text)
+              , ("HB", "虎杯")
+              , ("99999", "极速杯")
+              , ("100004", "极速联赛")
+              ]
+        results <- traverse
+          (\(contestKey, contestLabel) -> do
+             let imageUrl =
+                   "http://172.20.0.4:8077/contest/rank-table.png?contest="
+                     <> urlEncodeText contestKey
+                     <> "&limit=5&_=" <> cacheBase <> contestKey
+             sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
+             sendText <-
+               if null (rights sent)
+                 then do
+                   sendStandalone message (contestLabel <> "排行榜图片发送失败，稍后再试。")
+                   pure False
+                 else pure True
+             pure sendText)
+          contests
+        when (null results) $
           sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
