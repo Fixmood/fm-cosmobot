@@ -2327,7 +2327,7 @@ def ops_logs(tail: object = 200, since: object = "") -> dict:
     since_text = str(since or "").strip()
     if since_text and not re.fullmatch(r"[0-9A-Za-z:._+T-]{4,64}", since_text):
         raise ApiError("since 参数格式不正确（应为 docker 支持的 RFC3339 时间戳或 unix 秒）")
-    out = ops_request("logs", {"tail": tail_n, "since": since_text}, timeout=15.0)
+    out = ops_request("logs", {"tail": tail_n, "since": since_text}, timeout=45.0)
     payload = out.get("result") or {}
     lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
     return {
@@ -2346,7 +2346,7 @@ def ops_logs(tail: object = 200, since: object = "") -> dict:
 
 def ops_metrics() -> dict:
     """GET /api/v2/ops/metrics：宿主机负载/内存/磁盘/uptime + 容器 docker stats。"""
-    out = ops_request("metrics", {}, timeout=20.0)
+    out = ops_request("metrics", {}, timeout=45.0)
     payload = out.get("result") or {}
     return {
         "host": payload.get("host") or {},
@@ -2407,7 +2407,7 @@ def ops_images(live: bool = False) -> dict:
 
 def ops_cron() -> dict:
     """GET /api/v2/ops/cron：宿主机 crontab -l（只读）。"""
-    out = ops_request("cron", {}, timeout=15.0)
+    out = ops_request("cron", {}, timeout=45.0)
     payload = out.get("result") or {}
     lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
     return {
@@ -2430,7 +2430,7 @@ def ops_rollback(image: object) -> dict:
     image_text = str(image or "").strip()
     if not re.fullmatch(r"fm-cosmobot:runtime-[A-Za-z0-9._-]{1,90}", image_text):
         raise ApiError("image 必须形如 fm-cosmobot:runtime-<tag>（只允许回滚到 runtime 镜像）")
-    out = ops_request("rollback", {"image": image_text}, timeout=30.0)
+    out = ops_request("rollback", {"image": image_text}, timeout=60.0)
     payload = out.get("result") or {}
     return {
         "image": image_text,
