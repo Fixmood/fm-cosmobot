@@ -7488,11 +7488,9 @@ def merge_contest_rows(rows):
 
 
 def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
-    """赛文排行榜「表格风格」图（对齐 FM AI赛文排行榜 与常见电竞/打字榜的配色约定）。
+    """赛文排行榜「表格风格」图（与 FM AI赛文排行榜 同一套视觉）。
 
-    配色参考（2026-11-15 调研）：名次徽章金/银/铜（常见于 Monkeytype、各类排行卡），
-    速度按档位渐变（沿用本项目 555 AI 榜的 6 档），键准 <90 红 / 90-95 橙 / >=95 青 / >=98 绿，
-    重打越多越红（0-5 绿、6-15 蓝、16-25 橙、>25 红），打词率越高越绿。
+    2026-11-15：虎杯/锦标赛不能重打 → 不显示「重打」列；其它赛文有数据才显示。
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -7547,6 +7545,10 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
             entry["correction"] = float(payload.get("correction") or payload.get("correction_count") or 0)
 
     rows = sorted(merged.values(), key=lambda item: -float(item["best"] or 0))[:limit]
+
+    # 虎杯 / 锦标赛 不能重打 → 不显示重打列；其它赛文若一条重打数据都没有也隐藏
+    no_retype_contests = {"HB", "100000"}
+    show_retype = key not in no_retype_contests and any(float(r.get("correction") or 0) > 0 for r in rows)
 
     GOLD, SILVER, BRONZE = (255, 207, 92), (196, 204, 216), (214, 150, 96)
     ROW_TINTS = [(48, 42, 26), (37, 40, 48), (43, 36, 29)]
@@ -7630,8 +7632,15 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
     draw.text((48, 38), title, font=font(40), fill=(244, 247, 252))
     draw.text((48, 98), subtitle, font=font(22), fill=(159, 172, 193))
-    columns = [(52, "排名"), (120, "成员"), (500, "速度"), (620, "击键"),
-               (730, "码长"), (830, "打词率"), (960, "重打"), (1050, "键准")]
+
+    if show_retype:
+        columns = [(52, "排名"), (120, "成员"), (500, "速度"), (620, "击键"),
+                   (730, "码长"), (830, "打词率"), (960, "重打"), (1050, "键准")]
+        col_acc = 1050
+    else:
+        columns = [(52, "排名"), (120, "成员"), (500, "速度"), (620, "击键"),
+                   (730, "码长"), (830, "打词率"), (960, "键准")]
+        col_acc = 960
     draw.rounded_rectangle((40, 154, 1200, 210), radius=8, fill=(35, 43, 55))
     for x, name in columns:
         draw.text((x, 168), name, font=font(20), fill=(184, 196, 214))
@@ -7665,13 +7674,18 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         draw.text((730, top + 18), f"{code_len:.2f}" if code_len > 0 else "—", font=font(22), fill=(159, 172, 193))
         wr = float(item.get("word_rate") or 0)
         draw.text((830, top + 18), f"{wr:.2f}%" if wr > 0 else "—", font=font(22), fill=word_rate_color(wr))
-        corr = float(item.get("correction") or 0)
-        draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=correction_color(corr))
+        if show_retype:
+            corr = float(item.get("correction") or 0)
+            draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=correction_color(corr))
         acc = float(item.get("accuracy") or 0)
-        draw.text((1050, top + 18), f"{acc:.2f}%" if acc > 0 else "—", font=font(22), fill=accuracy_color(acc))
+        draw.text((col_acc, top + 18), f"{acc:.2f}%" if acc > 0 else "—", font=font(22), fill=accuracy_color(acc))
     footer = f"共 {len(rows)} 人 | 每人保留最高速度（成绩条数 {sum(int(r.get('n') or 0) for r in rows)}）"
     draw.text((48, height - 62), footer, font=font(18), fill=DIMMED)
-    legend = "颜色：速度分档（<130 蓝 / <150 青 / <180 金 / <200 橙 / ≥200 粉）· 键准 ≥98 绿、<90 红 · 重打越多越红"
+    legend = "颜色：速度分档（<130 蓝 / <150 青 / <180 金 / <200 橙 / ≥200 粉）· 键准 ≥98 绿、<90 红"
+    if show_retype:
+        legend += " · 重打越多越红"
+    else:
+        legend += " · 本赛文不能重打，未列重打"
     draw.text((48, height - 36), legend, font=font(15), fill=(96, 106, 122))
     output = io.BytesIO()
     image.save(output, "PNG", optimize=True)
