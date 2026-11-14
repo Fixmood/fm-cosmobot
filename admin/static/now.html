@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>FM · 当前功能与状态</title>
+<style>
+ :root{--bg:#0f1218;--card:#171c26;--line:#242c3a;--fg:#e8ecf4;--muted:#93a0b4;--ok:#43d17a;--warn:#f0b429}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI",system-ui,"Microsoft YaHei",sans-serif}
+ header{padding:20px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+ h1{font-size:18px;margin:0} .sub{color:var(--muted);font-size:12px}
+ main{padding:20px 24px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+ .card h2{font-size:14px;margin:0 0 10px;color:#b9c6db;font-weight:600}
+ .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
+ .kv span{color:var(--muted)} .kv b{font-weight:600;word-break:break-all}
+ ul{margin:0;padding-left:18px} li{margin:2px 0}
+ .chip{display:inline-block;background:#1e2635;border:1px solid var(--line);border-radius:999px;padding:1px 9px;margin:2px 4px 2px 0;font-size:12px;color:#c6d4ea}
+ .ok{color:var(--ok)} .warn{color:var(--warn)} .muted{color:var(--muted)}
+ table{width:100%;border-collapse:collapse;font-size:12.5px} td,th{padding:3px 6px;border-bottom:1px solid #1d2431;text-align:left}
+ .foot{padding:12px 24px;color:var(--muted);font-size:12px}
+ a{color:#7fb2ff}
+</style></head><body>
+<header>
+  <h1>FM · 当前功能与状态</h1>
+  <span class="sub" id="generated">加载中…</span>
+  <span style="flex:1"></span>
+  <a href="/" class="sub">← 返回控制台</a>
+</header>
+<main id="root"><div class="card muted">加载中…</div></main>
+<div class="foot">只读页面：数据来自 fm-domain 统计 / 机器人 runtime 文件 / 本地聊天库，几秒内可能延迟。</div>
+<script>
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const kv = rows => '<div class="kv">'+rows.map(([k,v])=>`<span>${esc(k)}</span><b>${v}</b>`).join('')+'</div>';
+const list = items => '<ul>'+items.map(x=>`<li>${x}</li>`).join('')+'</ul>';
+const chips = items => items.map(x=>`<span class="chip">${esc(x)}</span>`).join('');
+
+fetch('/api/now', {headers:{'Accept':'application/json'}}).then(async r=>{
+  if (r.status === 401) { location.href='/login'; return null }
+  return r.json();
+}).then(data=>{
+  if (!data) return;
+  const d = data.data || data;
+  document.getElementById('generated').textContent = '生成于 ' + new Date().toLocaleString('zh-CN');
+  const bot = d.bot || {}, hl = d.humanlike || {}, chat = d.chat || {}, dom = d.domain || {}, feat = d.features || {};
+  const cards = [];
+
+  cards.push('<div class="card"><h2>机器人运行</h2>'+kv([
+    ['模型', esc(bot.model||'-')],
+    ['思考档位', esc(bot.reasoning_effort||'-')],
+    ['最大轮数', esc(bot.agent_max_turns||'-')],
+    ['上下文', esc(bot.recent_context_chars||'-')+' 字符 / '+esc(bot.recent_context_limit||'-')+' 条'],
+    ['系统提示词', esc(bot.system_prompt_chars||0)+' 字符'],
+    ['配置文件', esc(bot.config_mtime||'-')],
+  ])+'</div>');
+
+  cards.push('<div class="card"><h2>拟人模式</h2>'+kv([
+    ['已开启会话', hl.scope_count==null?'-':chips(hl.scopes||[])],
+    ['主动发言配置', esc(hl.proactive||'(空)')],
+    ['humanlike 文件', esc((hl.files||[]).join('、')||'-')],
+  ])+'</div>');
+
+  cards.push('<div class="card"><h2>聊天记录（本地库）</h2>'+kv([
+    ['总消息', esc(chat.total||0)],
+    ['其中机器人', esc(chat.bot_messages||0)],
+    ['发言人数', esc(chat.senders||0)],
+    ['最近一条', esc(chat.last_at||'-')],
+  ])+(chat.top_groups&&chat.top_groups.length?'<table><tr><th>群</th><th>消息数</th></tr>'+chat.top_groups.map(g=>`<tr><td>${esc(g.name||g.id)}</td><td>${esc(g.count)}</td></tr>`).join('')+'</table>':'')+'</div>');
+
+  cards.push('<div class="card"><h2>业务数据（fm-domain）</h2>'+kv([
+    ['服务', dom.health_ok? '<span class="ok">正常</span>' : '<span class="warn">异常</span>'],
+    ['文库存量', esc(dom.stats && dom.stats.library_texts||0)],
+    ['赛文篇数', esc(dom.stats && dom.stats.contest_texts||0)],
+    ['聊天记录归档', esc(dom.stats && dom.stats.recent_messages||0)],
+  ])+'</div>');
+
+  cards.push('<div class="card"><h2>现有能力</h2>'+chips(feat.capabilities||[])+'<p class="muted" style="margin:10px 0 0">'+(feat.note||'')+'</p></div>');
+
+  if (feat.commands && feat.commands.length) {
+    cards.push('<div class="card"><h2>常用指令示例</h2>'+list(feat.commands.map(c=>`<code>${esc(c)}</code>`))+'</div>');
+  }
+  document.getElementById('root').innerHTML = cards.join('');
+}).catch(err=>{
+  document.getElementById('root').innerHTML = '<div class="card warn">加载失败：'+esc(err)+'</div>';
+});
+</script></body></html>

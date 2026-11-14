@@ -1090,6 +1090,167 @@ def validate_item(item: object) -> tuple[dict | None, str | None]:
     return clean, None
 
 
+
+# ==================== 当前功能与状态（/now） ====================
+# 2026-11-14 所有者要求：后台跟上现在的功能。只读聚合，不写任何状态。
+
+def _read_text(path: str, limit: int = 4096) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(limit)
+    except OSError:
+        return ""
+
+
+def _parse_toml_scalars(text: str) -> dict:
+    """按 section 取值：聊天模型要取 [llm.chat_provider.*] 那段，别抓到生图模型。"""
+    wanted = ("model", "reasoning_effort", "agent_max_turns",
+              "recent_chat_context_max_chars", "recent_chat_context_limit",
+              "system_prompt", "command", "name")
+    values = {}
+    section = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip()
+            continue
+        if "=" not in stripped:
+            continue
+        key, _, raw = stripped.partition("=")
+        key = key.strip()
+        raw = raw.strip()
+        if raw.startswith('"') and raw.endswith('"'):
+            raw = raw[1:-1]
+        if key not in wanted:
+            continue
+        # 聊天模型只在 llm.chat_provider.* 段里生效；image_provider 的 model 不要覆盖
+        if key == "model" and not section.startswith("llm.chat_provider"):
+            continue
+        if key == "reasoning_effort" and not section.startswith("llm.chat_provider"):
+            continue
+        values[key] = raw
+    return values
+
+
+def _sqlite_counts() -> dict:
+    import sqlite3
+    path = "/runtime/cosmobot.sqlite3"
+    result = {"total": 0, "bot_messages": 0, "senders": 0, "last_at": "", "top_groups": []}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except Exception:
+        return result
+    try:
+        result["total"] = conn.execute("SELECT COUNT(*) FROM chat_log").fetchone()[0]
+        result["bot_messages"] = conn.execute("SELECT COUNT(*) FROM chat_log WHERE is_bot=1").fetchone()[0]
+        result["senders"] = conn.execute("SELECT COUNT(DISTINCT sender_id) FROM chat_log WHERE is_bot=0").fetchone()[0]
+        row = conn.execute("SELECT MAX(recorded_at) FROM chat_log").fetchone()
+        result["last_at"] = str(row[0])[:19] if row and row[0] else ""
+        for chat_id, count in conn.execute(
+            "SELECT chat_id, COUNT(*) c FROM chat_log GROUP BY chat_id ORDER BY c DESC LIMIT 5"
+        ):
+            result["top_groups"].append({"id": str(chat_id), "count": count})
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return result
+
+
+NOW_CAPABILITIES = [
+    "拟人模式（人设 / 分段气泡 / 打字节奏）",
+    "群门控（不被@也能接话，续聊窗口 120s）",
+    "主动发言（每天上限、静默时段、模型决定说不说）",
+    "表情包（face→emoji、mface 图片）",
+    "长任务预告（第一次调慢工具时一句）",
+    "聊天记录全文搜索（chat_search，所有成员）",
+    "成员反查（昵称/QQ → 全部曾用昵称）",
+    "跟打文库（发一篇 / 继续 / 难度 / 计数）",
+    "赛文成绩图（官网优先、成绩库兜底、宽图）",
+    "积分/成绩统计（均速、键准、排行、曲线）",
+    "番茄小说（书架、续读、跳章、单章成绩）",
+    "记忆（persona / 成员风格 / 聊天记忆 / 便签）",
+    "触发方式（prefix / mention / keyword / 名字 / 回复）",
+    "部署锁与双会话协同（_session_bridge）",
+]
+
+NOW_COMMANDS = [
+    "fm 看下我近一个月的群赛文成绩曲线",
+    "fm 我的555有多少条",
+    "fm 生图：一只橘猫",
+    "fm 翻翻聊天记录有没有提过虎码",
+    "fm 弘辰杰是谁",
+    "fm 帮我查下今天有什么 AI 新闻",
+]
+
+
+def now_snapshot() -> dict:
+    import os
+    import time
+
+    config_path = "/runtime/config.toml"
+    config = _parse_toml_scalars(_read_text(config_path))
+    try:
+        config_mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(config_path)))
+    except OSError:
+        config_mtime = ""
+
+    # 拟人会话清单：优先 scopes.txt；现在实际写在 proactive.txt 的第一列
+    scopes = [line.strip() for line in _read_text("/runtime/humanlike/scopes.txt").splitlines() if line.strip()]
+    proactive_raw = _read_text("/runtime/humanlike/proactive.txt", 8192)
+    proactive_scopes = []
+    for row in proactive_raw.splitlines():
+        key = row.split("\t")[0].strip() if "\t" in row else row.split()[0].strip() if row.strip() else ""
+        if key and key not in proactive_scopes:
+            proactive_scopes.append(key)
+    if proactive_scopes:
+        scopes = proactive_scopes + [s for s in scopes if s not in proactive_scopes]
+    try:
+        humanlike_files = sorted(os.listdir("/runtime/humanlike"))
+    except OSError:
+        humanlike_files = []
+
+    domain_health = fetch_domain("/health")
+    domain_stats = fetch_domain("/stats")
+    stats = {}
+    if isinstance(domain_stats, dict):
+        inner = domain_stats.get("data")
+        stats = inner if isinstance(inner, dict) else domain_stats
+        if isinstance(stats.get("tables"), dict):
+            stats = stats["tables"]
+
+    return {
+        "generated_at": time.time(),
+        "bot": {
+            "model": config.get("model", ""),
+            "reasoning_effort": config.get("reasoning_effort", ""),
+            "agent_max_turns": config.get("agent_max_turns", ""),
+            "recent_context_chars": config.get("recent_chat_context_max_chars", ""),
+            "recent_context_limit": config.get("recent_chat_context_limit", ""),
+            "system_prompt_chars": len(config.get("system_prompt", "")),
+            "config_mtime": config_mtime,
+        },
+        "humanlike": {
+            "scopes": scopes,
+            "scope_count": len(scopes),
+            "proactive": _read_text("/runtime/humanlike/proactive.txt", 512).strip(),
+            "files": humanlike_files,
+        },
+        "chat": _sqlite_counts(),
+        "domain": {
+            "health_ok": bool(isinstance(domain_health, dict) and (domain_health.get("ok") or domain_health.get("status") in ("ok", "healthy"))),
+            "stats": stats if isinstance(stats, dict) else {},
+        },
+        "features": {
+            "capabilities": NOW_CAPABILITIES,
+            "commands": NOW_COMMANDS,
+            "note": "能力清单更新于 2026-11-14；拟人模式是否生效以「已开启会话」为准。",
+        },
+    }
+
+
 class Api(BaseHTTPRequestHandler):
     server_version = "FMControl/0.1"
 
@@ -1330,6 +1491,10 @@ class Api(BaseHTTPRequestHandler):
             self.handle_token_list()
         elif not self.require_auth():
             return
+        elif request.path == "/now":
+            self.send_static("now.html")
+        elif request.path == "/api/now":
+            self.send_json(HTTPStatus.OK, {"ok": True, "data": now_snapshot()})
         elif request.path == "/api/search":
             keyword = parse_qs(request.query).get("q", [""])[0]
             self.send_json(HTTPStatus.OK, {"ok": True, "data": global_search(keyword)})
