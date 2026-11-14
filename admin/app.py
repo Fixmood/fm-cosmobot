@@ -1739,7 +1739,7 @@ class Api(BaseHTTPRequestHandler):
             elif route == "messages":
                 data = v2.message_search(arg("q"), arg("chat"), _int_arg(arg("days", "0"), 0), _int_arg(arg("limit", "100"), 100))
             elif route == "tools/audit":
-                data = v2.tools_audit(arg("tool"), _int_arg(arg("days", "7"), 7), arg("status"), _int_arg(arg("limit", "200"), 200))
+                data = v2.tools_audit(int(arg("days", "7") or 7), arg("tool"), arg("status"), int(arg("limit", "200") or 200))
             elif route == "tools/stats":
                 data = v2.tools_stats(_int_arg(arg("days", "7"), 7))
             elif route == "groups":
