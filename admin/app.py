@@ -723,6 +723,14 @@ def query_value(query: dict, name: str, default: str = "") -> str:
     return str(values[-1]).strip() if values else default
 
 
+def _int_arg(value: object, default: int = 0) -> int:
+    """查询参数转整数；非法值回退默认值，避免 v2 接口因为 ?days=abc 直接 500。"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def filtered_audit(query: dict) -> list[dict]:
     state = read_state()
     actor = query_value(query, "actor").lower()
@@ -1634,9 +1642,91 @@ class Api(BaseHTTPRequestHandler):
         query = parse_qs(request.query)
         arg = lambda name, default="": (query.get(name, [default])[0] or default)
         route = request.path[len("/api/v2/"):].strip("/")
+        actor = (self.headers.get("X-FM-Admin-Actor") or "admin").strip()[:80] or "admin"
+
+        def method_not_allowed(allow: str) -> None:
+            self.send_error_json(HTTPStatus.METHOD_NOT_ALLOWED, "该接口只接受 " + allow + " 请求。")
+
         try:
             if route == "overview":
                 data = v2.overview(fetch_domain, fetch_rpc)
+            elif route == "charts/messages":
+                data = v2.charts_messages(_int_arg(arg("days", "14"), 14), arg("chat"))
+            elif route == "charts/tools":
+                data = v2.charts_tools(_int_arg(arg("days", "14"), 14))
+            elif route == "top/groups":
+                data = v2.top_groups(_int_arg(arg("days", "30"), 30), _int_arg(arg("limit", "15"), 15), fetch_domain)
+            elif route == "tools/catalog":
+                data = v2.tools_catalog(_int_arg(arg("days", "0"), 0))
+            elif route == "triggers":
+                data = v2.triggers_get(arg("group_id"), fetch_rpc, lambda: read_state().get("triggers") or {})
+            elif route == "triggers/set":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                data = v2.triggers_set(
+                    payload.get("group_id"),
+                    payload.get("modes"),
+                    payload.get("keywords"),
+                    fetch_rpc,
+                )
+                record_audit("set", "triggers", str(payload.get("group_id") or ""), actor)
+            elif route == "persona":
+                if self.command == "POST":
+                    if not self.require_admin():
+                        return
+                    payload = self.read_json()
+                    if not isinstance(payload, dict):
+                        raise v2.ApiError("请求体必须是 JSON 对象")
+                    data = v2.persona_write(
+                        payload.get("scope") or arg("scope"),
+                        payload.get("id") or arg("id"),
+                        payload.get("text"),
+                        payload.get("action"),
+                        fetch_rpc,
+                    )
+                    record_audit(str(data.get("action") or "set"), "persona", str(data.get("scope") or ""), actor)
+                else:
+                    data = v2.persona_read(arg("scope"), arg("id"), fetch_rpc, fetch_domain)
+            elif route == "scheduled":
+                data = v2.scheduled_list(
+                    arg("limit", "50"), arg("offset", "0"), arg("chat"), arg("sender"), arg("q"),
+                    arg("future").lower() in {"1", "true", "yes", "on"},
+                )
+            elif route == "scheduled/cancel":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                data = v2.scheduled_cancel(payload.get("id"))
+                record_audit("cancel", "scheduled", str(data.get("id") or ""), actor)
+            elif route == "members/profile":
+                data = v2.member_profile(arg("id"), fetch_domain)
+            elif route == "deploy/status":
+                data = v2.deploy_status(
+                    arg("request_id"),
+                    arg("force").lower() in {"1", "true", "yes", "on"},
+                )
+            elif route == "deploy/act":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                if not self.require_admin():
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                data = v2.deploy_act(payload.get("action"), payload.get("target") or "bot")
+                record_audit("deploy", "ops", f"{payload.get('action')}:{payload.get('target') or 'bot'}", actor)
             elif route == "humanlike":
                 if self.command == "POST":
                     payload = self.read_json() or {}
@@ -1647,11 +1737,11 @@ class Api(BaseHTTPRequestHandler):
             elif route == "members":
                 data = v2.member_search(arg("q"))
             elif route == "messages":
-                data = v2.message_search(arg("q"), arg("chat"), int(arg("days", "0") or 0), int(arg("limit", "100") or 100))
+                data = v2.message_search(arg("q"), arg("chat"), _int_arg(arg("days", "0"), 0), _int_arg(arg("limit", "100"), 100))
             elif route == "tools/audit":
-                data = v2.tools_audit(arg("tool"), int(arg("days", "7") or 7), arg("status"), int(arg("limit", "200") or 200))
+                data = v2.tools_audit(arg("tool"), _int_arg(arg("days", "7"), 7), arg("status"), _int_arg(arg("limit", "200"), 200))
             elif route == "tools/stats":
-                data = v2.tools_stats(int(arg("days", "7") or 7))
+                data = v2.tools_stats(_int_arg(arg("days", "7"), 7))
             elif route == "groups":
                 data = v2.groups_overview(fetch_domain)
             elif route == "group":
@@ -1659,9 +1749,9 @@ class Api(BaseHTTPRequestHandler):
             elif route == "browse/tables":
                 data = v2.browse_tables()
             elif route == "browse/rows":
-                data = v2.browse_rows(arg("table"), arg("q"), int(arg("limit", "50") or 50), int(arg("offset", "0") or 0))
+                data = v2.browse_rows(arg("table"), arg("q"), _int_arg(arg("limit", "50"), 50), _int_arg(arg("offset", "0"), 0))
             elif route == "members/all":
-                data = v2.all_members(int(arg("limit", "500") or 500))
+                data = v2.all_members(_int_arg(arg("limit", "500"), 500))
             elif route == "actions":
                 data = v2.action_catalog()
             elif route == "actions/run" and self.command == "POST":
@@ -1681,7 +1771,12 @@ class Api(BaseHTTPRequestHandler):
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "未知的 v2 接口")
                 return
+        except v2.ApiError as exc:
+            record_error("v2", exc.message, actor, request.path)
+            self.send_error_json(exc.status, exc.message)
+            return
         except Exception as exc:  # noqa: BLE001
+            record_error("v2", f"v2 接口失败：{exc}", actor, request.path)
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"v2 接口失败：{exc}")
             return
         self.send_json(HTTPStatus.OK, {"ok": True, "data": data})
