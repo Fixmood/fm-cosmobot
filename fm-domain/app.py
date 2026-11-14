@@ -4744,10 +4744,15 @@ def render_contest_chart(db: sqlite3.Connection, contest_key: str, group_id: str
         draw.text((32, header), "还没有这个赛文的成绩记录。", fill=(200, 120, 120), font=font(28))
     else:
         best_speed = max(float(r["best"] or 0) for r in rows) or 1.0
-        bar_left, bar_width = 300, 480
+        bar_left, bar_width = 330, 450
         for index, row in enumerate(rows):
             y = header + index * row_height
-            name = (row["user_name"] or row["user_id"] or "?")[:12]
+            raw_name = str(row["user_name"] or row["user_id"] or "?")
+            name = raw_name
+            while name and draw.textlength(name, font=font(24)) > 250:
+                name = name[:-1]
+            if name != raw_name:
+                name = name + "…"
             speed = float(row["best"] or 0)
             ratio = speed / best_speed
             draw.text((32, y + 8), f"{index + 1}. {name}", fill=(224, 228, 236), font=font(24))
@@ -6335,7 +6340,7 @@ def contest_rank_rows(db: sqlite3.Connection, contest_key: str, group_id: str, s
                 for row in live_rows
             ]
             rows.sort(key=lambda item: item["best"], reverse=True)
-            return rows[:limit], "官网实时"
+            return merge_contest_rows(rows[:limit]), "官网实时"
     clause, params = "", []
     if days > 0:
         clause = " AND c.recorded_at >= ?"
@@ -6350,7 +6355,7 @@ def contest_rank_rows(db: sqlite3.Connection, contest_key: str, group_id: str, s
         " GROUP BY c.user_id ORDER BY best DESC LIMIT ?",
         tuple([contest_key, room] + params + [limit]),
     ).fetchall()
-    return [dict(row) for row in rows], "成绩库"
+    return merge_contest_rows([dict(row) for row in rows]), "成绩库"
 
 
 def contest_user_points(db: sqlite3.Connection, contest_key: str, group_id: str,
@@ -7446,6 +7451,32 @@ def main():
     else:
         Api.db_path = args.db
         ThreadingHTTPServer((args.host, args.port), Api).serve_forever()
+
+
+def merge_contest_rows(rows):
+    """同一人多个花式昵称合并成一行（2026-11-15：排行榜同一人出现多次、名字被截断）。"""
+    import re as _re
+
+    def canonical(value):
+        parts = [p for p in _re.split(r"[\u300c\u300d\u300e\u300f\uff08\uff09()\[\]\u3010\u3011\s]+", value or "") if len(p) >= 2]
+        latin = [p for p in parts if _re.fullmatch(r"[A-Za-z0-9_]+", p)]
+        return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
+
+    merged = {}
+    for row in rows:
+        name = str(row.get("user_name") or row.get("user_id") or "?")
+        key = canonical(name) or name
+        current = merged.get(key)
+        if current is None:
+            merged[key] = dict(row)
+            continue
+        if float(row.get("best") or 0) > float(current.get("best") or 0):
+            current["best"] = row.get("best")
+        current["n"] = int(current.get("n") or 0) + int(row.get("n") or 0)
+        if len(name) > len(str(current.get("user_name") or "")):
+            current["user_name"] = name
+    return sorted(merged.values(), key=lambda item: -float(item.get("best") or 0))
+
 
 
 if __name__ == "__main__":
