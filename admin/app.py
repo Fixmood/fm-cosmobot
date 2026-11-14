@@ -1688,6 +1688,11 @@ class Api(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         request = urlparse(self.path)
+        if request.path.startswith("/api/v2/"):
+            if not self.require_auth():
+                return
+            self.handle_api_v2(request)
+            return
         if request.path == "/api/login":
             self.handle_login()
             return
