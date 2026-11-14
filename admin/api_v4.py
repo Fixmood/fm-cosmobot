@@ -51,6 +51,9 @@ CACHE_TTLS: dict[str, float] = {
     "novel": 30.0,
     "health/history": 15.0,
     "ops/stats": 15.0,
+    "ops/metrics": 15.0,
+    "ops/logs": 12.0,
+    "ops/cron": 15.0,
 }
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -110,6 +113,98 @@ def cache_wrap(kind: str, key_parts: tuple, ttl: float, producer: Callable[[], A
     return {"value": value, "cached": False, "age_seconds": 0.0, "ttl": ttl}
 
 
+def cache_peek(key: str) -> tuple[Any, float] | None:
+    """不管 TTL 是否过期都返回值（stale-while-revalidate 用）；不存在返回 None。"""
+    now = time.time()
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if not entry:
+            return None
+        return entry.get("value"), now - float(entry.get("at") or 0.0)
+
+
+# ── 宿主机代理类接口（ops/*）：缓存优先 + 单飞后台刷新 + 首次可不等 ──
+# QA P1-2/P1-3：docker stats / docker logs 每次 1~3s，且代理按 cron 周期扫描队列，
+# 冷调用可能 20s+。这里统一做：
+#   * TTL 内直接命中（~ms）；
+#   * 过期但手里有旧值 → 立刻返回旧值，同时后台线程刷新（stale-while-revalidate）；
+#   * 完全没缓存且 wait=False（自检探针用）→ 立刻返回 warming，后台刷新，不阻塞请求。
+_OPS_REFRESH_LOCK = threading.Lock()
+_OPS_REFRESH_INFLIGHT: set[str] = set()
+_OPS_REFRESH_STATS = {"kicks": 0, "done": 0, "failed": 0}
+
+
+def _ops_refresh_async(key: str, producer: Callable[[], Any]) -> bool:
+    """后台刷一个缓存键（同一个 key 同时只跑一个线程）。返回是否真的发起。"""
+    with _OPS_REFRESH_LOCK:
+        if key in _OPS_REFRESH_INFLIGHT:
+            return False
+        _OPS_REFRESH_INFLIGHT.add(key)
+        _OPS_REFRESH_STATS["kicks"] += 1
+
+    def runner() -> None:
+        try:
+            value = producer()
+            cache_set(key, value)
+            _OPS_REFRESH_STATS["done"] += 1
+        except Exception:  # noqa: BLE001  后台刷新失败不能影响请求；下次再刷
+            _OPS_REFRESH_STATS["failed"] += 1
+        finally:
+            with _OPS_REFRESH_LOCK:
+                _OPS_REFRESH_INFLIGHT.discard(key)
+
+    threading.Thread(target=runner, name="fm-ops-refresh", daemon=True).start()
+    return True
+
+
+def _ops_cached(kind: str, key_parts: tuple, ttl: float, fetch: Callable[[], dict],
+                wait: bool = True, force: bool = False) -> dict:
+    """ops 类接口统一缓存策略。
+
+    wait=True  ：没有缓存时同步抓一次（最多等代理一个来回）；
+    wait=False ：没有缓存时立刻返回 warming + 后台抓（自检探针/首屏不阻塞用）；
+    force=True ：忽略缓存，同步抓并回填。
+    返回 {"value", "cached", "age_seconds", "stale", "warming", "ttl"}。
+    """
+    key = _cache_key("ops/" + kind, *key_parts)
+    if force:
+        value = fetch()
+        cache_set(key, value)
+        return {"value": value, "cached": False, "age_seconds": 0.0,
+                "stale": False, "warming": False, "ttl": ttl}
+    peek = cache_peek(key)
+    if peek is not None:
+        value, age = peek
+        if age <= ttl:
+            return {"value": value, "cached": True, "age_seconds": round(age, 1),
+                    "stale": False, "warming": False, "ttl": ttl}
+        _ops_refresh_async(key, fetch)
+        return {"value": value, "cached": True, "age_seconds": round(age, 1),
+                "stale": True, "warming": False, "ttl": ttl}
+    if not wait:
+        _ops_refresh_async(key, fetch)
+        return {"value": None, "cached": False, "age_seconds": None,
+                "stale": False, "warming": True, "ttl": ttl}
+    value = fetch()
+    cache_set(key, value)
+    return {"value": value, "cached": False, "age_seconds": 0.0,
+            "stale": False, "warming": False, "ttl": ttl}
+
+
+def _ops_warming_payload(kind: str, ttl: float, extra: dict | None = None) -> dict:
+    payload = {
+        "warming": True,
+        "cached": False,
+        "cache_age_seconds": None,
+        "cache_ttl": ttl,
+        "note": "首次采集已入队，宿主机代理通常 1~3s 内返回；稍后刷新本接口（或加 ?force=1 同步等待）。",
+        "source": "host-ops-agent(warming)",
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+    return payload
+
+
 def cache_stats(rate_limit: dict | None = None) -> dict:
     now = time.time()
     with _CACHE_LOCK:
@@ -122,6 +217,9 @@ def cache_stats(rate_limit: dict | None = None) -> dict:
             }
             for key, entry in list(_CACHE.items())
         ]
+    with _OPS_REFRESH_LOCK:
+        refresh = dict(_OPS_REFRESH_STATS)
+        inflight = sorted(_OPS_REFRESH_INFLIGHT)
     entries.sort(key=lambda item: -(item.get("age_seconds") or 0))
     total = stats["hits"] + stats["misses"]
     return {
@@ -134,9 +232,11 @@ def cache_stats(rate_limit: dict | None = None) -> dict:
         "hit_ratio": round(stats["hits"] / total, 3) if total else None,
         "ttls": dict(CACHE_TTLS),
         "top_entries": entries[:40],
+        "ops_refresh": {**refresh, "inflight": inflight},
         "rate_limit": rate_limit or {},
         "now": now,
-        "note": "接口级 TTL 缓存：domain 代理 30s、文库正文 300s、sqlite 统计 30~120s；命中时返回 cached=true + age_seconds。",
+        "note": "接口级 TTL 缓存：domain 代理 30s、文库正文 300s、sqlite 统计 20~30s、"
+                "ops 类 12~15s（过期先用旧值+后台刷新，wait=0 首次不等）。",
     }
 
 
@@ -870,15 +970,21 @@ def novel_detail_cached(domain: Any, book_id: object = "") -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 # 4. C. 运维增强（宿主机 ops-agent v2 白名单）
 # ═══════════════════════════════════════════════════════════════════════
-def ops_stats(force: object = False) -> dict:
+def _flag(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ops_stats(wait: object = True, force: object = False) -> dict:
     """GET /api/v2/ops/stats：docker stats（bot/domain/admin）+ 磁盘 + 负载 + 内存快照。
 
-    宿主机 docker stats 每次约 2~3s，运维页/selftest 会重复拉，所以结果缓存 15s；
-    ?force=1 时绕过缓存现场采集。
+    缓存 15s（QA P1-2）：TTL 内 ~ms；过期先返回旧值 + 后台刷新；
+    ?wait=0 首次不等（warming）；?force=1 同步强制刷新。
     """
-    ttl = 15.0
-    force_flag = force if isinstance(force, bool) else str(force or "").strip().lower() in {
-        "1", "true", "yes", "on"}
+    ttl = CACHE_TTLS["ops/stats"]
 
     def build() -> dict:
         out = v2.ops_request("stats", {}, timeout=90.0)
@@ -895,20 +1001,51 @@ def ops_stats(force: object = False) -> dict:
             "source": "host-ops-agent:docker stats(+host /proc)",
         }
 
-    if force_flag:
-        data = build()
-        cache_set(_cache_key("ops/stats"), data)
-        cached, age = False, 0.0
-    else:
-        wrapped = cache_wrap("ops/stats", (), ttl, build)
-        data = dict(wrapped["value"])
-        cached, age = wrapped["cached"], wrapped["age_seconds"]
-    data.update({"cached": cached, "cache_age_seconds": age, "cache_ttl": ttl})
+    result = _ops_cached("stats", (), ttl, build, wait=_flag(wait, True), force=_flag(force))
+    if result["warming"]:
+        return _ops_warming_payload("stats", ttl, {"host": {}, "containers": [], "summary": {}})
+    data = dict(result["value"] or {})
+    data.update({"cached": result["cached"], "cache_age_seconds": result["age_seconds"],
+                 "cache_ttl": ttl, "stale": result["stale"], "warming": False})
     return data
 
 
-def ops_logs_v2(tail: object = 200, since: object = "", grep: object = "") -> dict:
-    """GET /api/v2/ops/logs?tail=&since=&grep=：docker logs fm-cosmobot（最多 500 行，支持 grep 过滤）。"""
+def ops_metrics_cached(wait: object = True, force: object = False) -> dict:
+    """GET /api/v2/ops/metrics：宿主机 load/mem/disk/uptime + docker stats（缓存 15s）。
+
+    v3 的 /ops/metrics 恒 3.0s 无缓存（QA P1-2），这里同样走 _ops_cached：
+    TTL 内 ~ms、过期先用旧值+后台刷新、?wait=0 首次不阻塞、?force=1 同步刷新。
+    """
+    ttl = CACHE_TTLS["ops/metrics"]
+
+    def build() -> dict:
+        out = v2.ops_request("metrics", {}, timeout=90.0)
+        payload = out.get("result") or {}
+        return {
+            "host": payload.get("host") or {},
+            "docker": payload.get("docker") or {},
+            "request_id": out.get("request_id"),
+            "elapsed_ms": out.get("elapsed_ms"),
+            "duration_ms": out.get("duration_ms"),
+            "source": "host-ops-agent",
+        }
+
+    result = _ops_cached("metrics", (), ttl, build, wait=_flag(wait, True), force=_flag(force))
+    if result["warming"]:
+        return _ops_warming_payload("metrics", ttl, {"host": {}, "docker": {}})
+    data = dict(result["value"] or {})
+    data.update({"cached": result["cached"], "cache_age_seconds": result["age_seconds"],
+                 "cache_ttl": ttl, "stale": result["stale"], "warming": False})
+    return data
+
+
+def ops_logs_v2(tail: object = 200, since: object = "", grep: object = "",
+                wait: object = True, force: object = False) -> dict:
+    """GET /api/v2/ops/logs?tail=&since=&grep=：docker logs fm-cosmobot（≤500 行，可 grep）。
+
+    缓存 12s，key = (tail, since, grep)（QA P1-3：冷启 20.9~29.6s）；
+    过期先返回旧日志 + 后台刷新；?wait=0 首次不阻塞（warming）；自检探针用 wait=0。
+    """
     tail_n = v2._int_param(tail, 200, 1, 500)
     since_text = str(since or "").strip()
     if since_text and not re.fullmatch(r"[0-9A-Za-z:._+T-]{4,64}", since_text):
@@ -918,42 +1055,69 @@ def ops_logs_v2(tail: object = 200, since: object = "", grep: object = "") -> di
         raise v2.ApiError("grep 太长（最多 120 字符）", 400)
     if any(char in grep_text for char in "\x00\r\n"):
         raise v2.ApiError("grep 不能包含控制字符", 400)
-    out = v2.ops_request("logs", {"tail": tail_n, "since": since_text, "grep": grep_text}, timeout=60.0)
-    payload = out.get("result") or {}
-    lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
-    return {
-        "container": payload.get("container") or "fm-cosmobot",
-        "tail": tail_n,
-        "since": since_text,
-        "grep": grep_text,
-        "lines": lines,
-        "count": len(lines),
-        "total_lines": int(payload.get("total_lines") or len(lines)),
-        "grep_matched": int(payload.get("grep_matched") or len(lines)),
-        "truncated": bool(payload.get("truncated")),
-        "request_id": out.get("request_id"),
-        "elapsed_ms": out.get("elapsed_ms"),
-        "duration_ms": out.get("duration_ms"),
-        "source": "host-ops-agent:docker logs",
-    }
+    ttl = CACHE_TTLS["ops/logs"]
+
+    def build() -> dict:
+        out = v2.ops_request("logs", {"tail": tail_n, "since": since_text, "grep": grep_text},
+                             timeout=60.0)
+        payload = out.get("result") or {}
+        lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+        return {
+            "container": payload.get("container") or "fm-cosmobot",
+            "tail": tail_n,
+            "since": since_text,
+            "grep": grep_text,
+            "lines": lines,
+            "count": len(lines),
+            "total_lines": int(payload.get("total_lines") or len(lines)),
+            "grep_matched": int(payload.get("grep_matched") or len(lines)),
+            "truncated": bool(payload.get("truncated")),
+            "request_id": out.get("request_id"),
+            "elapsed_ms": out.get("elapsed_ms"),
+            "duration_ms": out.get("duration_ms"),
+            "source": "host-ops-agent:docker logs",
+        }
+
+    result = _ops_cached("logs", (tail_n, since_text, grep_text), ttl, build,
+                         wait=_flag(wait, True), force=_flag(force))
+    if result["warming"]:
+        return _ops_warming_payload("logs", ttl, {
+            "container": "fm-cosmobot", "tail": tail_n, "since": since_text,
+            "grep": grep_text, "lines": [], "count": 0})
+    data = dict(result["value"] or {})
+    data.update({"cached": result["cached"], "cache_age_seconds": result["age_seconds"],
+                 "cache_ttl": ttl, "stale": result["stale"], "warming": False})
+    return data
 
 
-def ops_cron_list() -> dict:
-    """GET /api/v2/ops/cron：宿主机 crontab 只读列表（解析成 schedule/command）。"""
-    out = v2.ops_request("cron_list", {}, timeout=45.0)
-    payload = out.get("result") or {}
-    return {
-        "lines": payload.get("lines") or [],
-        "entries": payload.get("entries") or [],
-        "count": int(payload.get("count") or len(payload.get("lines") or [])),
-        "raw": payload.get("raw") or "",
-        "writable": False,
-        "can_set": False,
-        "request_id": out.get("request_id"),
-        "elapsed_ms": out.get("elapsed_ms"),
-        "source": "host-ops-agent:crontab -l",
-        "note": "只读：cron_set 写入未实现（返回 501），改 crontab 必须人工在宿主机执行并留证据。",
-    }
+def ops_cron_list(wait: object = True, force: object = False) -> dict:
+    """GET /api/v2/ops/cron：宿主机 crontab 只读列表（解析成 schedule/command，缓存 15s）。"""
+    ttl = CACHE_TTLS["ops/cron"]
+
+    def build() -> dict:
+        out = v2.ops_request("cron_list", {}, timeout=45.0)
+        payload = out.get("result") or {}
+        return {
+            "lines": payload.get("lines") or [],
+            "entries": payload.get("entries") or [],
+            "count": int(payload.get("count") or len(payload.get("lines") or [])),
+            "raw": payload.get("raw") or "",
+            "writable": False,
+            "can_set": False,
+            "request_id": out.get("request_id"),
+            "elapsed_ms": out.get("elapsed_ms"),
+            "source": "host-ops-agent:crontab -l",
+            "note": "只读：cron_set 写入未实现（返回 501），改 crontab 必须人工在宿主机执行并留证据。",
+        }
+
+    result = _ops_cached("cron", (), ttl, build, wait=_flag(wait, True), force=_flag(force))
+    if result["warming"]:
+        return _ops_warming_payload("cron", ttl, {"lines": [], "entries": [], "count": 0,
+                                                  "writable": False, "can_set": False})
+    data = dict(result["value"] or {})
+    data.update({"cached": result["cached"], "cache_age_seconds": result["age_seconds"],
+                 "cache_ttl": ttl, "stale": result["stale"], "warming": False})
+    return data
 
 
 def ops_cron_set(line: object = "") -> dict:
@@ -1197,11 +1361,68 @@ def selftest_v4_checks() -> list[dict]:
             raise RuntimeError("宿主机代理还是旧版，缺 op：" + " / ".join(missing))
         return {"version": agent.get("version"), "scans": agent.get("scans"),
                 "age_seconds": agent.get("age_seconds"),
+                "mode": agent.get("mode"), "linger_seconds": agent.get("linger_seconds"),
                 "health_samples": agent.get("health_samples"),
                 "last_health_at_text": agent.get("last_health_at_text"),
                 "allowed_ops": allowed}
 
     run("v4:ops-agent-v2", check_agent_v2)
+
+    def check_agent_schema() -> dict:
+        """心跳 state schema 校验（QA/Lead：字段名不一致会误报离线）。
+
+        要求：updated_at / updated_at_text / started_at 都存在、schema_version>=2，
+        且 updated_at 年龄 < 90s（与 api_v2._ops_agent_state 用同一判定）。
+        """
+        agent = v2._ops_agent_state()
+        fields = agent.get("schema_fields") or {}
+        missing = []
+        if not agent.get("updated_at"):
+            missing.append("updated_at")
+        if not agent.get("updated_at_text"):
+            missing.append("updated_at_text")
+        if not agent.get("started_at"):
+            missing.append("started_at")
+        if not agent.get("version"):
+            missing.append("version")
+        if missing:
+            raise RuntimeError("心跳 state 缺字段：" + " / ".join(missing) +
+                               "（老版本代理写的 state？等下一次心跳后重试）")
+        ttl = agent.get("online_ttl_seconds") or 90
+        age = agent.get("age_seconds")
+        if age is None or float(age) >= float(ttl):
+            raise RuntimeError("心跳过期：updated_at=%s，age=%ss ≥ %ss"
+                               % (agent.get("updated_at_text"), age, ttl))
+        return {"schema_version": agent.get("schema_version"),
+                "updated_at": agent.get("updated_at"),
+                "updated_at_text": agent.get("updated_at_text"),
+                "started_at": agent.get("started_at"),
+                "started_at_text": agent.get("started_at_text"),
+                "uptime_seconds": agent.get("uptime_seconds"),
+                "age_seconds": age, "online_ttl_seconds": ttl,
+                "version": agent.get("version"), "mode": agent.get("mode"),
+                "heartbeat": agent.get("heartbeat")}
+
+    run("v4:ops-agent-schema", check_agent_schema)
+
+    def check_ops_cache() -> dict:
+        """P1-2/P1-3 回归：ops/metrics、ops/logs 的缓存/后台刷新是否在工作。"""
+        with _CACHE_LOCK:
+            keys = sorted(key for key in _CACHE if key.startswith("ops/"))
+        with _OPS_REFRESH_LOCK:
+            refresh = dict(_OPS_REFRESH_STATS)
+            inflight = sorted(_OPS_REFRESH_INFLIGHT)
+        stats = {key: round(time.time() - float((_CACHE.get(key) or {}).get("at") or 0), 1)
+                 for key in keys}
+        if not keys and not refresh.get("kicks"):
+            # 冷启动/刚重启：ops 接口还没人访问过，属正常状态（不是失败）
+            return {"cached_keys": [], "ages": {}, "refresh": refresh, "ttls": {},
+                    "note": "冷启动：还没有 ops 接口被访问（正常；访问一次后就会预热）"}
+        return {"cached_keys": keys, "ages": stats,
+                "refresh": {**refresh, "inflight": inflight},
+                "ttls": {key: ttl for key, ttl in CACHE_TTLS.items() if key.startswith("ops/")}}
+
+    run("v4:ops-cache", check_ops_cache, required=False)
 
     def check_health_file() -> dict:
         if not os.path.isfile(HEALTH_HISTORY):
@@ -1278,9 +1499,10 @@ V4_ROUTES: dict[str, str] = {
     "novels": "novels_cached(domain, q, limit, offset)",
     "novel": "novel_detail_cached(domain, id)",
     # C. 运维
-    "ops/stats": "ops_stats()",
-    "ops/logs": "ops_logs_v2(tail, since, grep)",
-    "ops/cron": "ops_cron_list()",
+    "ops/stats": "ops_stats(wait, force)",
+    "ops/metrics": "ops_metrics_cached(wait, force)  # 15s 缓存（QA P1-2）",
+    "ops/logs": "ops_logs_v2(tail, since, grep, wait, force)  # 12s 缓存（QA P1-3）",
+    "ops/cron": "ops_cron_list(wait, force)  # 15s 缓存",
     "ops/cron-set": "ops_cron_set(line)  # POST，未实现→501",
     "ops/rollback": "ops_rollback_safe(image, confirm)  # POST，真实回滚",
     "ops/config-backup": "ops_config_backup()  # POST",

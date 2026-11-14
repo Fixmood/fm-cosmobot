@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import hashlib
 import mimetypes
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, unquote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -1501,6 +1503,59 @@ def revoke_admin_token(token_id: object) -> dict | None:
     }
 
 
+# ── QA P2-4：静态资源 gzip 缓存（按 路径+mtime+size 失效，避免每次请求重复压缩）──
+_STATIC_GZIP_CACHE: dict[str, tuple[float, int, bytes]] = {}
+_STATIC_GZIP_LOCK = threading.RLock()
+_STATIC_GZIP_MAX = 32
+
+
+def _static_payload(path: str, mtime: float, size: int, body: bytes) -> tuple[bytes, str]:
+    """返回 (要发送的字节, 编码)；命中缓存直接给 gzip 后的字节。"""
+    with _STATIC_GZIP_LOCK:
+        entry = _STATIC_GZIP_CACHE.get(path)
+        if entry and entry[0] == mtime and entry[1] == size:
+            return entry[2], "gzip"
+    compressed = gzip.compress(body, 6)
+    with _STATIC_GZIP_LOCK:
+        if len(_STATIC_GZIP_CACHE) >= _STATIC_GZIP_MAX and path not in _STATIC_GZIP_CACHE:
+            _STATIC_GZIP_CACHE.clear()
+        _STATIC_GZIP_CACHE[path] = (mtime, size, compressed)
+    return compressed, "gzip"
+
+
+# ── QA P2-8：domain 群清单缓存（判断“群是否存在”，避免未知群被当成在线）──
+_KNOWN_GROUPS_CACHE: dict[str, Any] = {"at": 0.0, "ids": set()}
+_KNOWN_GROUPS_LOCK = threading.RLock()
+
+
+def _known_group_ids(domain) -> set[str]:
+    """domain /groups 里的群号集合（300s 缓存；失败时沿用上次结果）。"""
+    now = time.time()
+    with _KNOWN_GROUPS_LOCK:
+        cached = set(_KNOWN_GROUPS_CACHE.get("ids") or set())
+        if cached and now - float(_KNOWN_GROUPS_CACHE.get("at") or 0) < 300:
+            return cached
+    ids: set[str] = set()
+    try:
+        result = domain("/groups") or {}
+    except Exception:  # noqa: BLE001
+        result = {}
+    items = result.get("data") if isinstance(result, dict) else result
+    if isinstance(items, dict):
+        items = items.get("groups") or items.get("data") or []
+    for group in items if isinstance(items, list) else []:
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("group_id") or group.get("id") or "").strip()
+        if group_id:
+            ids.add(group_id)
+    with _KNOWN_GROUPS_LOCK:
+        if ids:
+            _KNOWN_GROUPS_CACHE["ids"] = ids
+            _KNOWN_GROUPS_CACHE["at"] = now
+        return set(_KNOWN_GROUPS_CACHE.get("ids") or set())
+
+
 def domain_proxy_get(path: object, extra_query: str = "") -> dict:
     """GET /api/v2/domain?path=：通用只读 domain 代理（白名单前缀，仅 GET）。
 
@@ -1592,6 +1647,10 @@ SELFTEST_HTTP_ROUTES: list[tuple[str, str, bool]] = [
 
 # 写接口清单（自检不自动执行，避免副作用；这里登记给「自检」页做验收清单）
 SELFTEST_WRITE_ENDPOINTS: list[dict] = [
+    # QA P0-1：这两个写接口曾经漏 require_admin（只读令牌可发消息/改拟人配置）；
+    # 现已由 _handle_api_v2 的统一 POST 闸门 + selftest 断言（security:readonly-write-403）保护。
+    {"method": "POST", "path": "/api/v2/actions/run", "note": "执行动作（send_message 等，需管理员；只读令牌必须 403）"},
+    {"method": "POST", "path": "/api/v2/humanlike", "note": "保存拟人模式 scopes（需管理员；只读令牌必须 403）"},
     {"method": "POST", "path": "/api/v2/config/toml", "note": "保存配置（备份+tomllib+sha 校验+审计）"},
     {"method": "POST", "path": "/api/v2/memory/file", "note": "写记忆/人设文件（白名单+备份+sha 校验+审计）"},
     {"method": "POST", "path": "/api/v2/models/switch", "note": "切换模型（RPC probe 热切换；改 effort 走文件+重启）"},
@@ -1605,6 +1664,27 @@ SELFTEST_WRITE_ENDPOINTS: list[dict] = [
     {"method": "POST", "path": "/api/v2/backup/create", "note": "创建 bot/domain 备份（校验+审计）"},
     {"method": "POST", "path": "/api/v2/tokens/revoke", "note": "撤销 token（踢会话+审计）"},
     {"method": "GET", "path": "/api/v2/logs/stream", "note": "SSE 实时日志流"},
+]
+
+# selftest 安全断言用：只读会话对下列写接口必须 403（不产生副作用）。
+# 单列出来是为了断言稳定：路径固定、不含占位符、只读会话在 require_admin 第一道就被拦。
+SELFTEST_READONLY_DENY_PROBES: list[tuple[str, str, str]] = [
+    ("POST", "/api/v2/actions/run", '{"name":"selftest-readonly-probe"}'),
+    ("POST", "/api/v2/humanlike", '{"scopes":[]}'),
+    ("POST", "/api/v2/config/toml", '{"content":"selftest-readonly-probe"}'),
+    ("POST", "/api/v2/memory/file", '{"path":"selftest/readonly.md","content":"x"}'),
+    ("POST", "/api/v2/models/switch", '{"provider":"deepseek-flash"}'),
+    ("POST", "/api/v2/group/capability", '{"group_id":"0","feature":"x","enabled":false}'),
+    ("POST", "/api/v2/ops/rollback", '{"image":"fm-cosmobot:runtime-selftest","confirm":true}'),
+    ("POST", "/api/v2/ops/config-backup", "{}"),
+    ("POST", "/api/v2/ops/cron-set", '{"line":"* * * * * true"}'),
+    ("POST", "/api/v2/backup/create", '{"db":"bot"}'),
+    ("POST", "/api/v2/tokens/revoke", '{"id":"selftest"}'),
+    ("POST", "/api/v2/scheduled/cancel", '{"id":0}'),
+    ("POST", "/api/v2/triggers/set", '{"group_id":"0","modes":[]}'),
+    ("POST", "/api/v2/persona", '{"scope":"group_default","text":"x"}'),
+    ("POST", "/api/v2/deploy/act", '{"action":"list","target":"bot"}'),
+    ("DELETE", "/api/v2/sessions/selftest-probe", "{}"),
 ]
 
 
@@ -1870,7 +1950,9 @@ class Api(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         request = urlparse(self.path)
-        if request.path == "/login":
+        if request.path in ("/login", "/login.html"):
+            # QA P2-2：/login.html 直接访问以前会落到 require_auth 返回 401 JSON；
+            # 登录页本身必须免鉴权（书签/外部文档会直接指向它）。
             self.send_static("login.html")
             return
         if request.path == "/" and not self.authorized():
@@ -2145,7 +2227,12 @@ class Api(BaseHTTPRequestHandler):
                 data = v2.scheduled_cancel(payload.get("id"))
                 record_audit("cancel", "scheduled", str(data.get("id") or ""), actor)
             elif route == "members/profile":
-                data = v2.member_profile(arg("id"), fetch_domain)
+                # QA P2-1：前端 fallback 用 ?user_id= 会拿到 400“缺少成员 id”；
+                # 这里同时接受 id / user_id / qq / sender_id 四种写法。
+                data = v2.member_profile(
+                    arg("id") or arg("user_id") or arg("qq") or arg("sender_id"),
+                    fetch_domain,
+                )
             elif route == "deploy/status":
                 data = v2.deploy_status(
                     arg("request_id"),
@@ -2181,6 +2268,14 @@ class Api(BaseHTTPRequestHandler):
                 data = v2.groups_overview(fetch_domain)
             elif route == "group":
                 data = v2.group_detail(arg("id"), fetch_domain)
+                # QA P2-8：不存在的群以前返回 200（messages:0 + domain 的 online:true），
+                # 页面会显示“在线/0 数据”。这里对「不在 domain 群清单且本地无消息」的 id 返回 404。
+                group_id = str(arg("id") or "").strip()
+                if group_id and not int(data.get("messages") or 0):
+                    if group_id not in _known_group_ids(fetch_domain):
+                        data.update({"known": False, "online": False})
+                        raise v2.ApiError("群不存在：%s（既不在 domain 群清单，也没有聊天记录）" % group_id, 404)
+                data["known"] = True
             elif route == "browse/tables":
                 data = v2.browse_tables()
             elif route == "browse/rows":
@@ -2281,15 +2376,17 @@ class Api(BaseHTTPRequestHandler):
                     return
             # ── v3: 运维监控（E）────────────────────────────────────────
             elif route == "ops/logs":
-                # v4：支持 grep 过滤、最多 500 行
-                data = v4.ops_logs_v2(arg("tail", "200"), arg("since"), arg("grep"))
+                # v4：grep 过滤、最多 500 行、12s 缓存（QA P1-3：冷启 20.9~29.6s）
+                data = v4.ops_logs_v2(arg("tail", "200"), arg("since"), arg("grep"),
+                                      arg("wait", "1"), arg("force"))
             elif route == "ops/metrics":
-                data = v2.ops_metrics()
+                # v4：15s 缓存 + 后台刷新（QA P1-2：之前恒 3.0s 无缓存）
+                data = v4.ops_metrics_cached(arg("wait", "1"), arg("force"))
             elif route == "ops/images":
                 data = v2.ops_images(arg("live").lower() in {"1", "true", "yes", "on"})
             elif route == "ops/cron":
-                # v4：只读 crontab（解析成 schedule/command；cron_set 未实现→501）
-                data = v4.ops_cron_list()
+                # v4：只读 crontab（解析成 schedule/command）+ 15s 缓存；cron_set 未实现→501
+                data = v4.ops_cron_list(arg("wait", "1"), arg("force"))
             elif route == "ops/result":
                 data = v2.ops_result_view(arg("request_id"))
             elif route == "ops/rollback":
@@ -2429,7 +2526,7 @@ class Api(BaseHTTPRequestHandler):
                                               arg("group_id"), arg("metric"))
             # ══ v4: C. 运维增强（宿主机 ops-agent v2）═════════════════════
             elif route == "ops/stats":
-                data = v4.ops_stats(arg("force"))
+                data = v4.ops_stats(arg("wait", "1"), arg("force"))
             elif route == "ops/cron-set":
                 if self.command != "POST":
                     method_not_allowed("POST")
@@ -2571,73 +2668,82 @@ class Api(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    def _selftest_http_checks(self) -> list[dict]:
-        """以当前 cookie 对本机接口发真实 HTTP 请求，拿到每项状态码与耗时。
+    # ══ 自检：并发 HTTP 探针 + 安全回归断言（QA P1-3 / P0-1 / P1-1）══════════
+    def _http_probe(self, port: int, path: str, cookie: str, method: str = "GET",
+                    body: bytes | None = None, timeout: float = 25.0) -> tuple[int | None, bytes, str]:
+        """发一个内部 HTTP 探针（带 X-FM-Selftest: 1 免限流），返回 (status, body, error)。"""
+        headers = {"Cookie": cookie, "Accept": "application/json",
+                   "X-FM-Selftest": "1", "User-Agent": "fm-admin-selftest/1.1"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request("http://127.0.0.1:%d%s" % (port, path), data=body,
+                          headers=headers, method=method)
+        status: int | None = None
+        payload = b""
+        error_text = ""
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = int(response.status)
+                # memory/tree、镜像列表等响应几十 KB，必须读全，否则 JSON 截断会误报
+                payload = response.read(4 * 1024 * 1024)
+        except HTTPError as error:
+            status = int(error.code)
+            try:
+                payload = error.read(8000)
+            except Exception:  # noqa: BLE001
+                payload = b""
+        except Exception as error:  # noqa: BLE001
+            error_text = "%s: %s" % (type(error).__name__, str(error)[:300])
+        return status, payload, error_text
 
-        v4：探针带 X-FM-Selftest: 1 头 → 免限流计数（否则 50+ 项自检会把自己的
-        60 次/分钟限流打爆，自检结果会全是 429）。
+    def _probe_check(self, port: int, cookie: str, name: str, path: str,
+                     required: bool = True, method: str = "GET",
+                     body: bytes | None = None) -> dict:
+        """跑一个探针并组装标准 check 结构。"""
+        started = time.monotonic()
+        status, payload, error_text = self._http_probe(port, path, cookie, method=method, body=body)
+        elapsed = round((time.monotonic() - started) * 1000, 1)
+        ok = bool(status and 200 <= status < 300)
+        parsed: object = None
+        if ok and payload:
+            try:
+                parsed = json.loads(payload.decode("utf-8", "replace"))
+            except (ValueError, UnicodeDecodeError):
+                ok = False
+                error_text = "响应不是 JSON"
+            if isinstance(parsed, dict) and parsed.get("ok") is False:
+                ok = False
+                error_text = str(parsed.get("error") or "ok=false")
+        elif ok and not payload:
+            ok = False
+            error_text = "响应为空"
+        return {
+            "name": name,
+            "kind": "http",
+            "method": method,
+            "path": path,
+            "http_status": status,
+            "ms": elapsed,
+            "ok": ok,
+            "level": "ok" if ok else ("fail" if required else "warn"),
+            "required": bool(required),
+            "error": error_text,
+        }
+
+    def _selftest_http_checks(self) -> list[dict]:
+        """以当前 cookie 并发探测本机接口（QA P1-3：串行 53s → 并发目标 <35s）。
+
+        - 探针带 X-FM-Selftest: 1 头 → 免限流计数；
+        - 宿主机代理类接口（/api/v2/ops/*）统一加 `wait=0`：缓存优先、首次不等
+          （返回 warming），避免单个 ops 探针把整体拖到 20~30s。
         """
         port = int(getattr(self.server, "server_address", ("", 8090))[1] or 8090)
         cookie = str(self.headers.get("Cookie") or "")
         checks: list[dict] = []
-
-        def probe(name: str, path: str, required: bool = True) -> None:
-            started = time.monotonic()
-            status: int | None = None
-            body = b""
-            error_text = ""
-            # 宿主机代理类接口（ops/*）要走队列 + docker 命令，最坏情况要等一个 cron 周期；
-            # 给它们更长的超时，避免自检把「代理正在两轮之间」误报成失败（仍是 optional 项）。
-            probe_timeout = 70 if path.startswith("/api/v2/ops/") else 25
-            try:
-                request = Request("http://127.0.0.1:%d%s" % (port, path),
-                                  headers={"Cookie": cookie, "Accept": "application/json",
-                                           "X-FM-Selftest": "1",
-                                           "User-Agent": "fm-admin-selftest/1.0"})
-                with urlopen(request, timeout=probe_timeout) as response:
-                    status = int(response.status)
-                    # 有的接口（memory/tree、deploy 快照、镜像列表）响应几十 KB，必须读全，
-                    # 否则 JSON 截断会误报「响应不是 JSON」。
-                    body = response.read(4 * 1024 * 1024)
-            except HTTPError as error:
-                status = int(error.code)
-                try:
-                    body = error.read(4000)
-                except Exception:  # noqa: BLE001
-                    body = b""
-            except Exception as error:  # noqa: BLE001
-                error_text = "%s: %s" % (type(error).__name__, str(error)[:300])
-            elapsed = round((time.monotonic() - started) * 1000, 1)
-            ok = bool(status and 200 <= status < 300)
-            parsed: object = None
-            if ok and body:
-                try:
-                    parsed = json.loads(body.decode("utf-8", "replace"))
-                except (ValueError, UnicodeDecodeError):
-                    ok = False
-                    error_text = "响应不是 JSON"
-                if isinstance(parsed, dict) and parsed.get("ok") is False:
-                    ok = False
-                    error_text = str(parsed.get("error") or "ok=false")
-            elif ok and not body:
-                ok = False
-                error_text = "响应为空"
-            checks.append({
-                "name": name,
-                "kind": "http",
-                "method": "GET",
-                "path": path,
-                "http_status": status,
-                "ms": elapsed,
-                "ok": ok,
-                "level": "ok" if ok else ("fail" if required else "warn"),
-                "required": bool(required),
-                "error": error_text,
-            })
-
+        probes: list[dict] = []
         for name, path, required in SELFTEST_HTTP_ROUTES:
-            probe(name, path, required)
-        # v4：文库正文要动态取一个真实 id 才能探（id 是哈希，别硬编码）
+            probes.append({"name": name, "path": path, "required": required})
+        # 文库正文要动态取一个真实 id 才能探（id 是哈希，别硬编码；命中缓存，几乎不花时间）
         try:
             import api_v4 as v4
             library = v4.library_list(fetch_domain, 1, 0)
@@ -2646,17 +2752,121 @@ class Api(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             text_id = ""
         if text_id:
-            probe("v4:library/text", "/api/v2/library/text?id=" + text_id, True)
+            probes.append({"name": "v4:library/text", "path": "/api/v2/library/text?id=" + text_id,
+                           "required": True})
         else:
             checks.append({
                 "name": "v4:library/text", "kind": "http", "method": "GET", "path": "",
                 "http_status": None, "ms": 0.0, "ok": False, "level": "warn",
                 "required": False, "error": "拿不到文库 id，跳过正文探针（/library/list 无数据）",
             })
+        for item in probes:
+            if item["path"].startswith("/api/v2/ops/"):
+                item["path"] += ("&" if "?" in item["path"] else "?") + "wait=0"
+        workers = max(4, min(10, len(probes)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self._probe_check, port, cookie, item["name"],
+                                   item["path"], item["required"]) for item in probes]
+            for future in futures:
+                try:
+                    checks.append(future.result())
+                except Exception as exc:  # noqa: BLE001  单个探针崩溃不影响整体自检
+                    checks.append({
+                        "name": "probe-error", "kind": "http", "method": "GET", "path": "",
+                        "http_status": None, "ms": 0.0, "ok": False, "level": "fail",
+                        "required": True, "error": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
+                    })
+        return checks
+
+    def _selftest_security_checks(self) -> list[dict]:
+        """安全回归断言（QA P0-1 / P1-1）：
+
+        1) security:readonly-write-403 —— 临时只读会话 POST/DELETE 所有 v2 写接口必须 403；
+        2) security:readonly-config-masked —— 临时只读会话读 /api/v2/config/toml 必须脱敏；
+        3) security:admin-config-plain（仅当调用者本身是 admin）—— 管理员读配置应保持可用。
+        临时会话用完即删，不写 auth.json、不产生审计副作用。
+        """
+        port = int(getattr(self.server, "server_address", ("", 8090))[1] or 8090)
+        checks: list[dict] = []
+        read_only_id = secrets.token_hex(16)
+        with LOCK:
+            SESSIONS[read_only_id] = {"username": "selftest-readonly", "login_time": time.time(),
+                                       "is_admin": False, "token_id": None}
+        read_only_cookie = "fm_session=" + read_only_id
+        try:
+            started = time.monotonic()
+            failures: list[dict] = []
+            for method, path, body_text in SELFTEST_READONLY_DENY_PROBES:
+                body = body_text.encode("utf-8") if method != "GET" else None
+                status, payload, error_text = self._http_probe(port, path, read_only_cookie,
+                                                               method=method, body=body, timeout=20.0)
+                if status != 403:
+                    failures.append({"method": method, "path": path, "http_status": status,
+                                     "error": error_text,
+                                     "body": payload[:200].decode("utf-8", "replace")})
+            checks.append({
+                "name": "security:readonly-write-403",
+                "kind": "security", "method": "PROBE", "path": "POST/DELETE /api/v2/*(写)",
+                "http_status": 403 if not failures else None,
+                "ms": round((time.monotonic() - started) * 1000, 1),
+                "ok": not failures, "level": "ok" if not failures else "fail",
+                "required": True, "error": "" if not failures else "%d 个写接口未返回 403" % len(failures),
+                "detail": {"probes": len(SELFTEST_READONLY_DENY_PROBES), "failures": failures[:6]},
+            })
+
+            started = time.monotonic()
+            status, payload, error_text = self._http_probe(
+                port, "/api/v2/config/toml?days=0", read_only_cookie, timeout=20.0)
+            masked = False
+            leaked: list[str] = []
+            detail: object = None
+            if status == 200:
+                try:
+                    data = (json.loads(payload.decode("utf-8", "replace")).get("data") or {})
+                    content = str(data.get("content") or "")
+                    masked = bool(data.get("masked")) or "***masked***" in content
+                    leaked = re.findall(r"(sk-[A-Za-z0-9_\-]{16,}|Ogn_[A-Za-z0-9_\-]{16,})", content)
+                    detail = {"masked": bool(data.get("masked")),
+                              "content_chars": len(content),
+                              "sha256": str(data.get("sha256") or "")[:16]}
+                except (ValueError, UnicodeDecodeError) as exc:
+                    error_text = error_text or str(exc)[:200]
+            ok = status == 200 and masked and not leaked
+            checks.append({
+                "name": "security:readonly-config-masked",
+                "kind": "security", "method": "GET", "path": "/api/v2/config/toml",
+                "http_status": status,
+                "ms": round((time.monotonic() - started) * 1000, 1),
+                "ok": ok, "level": "ok" if ok else "fail", "required": True,
+                "error": "" if ok else ("HTTP %s / masked=%s / 明文命中=%s / %s"
+                                        % (status, masked, len(leaked), error_text[:160])),
+                "detail": detail,
+            })
+
+            # QA P2-2：未登录访问 /login.html 必须拿到登录页（以前落到 require_auth 返回 401 JSON）
+            started = time.monotonic()
+            status, payload, error_text = self._http_probe(port, "/login.html", "", timeout=15.0)
+            ok = status == 200 and b"<html" in payload[:4096].lower()
+            checks.append({
+                "name": "security:login-page-public",
+                "kind": "security", "method": "GET", "path": "/login.html（未登录）",
+                "http_status": status,
+                "ms": round((time.monotonic() - started) * 1000, 1),
+                "ok": ok, "level": "ok" if ok else "warn", "required": False,
+                "error": "" if ok else ("未登录访问 /login.html 返回 HTTP %s / %s"
+                                        % (status, error_text[:120])),
+                "detail": {"bytes": len(payload)},
+            })
+        finally:
+            with LOCK:
+                SESSIONS.pop(read_only_id, None)
         return checks
 
     def handle_selftest(self) -> None:
-        """GET /api/v2/selftest：内部资源项 + 逐接口 HTTP 探针，红/绿/黄色验收清单。"""
+        """GET /api/v2/selftest：内部资源项 + 并发 HTTP 探针 + 安全断言。
+
+        QA P1-3：HTTP 探针并发（10 线程）而不是串行；宿主机代理类探针带 wait=0 不阻塞。
+        """
         import api_v2 as v2
         import api_v4 as v4
         started = time.monotonic()
@@ -2671,17 +2881,43 @@ class Api(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             harness_error = (harness_error + "; " if harness_error else "") + \
                 "v4 checks: %s: %s" % (type(exc).__name__, str(exc)[:200])
-        http_checks = self._selftest_http_checks()
-        checks = internal + http_checks
+        # HTTP 探针与安全断言互不依赖，并行跑（省掉一半串行时间）
+        http_checks: list[dict] = []
+        security_checks: list[dict] = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            http_future = pool.submit(self._selftest_http_checks)
+            security_future = pool.submit(self._selftest_security_checks)
+            try:
+                http_checks = http_future.result()
+            except Exception as exc:  # noqa: BLE001
+                harness_error = (harness_error + "; " if harness_error else "") + \
+                    "http probes: %s: %s" % (type(exc).__name__, str(exc)[:200])
+            try:
+                security_checks = security_future.result()
+            except Exception as exc:  # noqa: BLE001
+                harness_error = (harness_error + "; " if harness_error else "") + \
+                    "security probes: %s: %s" % (type(exc).__name__, str(exc)[:200])
+        # QA P2-5：只读令牌访问 sessions/tokens 的 403 属预期，标记出来让前端标黄而不是标红
+        for item in http_checks:
+            if item.get("name") in ("v2:sessions", "v2:tokens") and item.get("http_status") == 403:
+                item["expected_denied"] = True
+                item["error"] = "预期内：只读令牌无管理员权限（403）"
+        checks = internal + security_checks + http_checks
         required_failed = [item for item in checks if item.get("required") and not item.get("ok")]
         optional_failed = [item for item in checks if not item.get("required") and not item.get("ok")]
+        expected_denied = [item for item in checks if item.get("expected_denied")]
         passed = [item for item in checks if item.get("ok")]
+        warn_names = [item.get("name") for item in checks if item.get("level") == "warn"]
         summary = {
             "total": len(checks),
             "passed": len(passed),
             "failed": len(required_failed) + len(optional_failed),
             "failed_required": len(required_failed),
             "failed_optional": len(optional_failed),
+            "failed_optional_unexpected": len([item for item in optional_failed
+                                               if not item.get("expected_denied")]),
+            "expected_denied": len(expected_denied),
+            "expected_denied_names": [item.get("name") for item in expected_denied],
             "levels": {
                 "ok": sum(1 for item in checks if item.get("level") == "ok"),
                 "warn": sum(1 for item in checks if item.get("level") == "warn"),
@@ -2690,6 +2926,9 @@ class Api(BaseHTTPRequestHandler):
             "wall_ms": round((time.monotonic() - started) * 1000, 1),
             "failed_names": [item.get("name") for item in required_failed],
             "optional_failed_names": [item.get("name") for item in optional_failed],
+            "warn_names": warn_names,
+            "parallel_http_probes": True,
+            "security_checks": len(security_checks),
         }
         self.send_json(HTTPStatus.OK, {"ok": True, "data": {
             "ok": not required_failed,
@@ -2700,7 +2939,8 @@ class Api(BaseHTTPRequestHandler):
             "summary": summary,
             "harness_error": harness_error,
             "write_endpoints": SELFTEST_WRITE_ENDPOINTS,
-            "note": "required=false 的项（宿主机代理慢操作 / domain 新接口未上线）标黄，不影响整体通过；写接口不自动执行，已由人工 curl 验证。",
+            "note": "HTTP 探针并发执行；/api/v2/ops/* 探针带 wait=0（缓存优先、首次不阻塞宿主代理）；"
+                    "安全断言 security:readonly-* 用临时只读会话验证 403/脱敏，不产生副作用。",
         }})
 
     def do_POST(self) -> None:
@@ -2976,18 +3216,38 @@ class Api(BaseHTTPRequestHandler):
             ".css": "text/css; charset=utf-8",
             ".js": "application/javascript; charset=utf-8",
             ".json": "application/json; charset=utf-8",
+            ".map": "application/json; charset=utf-8",
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".gif": "image/gif",
             ".svg": "image/svg+xml",
+            ".woff2": "font/woff2",
         }
         content_type = content_types.get(candidate.suffix.lower()) or mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
         if content_type.startswith("text/") and "charset=" not in content_type:
             content_type += "; charset=utf-8"
+        # QA P2-4：静态资源（console/pages/ECharts ≈ 732KB+1MB）之前不压缩；
+        # 对文本类资源在客户端支持时 gzip（首屏传输可省 60~70%）。按 (mtime,size) 缓存压缩结果，
+        # 前端线改文件后 mtime 变化自动失效。
+        compressible = (content_type.startswith("text/")
+                        or content_type.startswith("application/javascript")
+                        or content_type.startswith("application/json")
+                        or content_type.startswith("image/svg"))
+        accepts_gzip = "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
+        encoding = ""
+        if compressible and accepts_gzip and len(body) >= 1024:
+            try:
+                stat = candidate.stat()
+                body, encoding = _static_payload(str(candidate), stat.st_mtime, stat.st_size, body)
+            except Exception:  # noqa: BLE001  压缩失败就原样发
+                encoding = ""
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if not head_only:
@@ -3002,7 +3262,7 @@ class Api(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 self.send_static("index.html", head_only=True)
-        elif request.path == "/login":
+        elif request.path in ("/login", "/login.html"):
             self.send_static("login.html", head_only=True)
         elif request.path.startswith("/static/"):
             self.send_static(request.path.removeprefix("/static/"), head_only=True)

@@ -55,6 +55,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -88,7 +89,14 @@ CONFIG_BACKUP_KEEP = 10
 HEALTH_INTERVAL = int(os.environ.get("FM_OPS_HEALTH_INTERVAL", "300") or 300)
 HEALTH_KEEP_SAMPLES = int(os.environ.get("FM_OPS_HEALTH_KEEP", "3000") or 3000)
 ROLLBACK_HEALTH_TIMEOUT = float(os.environ.get("FM_OPS_ROLLBACK_HEALTH_TIMEOUT", "70") or 70)
-VERSION = "2.0.2"
+# v2.1.6：默认 -1 = 常驻（空闲也不退出，cron 每分钟尝试拉起 → 进程崩了 60s 内自愈，
+# 不会再有「驻留退出到下一次 cron」之间最长 60s 的空档，导致 ops 首包 20~60s）。
+# FM_OPS_LINGER>0 时按「空闲 N 秒退出」的旧行为；FM_OPS_MAX_UPTIME 到点主动退出换新进程。
+LINGER_SECONDS = float(os.environ.get("FM_OPS_LINGER", "-1") or -1)
+MAX_UPTIME_SECONDS = float(os.environ.get("FM_OPS_MAX_UPTIME", "43200") or 43200)
+VERSION = "2.1.6"
+# 进程启动时间（写进 state 的 started_at，供后台展示/判断重启）
+STARTED_AT = time.time()
 
 ALLOWED_OPS = ("images", "inspect", "restart", "images_detail", "logs",
                "metrics", "cron", "rollback", "backup_domain",
@@ -168,11 +176,37 @@ def human_size(size: object) -> str:
     return "-"
 
 
+_CMD_CACHE: dict[str, tuple[float, Any]] = {}
+_CMD_CACHE_LOCK = threading.Lock()
+
+
+def _cmd_cached(key: str, ttl: float, producer: Any) -> Any:
+    """宿主机命令结果短 TTL 缓存。
+
+    docker stats 一次要 2~3s；后台 selftest/运维页会在一瞬间pull metrics+stats+logs+cron，
+    串行执行就会把后面真正用户的请求挤到十几秒。缓存 3~6s 可以让并发 ops 复用同一次采集。
+    """
+    now = time.time()
+    with _CMD_CACHE_LOCK:
+        entry = _CMD_CACHE.get(key)
+        if entry and now - float(entry[0]) <= ttl:
+            return entry[1]
+    value = producer()
+    with _CMD_CACHE_LOCK:
+        _CMD_CACHE[key] = (now, value)
+    return value
+
+
 def _docker_stats_rows(names: list[str] | tuple[str, ...]) -> list[dict]:
-    """docker stats --no-stream 的快照（固定 argv；失败返回 [{'error': ...}]）。"""
+    """docker stats --no-stream 快照（固定 argv；失败返回 [{'error': ...}]；缓存 6s）。"""
     containers = [str(name) for name in names if str(name)]
     if not containers:
         return []
+    return _cmd_cached("stats:" + ",".join(containers), 6.0,
+                       lambda: _docker_stats_rows_uncached(containers))
+
+
+def _docker_stats_rows_uncached(containers: list[str]) -> list[dict]:
     output = run_docker(["stats", "--no-stream", "--format", "{{json .}}"] + containers, timeout=45)
     if not output["ok"]:
         error = (output["stderr"] or output["stdout"] or "docker stats 失败")
@@ -199,7 +233,11 @@ def _docker_stats_rows(names: list[str] | tuple[str, ...]) -> list[dict]:
 
 
 def _docker_ps_rows() -> list[dict]:
-    """docker ps 摘要（name/image/status/state），失败返回 []。"""
+    """docker ps 摘要（name/image/status/state），失败返回 []；缓存 3s。"""
+    return _cmd_cached("ps", 3.0, _docker_ps_rows_uncached)
+
+
+def _docker_ps_rows_uncached() -> list[dict]:
     output = run_docker(["ps", "--format", "{{json .}}"], timeout=25)
     if not output["ok"]:
         return []
@@ -231,6 +269,11 @@ def _docker_ps_rows() -> list[dict]:
 
 
 def op_images() -> dict:
+    """fm-cosmobot:runtime-* 镜像清单（docker images 在 220 个镜像的机器上要 ~20s，缓存 60s）。"""
+    return _cmd_cached("images:runtime", 60.0, _op_images_uncached)
+
+
+def _op_images_uncached() -> dict:
     output = run_docker(["images", "--format", "{{json .}}"], timeout=30)
     if not output["ok"]:
         raise RuntimeError("docker images 失败：" + (output["stderr"] or output["stdout"]))
@@ -260,7 +303,11 @@ def op_images() -> dict:
 
 
 def op_images_detail() -> dict:
-    """fm-cosmobot 全部镜像（含非 runtime tag）+ 当前容器镜像（运维监控用）。"""
+    """fm-cosmobot 全部镜像（含非 runtime tag）+ 当前容器镜像（缓存 90s，docker images 很慢）。"""
+    return _cmd_cached("images:detail", 90.0, _op_images_detail_uncached)
+
+
+def _op_images_detail_uncached() -> dict:
     output = run_docker(["images", IMAGE_REPO, "--format", "{{json .}}"], timeout=40)
     if not output["ok"]:
         raise RuntimeError("docker images 失败：" + (output["stderr"] or output["stdout"]))
@@ -296,6 +343,11 @@ def op_images_detail() -> dict:
 
 
 def op_inspect() -> dict:
+    """docker inspect 摘要（缓存 3s：运维页 metrics/stats 会高频调用）。"""
+    return _cmd_cached("inspect:" + CONTAINER_NAME, 3.0, _op_inspect_uncached)
+
+
+def _op_inspect_uncached() -> dict:
     output = run_docker(["inspect", CONTAINER_NAME], timeout=30)
     if not output["ok"]:
         raise RuntimeError("docker inspect 失败：" + (output["stderr"] or "容器不存在？"))
@@ -331,7 +383,7 @@ def op_restart(target: str) -> dict:
     output = run_docker(["restart", "-t", "5", CONTAINER_NAME], timeout=90)
     if not output["ok"]:
         raise RuntimeError("docker restart 失败：" + (output["stderr"] or output["stdout"]))
-    inspect_result = op_inspect()
+    inspect_result = _op_inspect_uncached()
     return {
         "target": "bot",
         "restarted": True,
@@ -407,7 +459,8 @@ def _read_proc(path: str) -> str:
         return ""
 
 
-def op_metrics(params: dict) -> dict:
+def _host_metrics_block() -> dict:
+    """宿主机 load/mem/disk/uptime/cpu（/proc + shutil.disk_usage）。"""
     now = time.time()
     load1 = load5 = load15 = 0.0
     processes = ""
@@ -458,7 +511,34 @@ def op_metrics(params: dict) -> dict:
             }
         except OSError:
             continue
-    docker_stats = {}
+    try:
+        cpu_count = os.cpu_count() or 0
+    except Exception:  # noqa: BLE001
+        cpu_count = 0
+    return {
+        "hostname": os.uname().nodename if hasattr(os, "uname") else "",
+        "now": now,
+        "now_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        "uptime_seconds": round(uptime_seconds, 1),
+        "uptime_text": uptime_text,
+        "cpu_count": cpu_count,
+        "load": {"1m": load1, "5m": load5, "15m": load15, "processes": processes},
+        "mem": {
+            "total_kb": total_kb, "available_kb": available_kb, "used_kb": used_kb,
+            "used_percent": used_percent,
+            "total_human": human_size(total_kb * 1024),
+            "available_human": human_size(available_kb * 1024),
+            "used_human": human_size(used_kb * 1024),
+            "swap_total_kb": swap_total_kb,
+            "swap_free_kb": swap_free_kb,
+        },
+        "disk": disks,
+    }
+
+
+def op_metrics(params: dict) -> dict:
+    """宿主机指标 + docker stats 摘要（docker stats 走 6s 缓存，重复请求不再慢）。"""
+    host = _host_metrics_block()
     stats_rows = _docker_stats_rows([CONTAINER_NAME])
     if stats_rows and not stats_rows[0].get("error"):
         docker_stats = stats_rows[0]
@@ -468,30 +548,8 @@ def op_metrics(params: dict) -> dict:
         container = op_inspect().get("container") or {}
     except Exception as exc:  # noqa: BLE001
         container = {"error": str(exc)[:300]}
-    try:
-        cpu_count = os.cpu_count() or 0
-    except Exception:  # noqa: BLE001
-        cpu_count = 0
     return {
-        "host": {
-            "hostname": os.uname().nodename if hasattr(os, "uname") else "",
-            "now": now,
-            "now_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-            "uptime_seconds": round(uptime_seconds, 1),
-            "uptime_text": uptime_text,
-            "cpu_count": cpu_count,
-            "load": {"1m": load1, "5m": load5, "15m": load15, "processes": processes},
-            "mem": {
-                "total_kb": total_kb, "available_kb": available_kb, "used_kb": used_kb,
-                "used_percent": used_percent,
-                "total_human": human_size(total_kb * 1024),
-                "available_human": human_size(available_kb * 1024),
-                "used_human": human_size(used_kb * 1024),
-                "swap_total_kb": swap_total_kb,
-                "swap_free_kb": swap_free_kb,
-            },
-            "disk": disks,
-        },
+        "host": host,
         "docker": {"container": container, "stats": docker_stats},
         "source": "host:/proc + docker stats",
     }
@@ -500,8 +558,7 @@ def op_metrics(params: dict) -> dict:
 def op_stats(params: dict) -> dict:
     """v2 GET /api/v2/ops/stats：docker stats（bot/domain/admin）+ 磁盘 + 负载 + 内存。"""
     started = time.time()
-    metrics = op_metrics({})
-    host = dict(metrics.get("host") or {})
+    host = _host_metrics_block()
     ps_rows = {str(row.get("name")): row for row in _docker_ps_rows()}
     stats_rows = _docker_stats_rows(list(STATS_CONTAINERS))
     errors = [row.get("error") for row in stats_rows if row.get("error")]
@@ -1353,73 +1410,250 @@ def _clean_params(raw: object) -> dict:
     return clean
 
 
-def process_queue(scan_id: int) -> dict:
-    QUEUE.mkdir(parents=True, exist_ok=True)
-    RESULTS.mkdir(parents=True, exist_ok=True)
+HEAVY_OPS = ("images", "images_detail", "rollback", "restart", "backup_domain")
+_HEAVY_STOP = threading.Event()
+
+
+def _read_queue_entries() -> list[tuple[Path, Any]]:
+    """读队列目录（最多 MAX_QUEUE_FILES），返回 [(path, parsed_or_None)]。"""
+    entries: list[tuple[Path, Any]] = []
     try:
         candidates = sorted(QUEUE.glob("*.json"))[:MAX_QUEUE_FILES]
-    except OSError as exc:
-        return {"processed": 0, "error": str(exc)}
-    processed = 0
-    failures = 0
-    last_id = ""
+    except OSError:
+        return entries
     for path in candidates:
-        stem = path.stem
-        if not SAFE_ID.match(stem):
+        if not SAFE_ID.match(path.stem):
             log("跳过非法队列文件名：" + str(path))
             try:
                 path.unlink()
             except OSError:
                 pass
             continue
-        request: dict = {"id": stem}
-        started = time.time()
         try:
-            raw = path.read_text(encoding="utf-8")
-            parsed = json.loads(raw)
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001  解析错误交给 _process_request_file 统一报错
+            parsed = None
+        entries.append((path, parsed))
+    return entries
+
+
+def _is_heavy(parsed: Any) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    return str(parsed.get("op") or "").strip().lower() in HEAVY_OPS
+
+
+def _process_request_file(path: Path, scan_id: int, parsed: Any = None) -> dict:
+    """处理一个队列文件：执行 op → 写结果文件 → 删队列文件。不抛异常。"""
+    stem = path.stem
+    request: dict = {"id": stem}
+    started = time.time()
+    try:
+        if not isinstance(parsed, dict):
+            if parsed is None:
+                raw = path.read_text(encoding="utf-8")
+                parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 raise ValueError("队列内容不是 JSON 对象")
-            request = {
-                "id": stem,
-                "op": parsed.get("op"),
-                "target": parsed.get("target"),
-                "params": _clean_params(parsed.get("params")),
-                "created_at": parsed.get("created_at"),
-            }
-            created = float(request.get("created_at") or time.time())
-            if time.time() - created > REQUEST_MAX_AGE_SECONDS:
-                raise TimeoutError("请求超过 %s 秒未处理，已过期" % REQUEST_MAX_AGE_SECONDS)
-            result = execute(request)
-            payload = result_payload(request, True, result=result, started=started)
-        except Exception as exc:  # noqa: BLE001
-            failures += 1
-            payload = result_payload(request, False, started=started, error=str(exc)[:1000])
-            # v2：带状态码的错误（如 cron_set 501）透传给后台 API
-            status = getattr(exc, "status", None)
-            if isinstance(status, int) and 400 <= status <= 599:
-                payload["error_status"] = status
-        try:
-            atomic_write_json(RESULTS / (stem + ".json"), payload)
-            path.unlink()
+        request = {
+            "id": stem,
+            "op": parsed.get("op"),
+            "target": parsed.get("target"),
+            "params": _clean_params(parsed.get("params")),
+            "created_at": parsed.get("created_at"),
+        }
+        created = float(request.get("created_at") or time.time())
+        if time.time() - created > REQUEST_MAX_AGE_SECONDS:
+            raise TimeoutError("请求超过 %s 秒未处理，已过期" % REQUEST_MAX_AGE_SECONDS)
+        result = execute(request)
+        payload = result_payload(request, True, result=result, started=started)
+    except Exception as exc:  # noqa: BLE001
+        payload = result_payload(request, False, started=started, error=str(exc)[:1000])
+        status = getattr(exc, "status", None)
+        if isinstance(status, int) and 400 <= status <= 599:
+            payload["error_status"] = status
+    try:
+        atomic_write_json(RESULTS / (stem + ".json"), payload)
+        path.unlink()
+        log("scan=%s op=%s target=%s id=%s -> %s" % (
+            scan_id, payload.get("op"), payload.get("target"), stem,
+            "ok" if payload.get("ok") else "FAIL " + str(payload.get("error"))[:200]))
+    except OSError as exc:
+        log("写结果失败 id=%s：%s" % (stem, exc))
+        return {"stem": stem, "ok": False, "error": str(exc)[:200]}
+    return {"stem": stem, "ok": bool(payload.get("ok")),
+            "duration_ms": payload.get("duration_ms"), "op": payload.get("op")}
+
+
+def process_queue(scan_id: int) -> dict:
+    """处理「快」op（metrics/logs/stats/cron/inspect/config_backup…）。
+
+    重 op（images/images_detail/rollback/restart/backup_domain）交给 _heavy_worker_loop，
+    避免 docker images（~20s）把高频的 ops/metrics、ops/logs 堵在队列后面
+    （QA P1-2 复测里 force=1 曾因它排队 18.6s）。
+    """
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    failures = 0
+    last_id = ""
+    skipped_heavy = 0
+    for path, parsed in _read_queue_entries():
+        if _is_heavy(parsed):
+            skipped_heavy += 1
+            continue
+        outcome = _process_request_file(path, scan_id, parsed)
+        if outcome.get("stem"):
             processed += 1
-            last_id = stem
-            log("scan=%s op=%s target=%s id=%s -> %s" % (
-                scan_id, payload.get("op"), payload.get("target"), stem,
-                "ok" if payload.get("ok") else "FAIL " + str(payload.get("error"))[:200]))
-        except OSError as exc:
-            log("写结果失败 id=%s：%s" % (stem, exc))
-    return {"processed": processed, "failures": failures, "last_id": last_id}
+            last_id = outcome["stem"]
+            if not outcome.get("ok"):
+                failures += 1
+    return {"processed": processed, "failures": failures, "last_id": last_id,
+            "skipped_heavy": skipped_heavy}
+
+
+def process_heavy_sync(scan_id: int = 0) -> int:
+    """单轮模式（--once）下同步处理重 op，保持旧行为。"""
+    count = 0
+    for path, parsed in _read_queue_entries():
+        if not _is_heavy(parsed):
+            continue
+        _process_request_file(path, scan_id, parsed)
+        count += 1
+    return count
+
+
+def _heavy_worker_loop() -> None:
+    """重 op 专用线程：串行执行 images/images_detail/rollback/restart/backup_domain。
+
+    这些 op 单次 5~180s，串行保证 rollback/restart 不会互相打架；同时不影响快 op。
+    """
+    while not _HEAVY_STOP.wait(1.0):
+        try:
+            heavy = [(path, parsed) for path, parsed in _read_queue_entries() if _is_heavy(parsed)]
+        except Exception as exc:  # noqa: BLE001
+            log("重 op 扫描失败：%s" % str(exc)[:200])
+            continue
+        for path, parsed in heavy:
+            if _HEAVY_STOP.is_set():
+                return
+            try:
+                _process_request_file(path, 0, parsed)
+            except Exception as exc:  # noqa: BLE001
+                log("重 op 处理异常：%s" % str(exc)[:300])
+
+
+def _queue_pending() -> int:
+    try:
+        return len(list(QUEUE.glob("*.json")))
+    except OSError:
+        return 0
+
+
+_STATE_LOCK = threading.Lock()
+# 心跳线程共享的「最近一轮扫描」信息（长时间 op 期间也能刷新心跳，避免后台误判离线）
+_SCAN_INFO: dict[str, Any] = {"scans": 0, "total": 0, "last_id": "", "scan_seconds": 0.0, "mode": "loop"}
+
+
+def _write_agent_state(scan_seconds: float, scans: int, total: int, last_id: str,
+                       extra: dict | None = None) -> dict:
+    now = time.time()
+    now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    state = {
+        "version": VERSION,
+        "pid": os.getpid(),
+        # v2.1.2：统一 state schema（Lead/QA 反馈「读 updated_at 得到 None」）：
+        # updated_at / started_at 用 epoch 秒 + 对应的 *_text 本地时间；
+        # last_scan / last_scan_text 保留为兼容旧读取方。
+        "schema_version": 2,
+        "updated_at": now,
+        "updated_at_text": now_text,
+        "started_at": STARTED_AT,
+        "started_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(STARTED_AT)),
+        "last_scan": now,
+        "last_scan_text": now_text,
+        "scan_seconds": round(scan_seconds, 3),
+        "scans": scans,
+        "processed_total": total,
+        "last_processed_id": last_id or "",
+        "queue": str(QUEUE),
+        "results": str(RESULTS),
+        "backups": str(BACKUPS),
+        "container": CONTAINER_NAME,
+        "domain_db": DOMAIN_DB,
+        "allowed_ops": list(ALLOWED_OPS),
+        "stats_containers": list(STATS_CONTAINERS),
+        "config_path": CONFIG_PATH,
+        "health_file": str(HEALTH_FILE),
+        "health_interval": HEALTH_INTERVAL,
+        "last_health_at": _LAST_HEALTH.get("at") or 0,
+        "last_health_at_text": _LAST_HEALTH.get("text") or "",
+        "health_samples": _LAST_HEALTH.get("samples") or 0,
+        "linger_seconds": LINGER_SECONDS,
+        "mode": "loop",
+        "uptime_seconds": round(max(0.0, now - STARTED_AT), 1),
+    }
+    if isinstance(extra, dict):
+        state.update(extra)
+    with _STATE_LOCK:
+        atomic_write_json(STATE, state)
+    return state
+
+
+def _heartbeat_loop(stop_event: "threading.Event") -> None:
+    """每 5s 刷一次心跳（独立线程）：长 op（rollback/images）或驻留空闲时后台仍显示在线。"""
+    while not stop_event.wait(5.0):
+        try:
+            _write_agent_state(_SCAN_INFO.get("scan_seconds") or 0.0,
+                               int(_SCAN_INFO.get("scans") or 0),
+                               int(_SCAN_INFO.get("total") or 0),
+                               str(_SCAN_INFO.get("last_id") or ""),
+                               {"mode": _SCAN_INFO.get("mode") or "loop",
+                                "heartbeat": True,
+                                "pending": _queue_pending()})
+        except Exception:  # noqa: BLE001  心跳失败不影响主循环
+            pass
+
+
+def _run_scan(scans: int) -> dict:
+    """扫一轮队列 + （按需）写健康检查点；返回 process_queue 的摘要。"""
+    started = time.time()
+    _SCAN_INFO["mode"] = "resident" if int(_SCAN_INFO.get("scans") or 0) >= 1 else "loop"
+    summary = process_queue(scans)
+    # v2：每 HEALTH_INTERVAL 秒追加一条健康检查点（节流在函数内部判断）
+    try:
+        snapshot = write_health_checkpoint()
+        if snapshot:
+            log("health checkpoint：%s containers=%s samples=%s"
+                % (snapshot["at_text"], len(snapshot.get("containers") or []),
+                   _LAST_HEALTH.get("samples")))
+    except Exception as exc:  # noqa: BLE001  健康检查点失败不能拖垮队列处理
+        log("健康检查点写入失败：%s" % str(exc)[:300])
+    summary = dict(summary or {})
+    summary["scan_seconds"] = round(time.time() - started, 3)
+    return summary
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FM host ops agent (docker whitelist)")
     parser.add_argument("--once", action="store_true", help="只扫一轮（默认）")
-    parser.add_argument("--loop", type=int, default=0, help="连续扫 N 轮后退出")
+    parser.add_argument("--loop", type=int, default=0, help="连续扫 N 轮后进入驻留等待")
     parser.add_argument("--interval", type=float, default=18.0, help="每轮间隔秒数（默认 18）")
+    parser.add_argument("--linger", type=float, default=None,
+                        help="扫完 --loop 后继续驻留等队列的秒数（默认 90；0=不驻留立即退出）")
     parser.add_argument("--health-now", action="store_true",
                         help="立即写一条健康检查点（忽略 5 分钟节流），然后退出")
     args = parser.parse_args()
     loops = args.loop if args.loop and args.loop > 0 else 1
+    # v2.1：cron 每分钟才拉起一次，进程扫完 --loop 就退出会留下最长 ~60s 空档，
+    # 造成后台 ops 接口首包 20~30s（QA P1-3 的根因）。所以 --loop 模式扫完后「驻留」
+    # 继续盯队列（1s 轮询），空闲超过 LINGER 秒才退出（下一分钟 cron 再拉起 = 自愈）。
+    if args.linger is not None:
+        linger_seconds = max(0.0, float(args.linger))
+    elif args.once or not args.loop:
+        linger_seconds = 0.0
+    else:
+        linger_seconds = LINGER_SECONDS
 
     if not BASE.is_dir():
         log("BASE 目录不存在：" + str(BASE))
@@ -1451,48 +1685,99 @@ def main() -> int:
 
     scans = 0
     total = 0
+    # v2.1.1：独立心跳线程，长 op（rollback/images）或驻留空闲时后台也能看到 agent 在线
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = None
+    heavy_thread = None
+    if linger_seconds != 0 or loops > 1:
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, args=(stop_heartbeat,),
+                                           name="fm-ops-heartbeat", daemon=True)
+        heartbeat_thread.start()
+        # v2.1.4：重 op 独立线程，避免 docker images(~20s)/rollback 堵住高频快 op
+        _HEAVY_STOP.clear()
+        heavy_thread = threading.Thread(target=_heavy_worker_loop, name="fm-ops-heavy", daemon=True)
+        heavy_thread.start()
     try:
         for index in range(loops):
             scans += 1
-            started = time.time()
-            summary = process_queue(scans)
+            summary = _run_scan(scans)
             total += int(summary.get("processed") or 0)
-            # v2：每 HEALTH_INTERVAL 秒追加一条健康检查点（节流在函数内部判断）
-            try:
-                snapshot = write_health_checkpoint()
-                if snapshot:
-                    log("health checkpoint：%s containers=%s samples=%s"
-                        % (snapshot["at_text"], len(snapshot.get("containers") or []),
-                           _LAST_HEALTH.get("samples")))
-            except Exception as exc:  # noqa: BLE001  健康检查点失败不能拖垮队列处理
-                log("健康检查点写入失败：%s" % str(exc)[:300])
-            state = {
-                "version": VERSION,
-                "pid": os.getpid(),
-                "last_scan": time.time(),
-                "last_scan_text": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "scan_seconds": round(time.time() - started, 3),
-                "scans": scans,
-                "processed_total": total,
-                "last_processed_id": summary.get("last_id") or "",
-                "queue": str(QUEUE),
-                "results": str(RESULTS),
-                "backups": str(BACKUPS),
-                "container": CONTAINER_NAME,
-                "domain_db": DOMAIN_DB,
-                "allowed_ops": list(ALLOWED_OPS),
-                "stats_containers": list(STATS_CONTAINERS),
-                "config_path": CONFIG_PATH,
-                "health_file": str(HEALTH_FILE),
-                "health_interval": HEALTH_INTERVAL,
-                "last_health_at": _LAST_HEALTH.get("at") or 0,
-                "last_health_at_text": _LAST_HEALTH.get("text") or "",
-                "health_samples": _LAST_HEALTH.get("samples") or 0,
-            }
-            atomic_write_json(STATE, state)
+            _SCAN_INFO.update({"scans": scans, "total": total,
+                               "last_id": summary.get("last_id") or "",
+                               "scan_seconds": summary.get("scan_seconds") or 0.0,
+                               "mode": "loop"})
+            _write_agent_state(summary.get("scan_seconds") or 0.0, scans, total,
+                               summary.get("last_id") or "",
+                               {"mode": "loop", "linger_seconds": linger_seconds})
+            if linger_seconds <= 0 and loops == 1:
+                # 单轮模式：同步把重 op 也处理掉（保持 --once 的旧行为）
+                process_heavy_sync(scans)
+                _write_agent_state(summary.get("scan_seconds") or 0.0, scans, total,
+                                   summary.get("last_id") or "",
+                                   {"mode": "once", "linger_seconds": 0.0})
             if index < loops - 1:
                 time.sleep(max(1.0, args.interval))
+
+        # ── 驻留等待：队列一来就处理；linger_seconds<0 = 永不因空闲退出（常驻）──
+        if linger_seconds != 0:
+            idle_since = time.time()
+            last_state_at = 0.0
+            if linger_seconds > 0:
+                log("进入驻留模式：轮询队列（0.5s），空闲 %.0fs 后退出" % linger_seconds)
+            else:
+                log("进入常驻模式：轮询队列（0.5s），不因空闲退出；"
+                    "最长运行 %.0fs 后主动退出换新进程" % MAX_UPTIME_SECONDS)
+            while True:
+                pending = _queue_pending()
+                if pending:
+                    summary = _run_scan(scans + 1)
+                    processed = int(summary.get("processed") or 0)
+                    if processed == 0:
+                        # v2.1.5：队列里只剩「重 op」（images/rollback 由 fm-ops-heavy 线程处理），
+                        # 本轮没处理任何请求 → 别空转、也别把 scans 计数刷爆（曾刷到 6 万+）。
+                        time.sleep(0.5)
+                        continue
+                    scans += 1
+                    total += processed
+                    idle_since = time.time()
+                    _SCAN_INFO.update({"scans": scans, "total": total,
+                                       "last_id": summary.get("last_id") or "",
+                                       "scan_seconds": summary.get("scan_seconds") or 0.0,
+                                       "mode": "resident"})
+                    _write_agent_state(summary.get("scan_seconds") or 0.0, scans, total,
+                                       summary.get("last_id") or "",
+                                       {"mode": "resident", "linger_seconds": linger_seconds,
+                                        "pending": _queue_pending(),
+                                        "idle_seconds": 0.0})
+                    continue
+                now = time.time()
+                idle = now - idle_since
+                if MAX_UPTIME_SECONDS > 0 and now - STARTED_AT >= MAX_UPTIME_SECONDS:
+                    log("已连续运行 %.0fs（上限 %.0fs），主动退出由 cron 拉起新进程"
+                        % (now - STARTED_AT, MAX_UPTIME_SECONDS))
+                    _write_agent_state(0.0, scans, total, "",
+                                       {"mode": "max-uptime-exit", "linger_seconds": linger_seconds,
+                                        "idle_seconds": round(idle, 1)})
+                    break
+                if linger_seconds > 0 and idle >= linger_seconds:
+                    log("空闲 %.0fs，退出驻留（cron 下一分钟会重新拉起）" % idle)
+                    _write_agent_state(0.0, scans, total, "",
+                                       {"mode": "exiting", "linger_seconds": linger_seconds,
+                                        "idle_seconds": round(idle, 1)})
+                    break
+                if now - last_state_at >= 4.0:
+                    _write_agent_state(0.0, scans, total, "",
+                                       {"mode": "resident-idle", "linger_seconds": linger_seconds,
+                                        "pending": 0, "idle_seconds": round(idle, 1)})
+                    last_state_at = now
+                time.sleep(0.5)
     finally:
+        stop_heartbeat.set()
+        _HEAVY_STOP.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2.0)
+        if heavy_thread is not None:
+            heavy_thread.join(timeout=3.0)
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         except Exception:  # noqa: BLE001

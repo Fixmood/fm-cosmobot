@@ -374,7 +374,10 @@ def browse_tables() -> dict:
 
 def browse_rows(table: str, q: str, limit: int, offset: int) -> dict:
     if table not in BROWSE_TABLES:
-        return {"error": "不允许浏览该表"}
+        # QA P2-3：以前返回 200 + {"ok":true,"data":{"error":...}}，前端会当成“空数据”；
+        # 统一成 400 + {"ok":false,"error":...}（与其他接口错误语义一致）。
+        raise ApiError("不允许浏览该表：%s（可用表：%s）"
+                       % (table or "(空)", " / ".join(sorted(BROWSE_TABLES))), 400)
     limit = max(1, min(300, limit))
     offset = max(0, offset)
     sql = f"SELECT * FROM {table}"
@@ -1220,6 +1223,8 @@ OPS_BASE = os.environ.get("FM_OPS_BASE", "/data").rstrip("/") or "/data"
 OPS_QUEUE = os.path.join(OPS_BASE, "ops-queue")
 OPS_RESULTS = os.path.join(OPS_BASE, "ops-results")
 OPS_STATE = os.path.join(OPS_BASE, "ops-agent-state.json")
+# 心跳多久没更新算离线（QA/Lead：统一阈值 90s）
+OPS_AGENT_ONLINE_TTL = int(os.environ.get("FM_OPS_AGENT_TTL", "90") or 90)
 # 白名单 op 必须与宿主机 ops_agent.py 的 ALLOWED_OPS 保持一致（v3 扩展 + v4 运维增强）。
 OPS_ALLOWED = ("images", "inspect", "restart", "images_detail", "logs", "metrics",
                "cron", "rollback", "backup_domain",
@@ -1238,7 +1243,18 @@ _OPS_FIRST_WAIT = 26.0
 
 
 def _ops_agent_state() -> dict:
-    """读 ops-agent 每轮写的心跳文件，判断宿主机代理是否在跑。"""
+    """读 ops-agent 心跳文件，判断宿主机代理是否在跑。
+
+    2026-11-15（QA/Lead 反馈「误报离线」）：统一 state schema 并兼容旧字段名。
+    新 schema（ops_agent >= 2.1.2 写入）：
+        started_at / started_at_text        进程启动时间（epoch 秒 + 本地文本）
+        updated_at / updated_at_text        最近一次心跳写入时间
+        heartbeat(bool)                     是否由独立心跳线程写入
+        scans / processed_total / mode ...
+    旧字段（last_scan / last_scan_text / ts / heartbeat_at）继续兼容读取。
+    在线判定：心跳年龄 < OPS_AGENT_ONLINE_TTL（默认 90s）。
+    """
+    now = time.time()
     for path in (OPS_STATE, os.path.join(OPS_RESULTS, "agent-state.json")):
         if not os.path.isfile(path):
             continue
@@ -1248,13 +1264,43 @@ def _ops_agent_state() -> dict:
             continue
         if not isinstance(data, dict):
             continue
-        last = float(data.get("last_scan") or data.get("updated_at") or 0)
-        age = time.time() - last if last else None
-        data["online"] = bool(age is not None and age < 90)
+        updated = 0.0
+        for key in ("updated_at", "last_scan", "heartbeat_at", "ts"):
+            try:
+                value = float(data.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                updated = value
+                break
+        age = now - updated if updated else None
+        data["updated_at"] = updated or None
+        if not data.get("updated_at_text") and updated:
+            data["updated_at_text"] = _local_time(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(updated)))
+        try:
+            data["started_at"] = float(data.get("started_at") or 0) or None
+        except (TypeError, ValueError):
+            data["started_at"] = None
+        if not data.get("started_at_text") and data.get("started_at"):
+            data["started_at_text"] = _local_time(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(data["started_at"])))
+        data["last_scan"] = updated or None
+        data["last_scan_text"] = data.get("last_scan_text") or data.get("updated_at_text") or ""
+        data["online"] = bool(age is not None and age < OPS_AGENT_ONLINE_TTL)
         data["age_seconds"] = round(age, 1) if age is not None else None
+        data["online_ttl_seconds"] = OPS_AGENT_ONLINE_TTL
         data["heartbeat_path"] = path
+        data["schema_version"] = 2
+        data["schema_fields"] = {
+            "has_updated_at": bool(updated),
+            "has_started_at": bool(data.get("started_at")),
+            "has_version": bool(data.get("version")),
+        }
         return data
     return {"online": False, "age_seconds": None, "heartbeat_path": OPS_STATE,
+            "updated_at": None, "started_at": None, "schema_version": 2,
+            "online_ttl_seconds": OPS_AGENT_ONLINE_TTL,
             "note": "未找到 ops-agent 心跳文件（宿主机代理未安装/未运行）"}
 
 
@@ -2813,8 +2859,13 @@ def selftest_internal(domain: Callable[..., Any] | None, rpc: Callable[..., Any]
         agent = _ops_agent_state()
         if not agent.get("online"):
             raise RuntimeError("宿主机运维代理离线：最后心跳 %s 秒前" % agent.get("age_seconds"))
-        return {"online": True, "age_seconds": agent.get("age_seconds"), "scans": agent.get("scans"),
-                "allowed_ops": agent.get("allowed_ops")}
+        return {"online": True, "age_seconds": agent.get("age_seconds"),
+                "updated_at": agent.get("updated_at"),
+                "updated_at_text": agent.get("updated_at_text"),
+                "started_at_text": agent.get("started_at_text"),
+                "online_ttl_seconds": agent.get("online_ttl_seconds", OPS_AGENT_ONLINE_TTL),
+                "version": agent.get("version"), "mode": agent.get("mode"),
+                "scans": agent.get("scans"), "allowed_ops": agent.get("allowed_ops")}
 
     run("ops:agent-heartbeat", check_ops_agent)
 
