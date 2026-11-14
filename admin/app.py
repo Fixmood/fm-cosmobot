@@ -1491,10 +1491,14 @@ class Api(BaseHTTPRequestHandler):
             self.handle_token_list()
         elif not self.require_auth():
             return
+        elif request.path == "/console":
+            self.send_static("console.html")
         elif request.path == "/now":
             self.send_static("now.html")
         elif request.path == "/api/now":
             self.send_json(HTTPStatus.OK, {"ok": True, "data": now_snapshot()})
+        elif request.path.startswith("/api/v2/"):
+            self.handle_api_v2(request)
         elif request.path == "/api/search":
             keyword = parse_qs(request.query).get("q", [""])[0]
             self.send_json(HTTPStatus.OK, {"ok": True, "data": global_search(keyword)})
@@ -1619,6 +1623,47 @@ class Api(BaseHTTPRequestHandler):
                 self.send_error_json(HTTPStatus.NOT_FOUND, "记录不存在。")
             else:
                 self.send_json(HTTPStatus.OK, {"ok": True, "item": item})
+
+
+    def handle_api_v2(self, request) -> None:
+        """一次性补齐的后台 v2 接口（见 api_v2.py）。"""
+        import api_v2 as v2
+        query = parse_qs(request.query)
+        arg = lambda name, default="": (query.get(name, [default])[0] or default)
+        route = request.path[len("/api/v2/"):].strip("/")
+        try:
+            if route == "overview":
+                data = v2.overview(fetch_domain, fetch_rpc)
+            elif route == "humanlike":
+                if self.command == "POST":
+                    payload = self.read_json() or {}
+                    scopes = payload.get("scopes") if isinstance(payload, dict) else []
+                    data = v2.humanlike_set_scopes(scopes if isinstance(scopes, list) else [])
+                else:
+                    data = v2.humanlike_state()
+            elif route == "members":
+                data = v2.member_search(arg("q"))
+            elif route == "messages":
+                data = v2.message_search(arg("q"), arg("chat"), int(arg("days", "0") or 0), int(arg("limit", "100") or 100))
+            elif route == "tools/audit":
+                data = v2.tools_audit(arg("tool"), int(arg("days", "7") or 7), arg("status"), int(arg("limit", "200") or 200))
+            elif route == "tools/stats":
+                data = v2.tools_stats(int(arg("days", "7") or 7))
+            elif route == "groups":
+                data = v2.groups_overview(fetch_domain)
+            elif route == "group":
+                data = v2.group_detail(arg("id"), fetch_domain)
+            elif route == "novels":
+                data = v2.novels(fetch_domain)
+            elif route == "novel":
+                data = v2.novel_detail(arg("id"), fetch_domain)
+            else:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "未知的 v2 接口")
+                return
+        except Exception as exc:  # noqa: BLE001
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"v2 接口失败：{exc}")
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True, "data": data})
 
     def do_POST(self) -> None:
         request = urlparse(self.path)
