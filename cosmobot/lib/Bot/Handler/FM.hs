@@ -805,6 +805,17 @@ repeatCommandHandler =
           void (Chat.replyTo message reply)
         _ -> pure ()
 
+-- | 解析 domain /contests/today 的 items：[(contest, group_id)]（2026-11-15）。
+parseContestTodayItems :: Aeson.Value -> [(Text, Text)]
+parseContestTodayItems =
+  fromMaybe [] . AesonTypes.parseMaybe
+    (Aeson.withObject "today" \o -> o Aeson..: "items" >>= traverse one)
+  where
+    one = Aeson.withObject "item" \item' -> do
+      contest <- item' Aeson..: "contest"
+      groupId <- item' Aeson..:? "group_id" Aeson..!= ""
+      pure (contest, groupId)
+
 allCompetitionRankQuickHandler
   :: (HTTP.HTTP :> es, Chat.Chat :> es) => RouteHandler es
 allCompetitionRankQuickHandler =
@@ -815,33 +826,31 @@ allCompetitionRankQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
-        -- 2026-11-15 所有者：全部排行榜 = 所有赛文，不只是四大赛事。
-        -- 所有图装进同一条消息（ReplyBody 一行一个 [image]），QQ 会折叠成一组。
+        -- 2026-11-15 所有者：全部 = **官网能查的排行榜**（四大赛事 + 各群群赛文 + 555），
+        -- 清单来自 domain /contests/today：今天确实有成绩的才列，没有的不编。
+        response <- HTTP.runReq $
+          req GET (http "172.20.0.4" /: "contests" /: "today") NoReqBody jsonResponse
+            (port 8077)
         let cacheBase = maybe "0" (Text.pack . show) message.messageId
-            groupValue = case message.kind of
-              ChatGroup -> fromMaybe "" (show <$> message.chatId)
-              _ -> ""
-            -- 2026-11-15 所有者：全部排行榜 = 官网能查的赛事（含群赛文）+ 555，其它不列。
-            contests =
-              [ ("100000" :: Text, "锦标赛" :: Text)
-              , ("HB", "虎杯")
-              , ("99999", "极速杯")
-              , ("100004", "极速联赛")
-              , ("999", "群赛文")
-              , ("555", "555赛文")
+            allowed = ["HB" :: Text, "100000", "99999", "100004", "555", "999"]
+            picked =
+              [ pair
+              | pair@(contest, _) <- parseContestTodayItems (responseBody response)
+              , contest `elem` allowed
               ]
             urls =
-              [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
-                  <> "&group_id=" <> urlEncodeText groupValue
-                  <> "&limit=5&_=" <> cacheBase <> contestKey
-              | (contestKey, _) <- contests
+              [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
+                  <> "&group_id=" <> urlEncodeText groupId
+                  <> "&limit=5&_=" <> cacheBase <> contest <> groupId
+              | (contest, groupId) <- picked
               ]
-            body = Text.unlines (map ReplyBody.imageDirective urls)
-            summary =
-              Text.intercalate "、" [contestLabel | (_, contestLabel) <- contests]
-        sent <- Chat.replyTo (standaloneMessage message) body
-        when (null (rights sent)) $
-          sendStandalone message ("全部排行榜（" <> summary <> "）图片发送失败，稍后再试。")
+        if null urls
+          then sendStandalone message "今天还没有任何赛文有成绩，晚点再来看看。"
+          else do
+            let body = Text.unlines (map ReplyBody.imageDirective urls)
+            sent <- Chat.replyTo (standaloneMessage message) body
+            when (null (rights sent)) $
+              sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
 isAllCompetitionRankQuick message =
