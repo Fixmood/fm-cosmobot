@@ -391,19 +391,30 @@ contestTopQuickHandler =
         groupValue = case message.kind of
           ChatGroup -> fromMaybe "" (show <$> message.chatId)
           _ -> ""
-    response <- HTTP.runReq $
-      req GET (http "172.20.0.4" /: "contest" /: "top") NoReqBody jsonResponse
-        ( "contest" =: (contestKey :: Text)
-            <> "group_id" =: (groupValue :: Text)
-            <> "days" =: (Text.pack (show days) :: Text)
-            <> "limit" =: ("5" :: Text)
-            <> port 8077
-        )
-    case AesonTypes.parseMaybe
-      (Aeson.withObject "FM contest top" \o -> o Aeson..:? "message" Aeson..!= "")
-      (responseBody response) of
-      Just reply | not (Text.null (Text.strip reply)) -> sendStandalone message reply
-      _ -> sendStandalone message "没查到排名，可能这个赛文还没有数据。"
+    -- 2026-11-15 所有者：「fm555排行榜」只回文字，要图。
+    -- 先发排行榜图（domain 的 /contest/chart.png 默认 rank 模式）；
+    -- 图发不出去（rights 为空）再退回文字榜。
+    let chartUrl =
+          "http://172.20.0.4:8077/contest/chart.png?contest=" <> urlEncodeText contestKey
+            <> "&group_id=" <> urlEncodeText groupValue
+            <> "&days=" <> Text.pack (show days)
+            <> "&metric=speed&mode=rank"
+            <> "&_=" <> maybe "0" (Text.pack . show) message.messageId
+    sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective chartUrl)
+    when (null (rights sent)) do
+      response <- HTTP.runReq $
+        req GET (http "172.20.0.4" /: "contest" /: "top") NoReqBody jsonResponse
+          ( "contest" =: (contestKey :: Text)
+              <> "group_id" =: (groupValue :: Text)
+              <> "days" =: (Text.pack (show days) :: Text)
+              <> "limit" =: ("5" :: Text)
+              <> port 8077
+          )
+      case AesonTypes.parseMaybe
+        (Aeson.withObject "FM contest top" \o -> o Aeson..:? "message" Aeson..!= "")
+        (responseBody response) of
+        Just reply | not (Text.null (Text.strip reply)) -> sendStandalone message reply
+        _ -> sendStandalone message "没查到排名，可能这个赛文还没有数据。"
 
 isContestTopQuick :: IncomingMessage -> Bool
 isContestTopQuick message =
