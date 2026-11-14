@@ -8,6 +8,13 @@
 <meta name="robots" content="noindex,nofollow">
 <title>FM Console · 后台控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8cff'/%3E%3Ctext x='16' y='22' font-family='Segoe UI,sans-serif' font-size='14' font-weight='700' fill='%23070a10' text-anchor='middle'%3EFM%3C/text%3E%3C/svg%3E">
+<script>
+/* 主题引导：在样式表之前恢复用户偏好，避免浅色/深色闪烁（v3） */
+try {
+  var savedTheme = localStorage.getItem('fm-console-theme');
+  document.documentElement.setAttribute('data-theme', savedTheme === 'light' ? 'light' : 'dark');
+} catch (err) { /* 隐私模式：保持默认深色 */ }
+</script>
 <link rel="stylesheet" href="/static/console.css">
 </head>
 <body>
@@ -102,7 +109,7 @@
       <button class="sidebar-link sidebar-logout" id="sidebar-logout" type="button">
         <svg class="ico"><use href="#i-logout"/></svg><span>退出登录</span>
       </button>
-      <div class="sidebar-version">FM Console v2 · <span id="build-stamp">native / 0 构建</span></div>
+      <div class="sidebar-version">FM Console v3 · <span id="build-stamp">native / 0 构建 · 26 视图</span></div>
     </div>
   </aside>
 
@@ -202,5 +209,6 @@
 
 <script src="/static/echarts.min.js"></script>
 <script src="/static/console.js"></script>
+<script src="/static/pages-v3.js"></script>
 </body>
 </html>

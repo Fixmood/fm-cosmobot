@@ -17,7 +17,7 @@
 /* ── 1. 常量与工具 ─────────────────────────────────────────────────────── */
 
 const APP = {
-  version: '2.0.0',
+  version: '3.0.0',
   title: 'FM Console',
   autoRefresh: false,
   autoRefreshMs: 10000,
