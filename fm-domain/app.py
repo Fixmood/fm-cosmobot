@@ -6856,6 +6856,14 @@ class Api(BaseHTTPRequestHandler):
                     if user_id and user_id not in best:
                         best[user_id] = item
                 return self.json({"date": competition_date, "rows": list(best.values())})
+            if request.path == "/reports/all-ranks.png":
+                db = connect(self.db_path)
+                try:
+                    room = (query.get("group_id", [""])[0] or "").strip()
+                    top_n = query_int(query, "limit", 5, 1, 10)
+                    return self.bytes(render_all_ranks(db, room, top_n), "image/png")
+                finally:
+                    db.close()
             if request.path == "/reports/ai-leaderboard.png":
                 competition_date = query.get("date", [""])[0].strip()
                 return self.bytes(render_ai_leaderboard(db, competition_date), "image/png")
@@ -7753,6 +7761,134 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     output = io.BytesIO()
     image.save(output, "PNG", optimize=True)
     return output.getvalue()
+
+
+def _official_rows_for(db, key, label, room, limit):
+    """官方赛排行榜：官网实时优先，今日官网成绩库兜底。"""
+    from datetime import date
+    today = date.today().isoformat()
+
+    def canon(value):
+        parts = [p for p in re.split(r"[\u300c\u300d\u300e\u300f\uff08\uff09()\[\]\u3010\u3011\s]+", value or "") if len(p) >= 2]
+        latin = [p for p in parts if re.fullmatch(r"[A-Za-z0-9_]+", p)]
+        return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
+
+    archive = {}
+    for item in db.execute(
+        "SELECT user_name, speed, source_json FROM competition_scores WHERE competition_date=? AND source_group=?",
+        (today, label),
+    ).fetchall():
+        name = str(item["user_name"] or "?")
+        try:
+            payload = json.loads(item["source_json"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        archive[canon(name)] = {"user_name": name, "best": float(item["speed"] or 0),
+                                "accuracy": float(payload.get("acc") or payload.get("accuracy") or 0)}
+    live = contest_live_rows(key, room)
+    merged = {}
+    for item in live:
+        name = str(item.get("name") or "?")
+        ident = canon(name) or name
+        base = archive.get(ident, {})
+        merged[ident] = {"user_name": name,
+                         "best": float(item.get("speed") or base.get("best") or 0),
+                         "accuracy": float(item.get("acc") or base.get("accuracy") or 0)}
+    for ident, base in archive.items():
+        merged.setdefault(ident, base)
+    return sorted(merged.values(), key=lambda i: -float(i["best"] or 0))[:limit]
+
+
+def render_all_ranks(db, group_id: str, limit: int = 5) -> bytes:
+    """「全部排行榜」：各官方赛文统一表格风格，叠成一张图。"""
+    from PIL import Image, ImageDraw, ImageFont
+    from datetime import date
+
+    sections = [("100000", "锦标赛"), ("HB", "虎杯"), ("99999", "极速杯"), ("100004", "极速联赛")]
+    font_path = os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc")
+    try:
+        font = lambda size: ImageFont.truetype(font_path, size)
+    except Exception:
+        font = lambda size: ImageFont.load_default()
+
+    data = [(label, _official_rows_for(db, key, label, "", limit)) for key, label in sections]
+    row_h = 46
+    header = 150
+    per_section = 44 + max(1, limit) * row_h + 18
+    height = header + len(data) * per_section + 60
+    width = 1240
+    image = Image.new("RGB", (width, height), (20, 24, 31))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
+    draw.text((48, 38), "FM 赛文排行榜 · 全部", font=font(40), fill=(244, 247, 252))
+    draw.text((48, 98), f"{date.today().isoformat()}  |  锦标赛 / 虎杯 / 极速杯 / 极速联赛  |  今日  |  官网优先",
+              font=font(22), fill=(159, 172, 193))
+
+    GOLD, SILVER, BRONZE = (255, 207, 92), (196, 204, 216), (214, 150, 96)
+    DIMMED = (128, 141, 160)
+
+    def speed_color(value):
+        if value < 100:
+            return (145, 164, 190)
+        if value < 130:
+            return (100, 181, 246)
+        if value < 150:
+            return (91, 219, 194)
+        if value < 180:
+            return GOLD
+        if value < 200:
+            return (255, 154, 102)
+        return (239, 116, 166)
+
+    def accuracy_color(value):
+        if value <= 0:
+            return DIMMED
+        if value < 90:
+            return (246, 116, 130)
+        if value < 95:
+            return (255, 154, 102)
+        if value < 98:
+            return (91, 219, 194)
+        return (126, 224, 156)
+
+    y = header
+    for label, rows in data:
+        draw.text((48, y), f"FM {label}排行榜", font=font(30), fill=(235, 239, 245))
+        draw.text((300, y + 8), "（今日 · 官网优先）", font=font(18), fill=DIMMED)
+        y += 44
+        draw.rounded_rectangle((40, y, 1200, y + 40), radius=6, fill=(35, 43, 55))
+        for x, name in [(52, "排名"), (120, "成员"), (620, "速度"), (860, "键准")]:
+            draw.text((x, y + 8), name, font=font(18), fill=(184, 196, 214))
+        y += 46
+        if not rows:
+            draw.text((60, y + 4), "今天官网还没有这个赛文的成绩。", font=font(20), fill=(200, 120, 120))
+            y += 40
+        for index, item in enumerate(rows, 1):
+            fill = (29, 36, 47) if index % 2 else (25, 31, 41)
+            draw.rounded_rectangle((40, y, 1200, y + row_h - 8), radius=6, fill=fill)
+            rank_color = [GOLD, SILVER, BRONZE][index - 1] if index <= 3 else (219, 226, 237)
+            raw_name = str(item.get("user_name") or "?")
+            name = raw_name
+            while name and draw.textlength(name, font=font(20)) > 460:
+                name = name[:-1]
+            if name != raw_name:
+                name += "…"
+            speed = float(item["best"] or 0)
+            acc = float(item.get("accuracy") or 0)
+            draw.text((58, y + 6), str(index), font=font(20), fill=rank_color)
+            draw.text((120, y + 6), name, font=font(20), fill=(235, 239, 245))
+            draw.text((620, y + 6), f"{speed:.2f}", font=font(20), fill=speed_color(speed))
+            draw.text((860, y + 6), f"{acc:.2f}%" if acc > 0 else "—", font=font(20), fill=accuracy_color(acc))
+            y += row_h
+        y += 10
+
+    draw.text((48, height - 36), "颜色：速度分档（<130 蓝 / <150 青 / <180 金 / <200 橙 / ≥200 粉）· 键准 ≥98 绿、<90 红",
+              font=font(15), fill=(96, 106, 122))
+    output = io.BytesIO()
+    image.save(output, "PNG", optimize=True)
+    return output.getvalue()
+
+
 
 
 if __name__ == "__main__":

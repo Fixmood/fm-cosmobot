@@ -324,8 +324,7 @@ aiContestQuickHandler =
           <> body <> "\n-----第555段 " <> competitionDate <> "-FM赛文"
 
 liveCompetitionQuickHandler
-  :: (HTTP.HTTP :> es, Chat.Chat :> es)
-  => RouteHandler es
+  :: (HTTP.HTTP :> es, Chat.Chat :> es) => RouteHandler es
 liveCompetitionQuickHandler =
   stopOn (matching isLiveCompetitionRankQuick) \message _ -> do
     enabled <- case (message.kind, message.chatId) of
@@ -334,28 +333,19 @@ liveCompetitionQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
-        response <- HTTP.runReq $
-          req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
-            ( "source" =: ("锦标赛" :: Text)
-              <> "group_id" =: maybe ("" :: Text) show message.chatId
-              <> "soft" =: True
-              <> port 8077
-            )
-        case parseLiveCompetition (responseBody response :: Aeson.Value) of
-          Just ("ok", kind, actualDate, _) -> do
-            let sourceKey = if kind == "group" then maybe "" show message.chatId else kind
-                cacheKey = fromMaybe "refresh" (messageIdText <$> message.messageId)
-                imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source="
-                  <> sourceKey <> "&date=" <> actualDate <> "&combined=1&v=" <> cacheKey
-            void $ Chat.replyTo (standaloneMessage message)
-              "😻 FM：正在调用 fm_live_competition_rank 工具…"
-            sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
-            when (null (rights sent)) $
-              sendStandalone message "锦标赛排行榜图片发送失败。"
-          Just (_, _, _, errorMessage) ->
-            sendStandalone message ("锦标赛排行榜获取失败：" <> errorMessage)
-          Nothing ->
-            sendStandalone message "锦标赛排行榜获取失败：领域服务返回格式不正确。"
+        -- 2026-11-15 所有者：不要进度行（「正在调用 xx 工具」），也不要旧风格图；
+        -- 统一用 domain 的表格风格排行榜（官网优先、只取今日）。
+        let groupValue = case message.kind of
+              ChatGroup -> fromMaybe "" (show <$> message.chatId)
+              _ -> ""
+            cacheKey = maybe "0" (Text.pack . show) message.messageId
+            imageUrl =
+              "http://172.20.0.4:8077/contest/rank-table.png?contest=100000&group_id="
+                <> urlEncodeText groupValue
+                <> "&limit=12&_=" <> cacheKey
+        sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
+        when (null (rights sent)) $
+          sendStandalone message "锦标赛排行榜图片发送失败，稍后再试。"
 
 isLiveCompetitionRankQuick :: IncomingMessage -> Bool
 isLiveCompetitionRankQuick message =
@@ -816,8 +806,7 @@ repeatCommandHandler =
         _ -> pure ()
 
 allCompetitionRankQuickHandler
-  :: (HTTP.HTTP :> es, Chat.Chat :> es)
-  => RouteHandler es
+  :: (HTTP.HTTP :> es, Chat.Chat :> es) => RouteHandler es
 allCompetitionRankQuickHandler =
   stopOn (matching isAllCompetitionRankQuick) \message _ -> do
     enabled <- case (message.kind, message.chatId) of
@@ -826,79 +815,13 @@ allCompetitionRankQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
-        void $ Chat.replyTo (standaloneMessage message)
-          "😻 FM：正在调用 fm_live_competition_rank 工具…"
-        results <- traverse (fetchRank message)
-          [ ("champ" :: Text, "锦标赛" :: Text)
-          , ("tiger", "虎杯")
-          , ("comp", "极速杯")
-          , ("540678308", "极速联赛")
-          , ("1021522088", "五笔修炼基地")
-          , ("151040026", "帝隆")
-          , ("776227233", "梦幻打字阁")
-          , ("391047371", "092五笔正规闲聊群")
-          , ("201323122", "倉頡之友")
-          , ("488748631", "小鹤进修班")
-          ]
-        aiResult <- fetchAiRank
-        let nodes = rights (results <> [aiResult])
-        if null nodes
-          then sendStandalone message "全部排行榜获取失败，请稍后再试。"
-          else do
-            sent <- Chat.sendMergedForward (standaloneMessage message) nodes
-            case sent of
-              Right _ -> sendStandalone message "😻 FM：全部排行榜已合并转发。"
-              Left errorText -> sendStandalone message ("全部排行榜合并转发失败：" <> errorText)
-  where
-    fetchRank targetMessage (sourceKey, label) = do
-      response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
-          ( "source" =: sourceKey
-            <> "group_id" =: maybe ("" :: Text) show targetMessage.chatId
-            <> "soft" =: True
-            <> port 8077
-          )
-      case AesonTypes.parseMaybe parseRank (responseBody response :: Aeson.Value) of
-        Just ("ok", actualDate) ->
-          pure $ Right (forwardNode label
-            ("http://172.20.0.4:8077/reports/live-competition.png?source="
-              <> sourceKey <> "&date=" <> actualDate <> "&combined=1"))
-        Just (_, _) -> pure (Left label)
-        Nothing -> pure (Left label)
-    fetchAiRank = do
-      response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
-          (port 8077)
-      case AesonTypes.parseMaybe parseAiRank (responseBody response :: Aeson.Value) of
-        Just (actualDate, rows) | not (null rows) ->
-          pure $ Right (forwardNode ("555 AI赛文榜" :: Text)
-            ("http://172.20.0.4:8077/reports/ai-leaderboard.png?date=" <> actualDate))
-        _ -> pure (Left "555 AI赛文榜")
-    parseAiRank = Aeson.withObject "FM AI leaderboard" $ \o ->
-      (,) <$> o Aeson..:? "date" Aeson..!= ("" :: Text)
-          <*> o Aeson..:? "rows" Aeson..!= ([] :: [Aeson.Value])
-    parseRank = Aeson.withObject "FM live rank" $ \o ->
-      (,)
-        <$> o Aeson..:? "status" Aeson..!= ("error" :: Text)
-        <*> o Aeson..:? "date" Aeson..!= ""
-    forwardNode label imageUrl =
-      Aeson.object
-        [ "type" Aeson..= Aeson.String "node"
-        , "data" Aeson..= Aeson.object
-            [ "name" Aeson..= Aeson.String "FM"
-            , "uin" Aeson..= Aeson.String "3471095459"
-            , "content" Aeson..= [
-                Aeson.object
-                  [ "type" Aeson..= Aeson.String "text"
-                  , "data" Aeson..= Aeson.object ["text" Aeson..= label]
-                  ]
-              , Aeson.object
-                  [ "type" Aeson..= Aeson.String "image"
-                  , "data" Aeson..= Aeson.object ["file" Aeson..= imageUrl]
-                  ]
-              ]
-            ]
-        ]
+        -- 2026-11-15：全部排行榜也统一风格（锦标赛/虎杯/极速杯/极速联赛 各一段表格）。
+        let cacheKey = maybe "0" (Text.pack . show) message.messageId
+            imageUrl =
+              "http://172.20.0.4:8077/reports/all-ranks.png?limit=5&_=" <> cacheKey
+        sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
+        when (null (rights sent)) $
+          sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
 isAllCompetitionRankQuick message =
