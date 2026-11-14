@@ -7520,7 +7520,7 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     today = date.today().isoformat()
     room = group if scope == "group" else ""
 
-    official = key in ("HB", "100000", "99999", "100004")
+    official = key in ("HB", "100000", "99999", "100004") or (key == "999" and room in CONTEST_GROUP_LIVE_GROUPS)
     source_label = ""
     rows_data = []
 
@@ -7531,27 +7531,28 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
             return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
 
         archive = {}
-        for item in db.execute(
-            "SELECT user_name, speed, source_json FROM competition_scores "
-            "WHERE competition_date=? AND source_group=?", (today, label)
-        ).fetchall():
-            name = str(item["user_name"] or "?")
-            try:
-                payload = json.loads(item["source_json"] or "{}")
-            except (TypeError, ValueError):
-                payload = {}
-            word_rate = float(payload.get("word_rate") or payload.get("word_ratio") or 0)
-            archive[canonical_name(name)] = {
-                "user_name": name,
-                "best": float(item["speed"] or 0),
-                "accuracy": float(payload.get("acc") or payload.get("accuracy") or 0),
-                "key": float(payload.get("key") or payload.get("hit_rate") or 0),
-                "code_length": float(payload.get("code_length") or payload.get("kpw") or 0),
-                "word_rate": word_rate * 100 if 0 < word_rate <= 1 else word_rate,
-                "correction": float(payload.get("correction_count") or payload.get("correction") or 0),
-                "n": 1,
-            }
-
+        # 群赛文（999）没有单独的官方归档表，只走官网实时；四大赛文才有今日官网成绩库
+        if scope != "group":
+            for item in db.execute(
+                "SELECT user_name, speed, source_json FROM competition_scores "
+                "WHERE competition_date=? AND source_group=?", (today, label)
+            ).fetchall():
+                name = str(item["user_name"] or "?")
+                try:
+                    payload = json.loads(item["source_json"] or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                word_rate = float(payload.get("word_rate") or payload.get("word_ratio") or 0)
+                archive[canonical_name(name)] = {
+                    "user_name": name,
+                    "best": float(item["speed"] or 0),
+                    "accuracy": float(payload.get("acc") or payload.get("accuracy") or 0),
+                    "key": float(payload.get("key") or payload.get("hit_rate") or 0),
+                    "code_length": float(payload.get("code_length") or payload.get("kpw") or 0),
+                    "word_rate": word_rate * 100 if 0 < word_rate <= 1 else word_rate,
+                    "correction": float(payload.get("correction_count") or payload.get("correction") or 0),
+                    "n": 1,
+                }
         live = contest_live_rows(key, room)
         merged_official = {}
         for item in live:
@@ -7912,13 +7913,15 @@ def render_all_ranks(db, group_id: str, limit: int = 5) -> bytes:
 
 
 def contests_today_payload(db, group_id: str) -> dict:
-    """今日有成绩的全部赛文清单（后台/机器人「全部排行榜」用）。"""
-    from datetime import date, timedelta
+    """今日有成绩的全部赛文清单：官网四赛 + 555 + 每个可查群的群赛文（空的不列，不编造）。"""
+    from datetime import date
     today = date.today().isoformat()
     group = (group_id or "").strip()
     official = {"HB", "100000", "99999", "100004"}
     items = []
     for key, (label, scope) in CONTEST_LABELS.items():
+        if key == "999":
+            continue  # 群赛文按群单独列
         room = group if scope == "group" else ""
         count = 0
         try:
@@ -7929,8 +7932,7 @@ def contests_today_payload(db, group_id: str) -> dict:
                 ).fetchone()
                 count = int(row["n"] if row and row["n"] else 0)
                 if count == 0:
-                    live = contest_live_rows(key, room)
-                    count = len(live)
+                    count = len(contest_live_rows(key, room))
             else:
                 row = db.execute(
                     "SELECT COUNT(*) n FROM contest_scores WHERE contest_key=? AND group_id=? AND score_date=?",
@@ -7940,11 +7942,28 @@ def contests_today_payload(db, group_id: str) -> dict:
         except Exception:
             count = 0
         if count > 0:
-            items.append({"contest": key, "label": label, "scope": scope,
-                          "group_id": room, "count": count})
+            items.append({"contest": key, "label": label, "scope": scope, "group_id": room, "count": count})
+
+    # 群赛文：所有官网可查的群各列一行（有今日成绩才列）
+    groups = [group] if group else list(CONTEST_GROUP_LIVE_GROUPS)
+    for gid in groups:
+        try:
+            row = db.execute(
+                "SELECT COUNT(*) n FROM contest_scores WHERE contest_key='999' AND group_id=? AND score_date=?",
+                (gid, today),
+            ).fetchone()
+            count = int(row["n"] if row and row["n"] else 0)
+            if count == 0:
+                count = len(contest_live_rows("999", gid))
+        except Exception:
+            count = 0
+        if count > 0:
+            name = group_display_name(db, gid) or gid
+            items.append({"contest": "999", "label": f"{name}赛文", "scope": "group",
+                          "group_id": gid, "count": count, "group_name": name})
+
     items.sort(key=lambda item: -int(item["count"]))
     return {"ok": True, "date": today, "count": len(items), "items": items}
-
 
 
 
