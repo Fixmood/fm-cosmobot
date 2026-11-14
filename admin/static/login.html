@@ -127,7 +127,7 @@
       if (!res.ok || (data && data.ok === false)) {
         throw new Error((data && (data.error || data.message)) || `登录失败（HTTP ${res.status}）`);
       }
-      location.replace('/');
+      location.replace('/console');
     } catch (err) {
       fail(err.message || '登录失败');
       submit.disabled = false;

@@ -1601,6 +1601,9 @@ class Api(BaseHTTPRequestHandler):
         elif request.path.startswith("/api/collections/"):
             self.collection_get(request.path.removeprefix("/api/collections/"), parse_qs(request.query))
         elif request.path == "/":
+            # 2026-11-14：根路径改为新控制台（旧版挪到 /classic）
+            self.send_static("console.html")
+        elif request.path == "/classic":
             self.send_static("index.html")
         elif request.path.startswith("/static/"):
             self.send_static(request.path.removeprefix("/static/"))
