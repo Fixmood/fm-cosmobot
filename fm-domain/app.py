@@ -6981,6 +6981,14 @@ class Api(BaseHTTPRequestHandler):
                     return self.bytes(render_contest_chart(db, key, group_id, name, scope, days, metric), "image/png")
                 finally:
                     db.close()
+            if request.path == "/contest/rank-table.png":
+                db = connect(self.db_path)
+                try:
+                    if not contest_chart_lookup(db, query):
+                        return self.json({"error": "unknown contest"}, HTTPStatus.BAD_REQUEST)
+                    return self.bytes(render_contest_rank_table(db, query), "image/png")
+                finally:
+                    db.close()
             if request.path == "/stats":
                 return self.json(stats_response(db))
             if request.path == "/archive/status":
@@ -7477,6 +7485,144 @@ def merge_contest_rows(rows):
             current["user_name"] = name
     return sorted(merged.values(), key=lambda item: -float(item.get("best") or 0))
 
+
+
+def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
+    """赛文排行榜「表格风格」图（与 FM AI赛文排行榜 同一套视觉）。
+
+    2026-11-15：标题写清哪个赛文（虎杯/锦标赛/…）；七列数据齐全（击键/码长/打词率/重打/键准）；数据来自 contest_scores。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    raw_contest = query_value(query, "contest").strip()
+    key = resolve_contest_key(raw_contest) or ""
+    label, scope = CONTEST_LABELS.get(key, (raw_contest or "赛文", "global"))
+    group = resolve_group_id(db, query_value(query, "group_id").strip())
+    days = query_int(query, "days", 0, 0, 3660)
+    limit = query_int(query, "limit", 12, 1, 60)
+    room = group if scope == "group" else ""
+
+    sql = ("SELECT user_id, user_name, speed, accuracy, code_length, word_rate, raw_text "
+           "FROM contest_scores WHERE contest_key=? AND group_id=?")
+    params = [key, room]
+    if days > 0:
+        from datetime import date, timedelta
+        since = (date.today() - timedelta(days=days - 1)).isoformat()
+        sql += " AND score_date >= ?"
+        params.append(since)
+    sql += " ORDER BY speed DESC"
+    records = db.execute(sql, tuple(params)).fetchall()
+
+    def canonical(value):
+        parts = [p for p in re.split(r"[\u300c\u300d\u300e\u300f\uff08\uff09()\[\]\u3010\u3011\s]+", value or "") if len(p) >= 2]
+        latin = [p for p in parts if re.fullmatch(r"[A-Za-z0-9_]+", p)]
+        return max(latin, key=len) if latin else (max(parts, key=len) if parts else (value or ""))
+
+    merged = {}
+    for row in records:
+        name = str(row["user_name"] or row["user_id"] or "?")
+        ident = canonical(name) or str(row["user_id"] or name)
+        entry = merged.get(ident)
+        if entry is None:
+            entry = {"user_name": name, "best": 0.0, "accuracy": 0.0, "code_length": 0.0,
+                     "word_rate": 0.0, "key": 0.0, "correction": 0.0, "n": 0}
+            merged[ident] = entry
+        speed = float(row["speed"] or 0)
+        entry["n"] += 1
+        if speed >= float(entry["best"] or 0):
+            entry["best"] = speed
+            if len(name) >= len(str(entry["user_name"] or "")):
+                entry["user_name"] = name
+            entry["accuracy"] = float(row["accuracy"] or 0)
+            entry["code_length"] = float(row["code_length"] or 0)
+            word_rate = float(row["word_rate"] or 0)
+            entry["word_rate"] = word_rate * 100 if word_rate and word_rate <= 1 else word_rate
+            try:
+                payload = json.loads(row["raw_text"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            entry["key"] = float(payload.get("key") or payload.get("hit_rate") or 0)
+            entry["correction"] = float(payload.get("correction") or payload.get("correction_count") or 0)
+
+    rows = sorted(merged.values(), key=lambda item: -float(item["best"] or 0))[:limit]
+
+    def speed_color(value):
+        if value < 100:
+            return (145, 164, 190)
+        if value < 130:
+            return (100, 181, 246)
+        if value < 150:
+            return (91, 219, 194)
+        if value < 180:
+            return (247, 199, 95)
+        if value < 200:
+            return (255, 154, 102)
+        return (239, 116, 166)
+
+    def accuracy_color(value):
+        return (246, 116, 130) if value < 95 else (91, 219, 194)
+
+    font_path = os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc")
+    try:
+        font = lambda size: ImageFont.truetype(font_path, size)
+    except Exception:
+        font = lambda size: ImageFont.load_default()
+
+    where = ""
+    if scope == "group" and group:
+        where = f"（{group_display_name(db, group)}）"
+    elif scope != "group":
+        where = "（全群）"
+    when = "全部时间" if days <= 0 or days >= 3660 else f"最近 {days} 天"
+    title = "FM AI赛文排行榜" if key == "555" else f"FM {label}排行榜"
+    subtitle = f"{time.strftime('%Y-%m-%d')}  |  {label}{where}  |  {when}  |  成绩库"
+
+    width = 1240
+    row_height = 74
+    height = 230 + max(1, len(rows)) * row_height + 70
+    image = Image.new("RGB", (width, height), (20, 24, 31))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
+    draw.text((48, 38), title, font=font(40), fill=(244, 247, 252))
+    draw.text((48, 98), subtitle, font=font(22), fill=(159, 172, 193))
+    columns = [(52, "排名"), (120, "成员"), (500, "速度"), (620, "击键"),
+               (730, "码长"), (830, "打词率"), (960, "重打"), (1050, "键准")]
+    draw.rounded_rectangle((40, 154, 1200, 210), radius=8, fill=(35, 43, 55))
+    for x, name in columns:
+        draw.text((x, 168), name, font=font(20), fill=(184, 196, 214))
+    if not rows:
+        text = f"最近 {days} 天还没有这个赛文的成绩。" if days > 0 else "还没有这个赛文的成绩记录。"
+        draw.text((52, 240), text, font=font(24), fill=(200, 120, 120))
+    for index, item in enumerate(rows, 1):
+        top = 224 + (index - 1) * row_height
+        fill = (29, 36, 47) if index % 2 else (25, 31, 41)
+        draw.rounded_rectangle((40, top, 1200, top + 64), radius=7, fill=fill)
+        rank_color = (247, 199, 95) if index <= 3 else (219, 226, 237)
+        raw_name = str(item.get("user_name") or "unknown")
+        name = raw_name
+        while name and draw.textlength(name, font=font(21)) > 330:
+            name = name[:-1]
+        if name != raw_name:
+            name += "…"
+        speed = float(item.get("best") or 0)
+        draw.text((58, top + 18), str(index), font=font(22), fill=rank_color)
+        draw.text((120, top + 18), name, font=font(21), fill=(235, 239, 245))
+        draw.text((500, top + 18), f"{speed:.2f}", font=font(22), fill=speed_color(speed))
+        key_val = float(item.get("key") or 0)
+        draw.text((620, top + 18), f"{key_val:.2f}" if key_val > 0 else "—", font=font(22), fill=(113, 164, 255))
+        code_len = float(item.get("code_length") or 0)
+        draw.text((730, top + 18), f"{code_len:.2f}" if code_len > 0 else "—", font=font(22), fill=(159, 172, 193))
+        wr = float(item.get("word_rate") or 0)
+        draw.text((830, top + 18), f"{wr:.2f}%" if wr > 0 else "—", font=font(22), fill=(159, 172, 193))
+        corr = float(item.get("correction") or 0)
+        draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=(159, 172, 193))
+        acc = float(item.get("accuracy") or 0)
+        draw.text((1050, top + 18), f"{acc:.2f}%" if acc > 0 else "—", font=font(22), fill=accuracy_color(acc))
+    footer = f"共 {len(rows)} 人 | 每人保留最高速度（成绩条数 {sum(int(r.get('n') or 0) for r in rows)}）"
+    draw.text((48, height - 48), footer, font=font(18), fill=(128, 141, 160))
+    output = io.BytesIO()
+    image.save(output, "PNG", optimize=True)
+    return output.getvalue()
 
 
 if __name__ == "__main__":
