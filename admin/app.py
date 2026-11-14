@@ -1191,7 +1191,7 @@ def now_snapshot() -> dict:
     import time
 
     config_path = "/runtime/config.toml"
-    config = _parse_toml_scalars(_read_text(config_path))
+    config = _parse_toml_scalars(_read_text(config_path, 200000))
     try:
         config_mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(config_path)))
     except OSError:
