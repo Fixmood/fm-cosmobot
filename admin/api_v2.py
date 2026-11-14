@@ -335,7 +335,7 @@ def overview(domain: Callable[[str], Any], rpc: Callable[[str, Any], Any]) -> di
         counts["senders"] = row["n"]
     last = _query("SELECT MAX(recorded_at) at FROM chat_log")
     return {
-        "config": config,
+        "config": _mask_secret_values(config),
         "chat_model": chat_models[0] if chat_models else "",
         "reasoning_effort": efforts[0] if efforts else "",
         "health": health,
@@ -3047,3 +3047,19 @@ ROUTES: dict[str, Callable[..., dict]] = {
     "backup/list": backup_list,
     "selftest": selftest_internal,
 }
+
+def _mask_secret_values(value):
+    """把 config 里的 api_key/token/secret 打成 ***masked***（2026-11-15 QA P1）。"""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if isinstance(item, (dict, list)):
+                out[key] = _mask_secret_values(item)
+            elif isinstance(item, str) and any(hint in str(key).lower() for hint in ("api_key", "apikey", "token", "secret", "password")):
+                out[key] = "***masked***"
+            else:
+                out[key] = item
+        return out
+    if isinstance(value, list):
+        return [_mask_secret_values(item) for item in value]
+    return value

@@ -2072,6 +2072,11 @@ class Api(BaseHTTPRequestHandler):
         query = parse_qs(request.query)
         arg = lambda name, default="": (query.get(name, [default])[0] or default)
         route = request.path[len("/api/v2/"):].strip("/")
+
+        # 2026-11-15 QA P0 修复：v2 的所有写操作必须管理员会话。
+        # 之前 actions/run、humanlike 等分支漏了 require_admin，只读 token 可发消息/改拟人配置。
+        if self.command == "POST" and not self.require_admin():
+            return
         actor = (self.headers.get("X-FM-Admin-Actor") or "admin").strip()[:80] or "admin"
 
         def method_not_allowed(allow: str) -> None:
@@ -2210,7 +2215,10 @@ class Api(BaseHTTPRequestHandler):
                     data = v2.config_toml_write(payload.get("content"), actor)
                     record_audit("save", "config.toml", str(data.get("sha256") or "")[:12], actor)
                 elif self.command == "GET":
+                    session_ro = self.current_session() or {}
                     data = v2.config_toml_read()
+                    if not session_ro.get("is_admin"):
+                        data = _mask_config_payload(data)
                 else:
                     method_not_allowed("GET, POST")
                     return
@@ -3008,6 +3016,28 @@ def main() -> None:
     read_auth()
     print(f"FM Control Center listening on http://{host}:{port}", flush=True)
     ThreadingHTTPServer((host, port), Api).serve_forever()
+
+
+
+def _mask_config_payload(payload):
+    """只读会话读取 config.toml 时把 api_key/token/secret 之类值打码（2026-11-15 QA P1）。"""
+    if not isinstance(payload, dict):
+        return payload
+    result = dict(payload)
+    content = result.get("content")
+    if isinstance(content, str):
+        masked_lines = []
+        for line in content.splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key = line.split("=", 1)[0].strip().lower()
+                if any(hint in key for hint in ("api_key", "apikey", "token", "secret", "password", "passwd", "authorization")):
+                    masked_lines.append(line.split("=", 1)[0].rstrip() + ' = "***masked***"')
+                    continue
+            masked_lines.append(line)
+        result["content"] = "\n".join(masked_lines)
+        result["masked"] = True
+    return result
+
 
 
 if __name__ == "__main__":
