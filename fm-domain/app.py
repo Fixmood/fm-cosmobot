@@ -7488,9 +7488,11 @@ def merge_contest_rows(rows):
 
 
 def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
-    """赛文排行榜「表格风格」图（与 FM AI赛文排行榜 同一套视觉）。
+    """赛文排行榜「表格风格」图（对齐 FM AI赛文排行榜 与常见电竞/打字榜的配色约定）。
 
-    2026-11-15：标题写清哪个赛文（虎杯/锦标赛/…）；七列数据齐全（击键/码长/打词率/重打/键准）；数据来自 contest_scores。
+    配色参考（2026-11-15 调研）：名次徽章金/银/铜（常见于 Monkeytype、各类排行卡），
+    速度按档位渐变（沿用本项目 555 AI 榜的 6 档），键准 <90 红 / 90-95 橙 / >=95 青 / >=98 绿，
+    重打越多越红（0-5 绿、6-15 蓝、16-25 橙、>25 红），打词率越高越绿。
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -7546,21 +7548,64 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
 
     rows = sorted(merged.values(), key=lambda item: -float(item["best"] or 0))[:limit]
 
+    GOLD, SILVER, BRONZE = (255, 207, 92), (196, 204, 216), (214, 150, 96)
+    ROW_TINTS = [(48, 42, 26), (37, 40, 48), (43, 36, 29)]
+    DIMMED = (128, 141, 160)
+    CYAN = (91, 219, 194)
+    RED = (246, 116, 130)
+
     def speed_color(value):
         if value < 100:
             return (145, 164, 190)
         if value < 130:
             return (100, 181, 246)
         if value < 150:
-            return (91, 219, 194)
+            return CYAN
         if value < 180:
-            return (247, 199, 95)
+            return GOLD
         if value < 200:
             return (255, 154, 102)
         return (239, 116, 166)
 
     def accuracy_color(value):
-        return (246, 116, 130) if value < 95 else (91, 219, 194)
+        if value <= 0:
+            return DIMMED
+        if value < 90:
+            return RED
+        if value < 95:
+            return (255, 154, 102)
+        if value < 98:
+            return CYAN
+        return (126, 224, 156)
+
+    def correction_color(value):
+        if value <= 0:
+            return DIMMED
+        if value <= 5:
+            return (126, 224, 156)
+        if value <= 15:
+            return (113, 164, 255)
+        if value <= 25:
+            return (255, 154, 102)
+        return RED
+
+    def word_rate_color(value):
+        if value <= 0:
+            return DIMMED
+        if value >= 55:
+            return (126, 224, 156)
+        if value >= 45:
+            return CYAN
+        return DIMMED
+
+    def key_color(value):
+        if value <= 0:
+            return DIMMED
+        if value >= 9:
+            return (255, 154, 102)
+        if value >= 7:
+            return (100, 181, 246)
+        return DIMMED
 
     font_path = os.environ.get("FM_REPORT_FONT", "/assets/msyh.ttc")
     try:
@@ -7579,7 +7624,7 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
 
     width = 1240
     row_height = 74
-    height = 230 + max(1, len(rows)) * row_height + 70
+    height = 230 + max(1, len(rows)) * row_height + 96
     image = Image.new("RGB", (width, height), (20, 24, 31))
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
@@ -7595,9 +7640,15 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         draw.text((52, 240), text, font=font(24), fill=(200, 120, 120))
     for index, item in enumerate(rows, 1):
         top = 224 + (index - 1) * row_height
-        fill = (29, 36, 47) if index % 2 else (25, 31, 41)
+        fill = ROW_TINTS[index - 1] if index <= 3 else ((29, 36, 47) if index % 2 else (25, 31, 41))
         draw.rounded_rectangle((40, top, 1200, top + 64), radius=7, fill=fill)
-        rank_color = (247, 199, 95) if index <= 3 else (219, 226, 237)
+        if index == 1:
+            draw.rounded_rectangle((40, top, 48, top + 64), radius=3, fill=GOLD)
+        elif index == 2:
+            draw.rounded_rectangle((40, top, 48, top + 64), radius=3, fill=SILVER)
+        elif index == 3:
+            draw.rounded_rectangle((40, top, 48, top + 64), radius=3, fill=BRONZE)
+        rank_color = [GOLD, SILVER, BRONZE][index - 1] if index <= 3 else (219, 226, 237)
         raw_name = str(item.get("user_name") or "unknown")
         name = raw_name
         while name and draw.textlength(name, font=font(21)) > 330:
@@ -7609,17 +7660,19 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         draw.text((120, top + 18), name, font=font(21), fill=(235, 239, 245))
         draw.text((500, top + 18), f"{speed:.2f}", font=font(22), fill=speed_color(speed))
         key_val = float(item.get("key") or 0)
-        draw.text((620, top + 18), f"{key_val:.2f}" if key_val > 0 else "—", font=font(22), fill=(113, 164, 255))
+        draw.text((620, top + 18), f"{key_val:.2f}" if key_val > 0 else "—", font=font(22), fill=key_color(key_val))
         code_len = float(item.get("code_length") or 0)
         draw.text((730, top + 18), f"{code_len:.2f}" if code_len > 0 else "—", font=font(22), fill=(159, 172, 193))
         wr = float(item.get("word_rate") or 0)
-        draw.text((830, top + 18), f"{wr:.2f}%" if wr > 0 else "—", font=font(22), fill=(159, 172, 193))
+        draw.text((830, top + 18), f"{wr:.2f}%" if wr > 0 else "—", font=font(22), fill=word_rate_color(wr))
         corr = float(item.get("correction") or 0)
-        draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=(159, 172, 193))
+        draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=correction_color(corr))
         acc = float(item.get("accuracy") or 0)
         draw.text((1050, top + 18), f"{acc:.2f}%" if acc > 0 else "—", font=font(22), fill=accuracy_color(acc))
     footer = f"共 {len(rows)} 人 | 每人保留最高速度（成绩条数 {sum(int(r.get('n') or 0) for r in rows)}）"
-    draw.text((48, height - 48), footer, font=font(18), fill=(128, 141, 160))
+    draw.text((48, height - 62), footer, font=font(18), fill=DIMMED)
+    legend = "颜色：速度分档（<130 蓝 / <150 青 / <180 金 / <200 橙 / ≥200 粉）· 键准 ≥98 绿、<90 红 · 重打越多越红"
+    draw.text((48, height - 36), legend, font=font(15), fill=(96, 106, 122))
     output = io.BytesIO()
     image.save(output, "PNG", optimize=True)
     return output.getvalue()
