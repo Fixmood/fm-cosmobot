@@ -815,31 +815,18 @@ allCompetitionRankQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
-        -- 2026-11-15 所有者：全部排行榜要**分开发**（每个赛文一张图，QQ 会把连续图片折叠成一组），
-        -- 不要拼成一张长图。
+        -- 2026-11-15 所有者：全部排行榜要**折叠成一条**（QQ 一条消息里多图会折叠成一组）。
+        -- ReplyBody 一行一个 [image] 指令就是「同一条消息多张图」。
         let cacheBase = maybe "0" (Text.pack . show) message.messageId
-            contests =
-              [ ("100000" :: Text, "锦标赛" :: Text)
-              , ("HB", "虎杯")
-              , ("99999", "极速杯")
-              , ("100004", "极速联赛")
+            contests = ["100000" :: Text, "HB", "99999", "100004"]
+            urls =
+              [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
+                  <> "&limit=5&_=" <> cacheBase <> contestKey
+              | contestKey <- contests
               ]
-        results <- traverse
-          (\(contestKey, contestLabel) -> do
-             let imageUrl =
-                   "http://172.20.0.4:8077/contest/rank-table.png?contest="
-                     <> urlEncodeText contestKey
-                     <> "&limit=5&_=" <> cacheBase <> contestKey
-             sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
-             sendText <-
-               if null (rights sent)
-                 then do
-                   sendStandalone message (contestLabel <> "排行榜图片发送失败，稍后再试。")
-                   pure False
-                 else pure True
-             pure sendText)
-          contests
-        when (null results) $
+            body = Text.unlines (map ReplyBody.imageDirective urls)
+        sent <- Chat.replyTo (standaloneMessage message) body
+        when (null (rights sent)) $
           sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
