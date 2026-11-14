@@ -333,6 +333,122 @@ def overview(domain: Callable[[str], Any], rpc: Callable[[str, Any], Any]) -> di
     }
 
 
+
+
+# ── 数据浏览器：任意表 ────────────────────────────────────
+BROWSE_TABLES = {
+    "chat_log": ("聊天记录", ["chat_id", "sender_id", "sender_username", "is_bot", "body_text", "recorded_at"]),
+    "audit_log": ("审计事件", ["event_kind", "occurred_at", "event_json"]),
+    "sessions": ("会话", None),
+    "session_messages": ("会话消息", None),
+    "threads": ("话题线程", None),
+    "media_files": ("媒体文件", None),
+    "resources": ("资源", None),
+    "scheduled_messages": ("定时消息", None),
+    "lifecycle_actions": ("生命周期动作", None),
+}
+
+
+def browse_tables() -> dict:
+    out = []
+    for name, (label, cols) in BROWSE_TABLES.items():
+        count = _query(f"SELECT COUNT(*) n FROM {name}")
+        out.append({"table": name, "label": label, "rows": int(count[0]["n"]) if count else 0,
+                    "columns": cols or []})
+    return {"tables": out}
+
+
+def browse_rows(table: str, q: str, limit: int, offset: int) -> dict:
+    if table not in BROWSE_TABLES:
+        return {"error": "不允许浏览该表"}
+    limit = max(1, min(300, limit))
+    offset = max(0, offset)
+    sql = f"SELECT * FROM {table}"
+    params: list[Any] = []
+    if q:
+        sql += " WHERE CAST((" + ("body_text" if table == "chat_log" else "event_json" if table == "audit_log" else "rowid") + ") AS TEXT) LIKE ?"
+        params.append(f"%{q}%")
+    sql += " LIMIT ? OFFSET ?"
+    params += [limit, offset]
+    rows = _query(sql, tuple(params))
+    total = _query(f"SELECT COUNT(*) n FROM {table}")
+    clean = []
+    for row in rows:
+        item = {}
+        for key, value in row.items():
+            if isinstance(value, bytes):
+                item[key] = f"<{len(value)} bytes>"
+            elif isinstance(value, str) and len(value) > 500:
+                item[key] = value[:500] + "…"
+            else:
+                item[key] = value
+        clean.append(item)
+    return {"table": table, "rows": clean, "total": int(total[0]["n"]) if total else 0,
+            "limit": limit, "offset": offset}
+
+
+def all_members(limit: int = 500) -> dict:
+    rows = _query(
+        "SELECT sender_id, sender_username, COUNT(*) n, MAX(recorded_at) last_at "
+        "FROM chat_log WHERE is_bot=0 AND sender_id IS NOT NULL "
+        "GROUP BY sender_id ORDER BY n DESC LIMIT ?",
+        (max(1, min(2000, limit)),),
+    )
+    seen: dict[str, dict] = {}
+    for row in rows:
+        sid = row["sender_id"]
+        entry = seen.setdefault(sid, {"user_id": sid, "messages": 0, "last_at": "", "aliases": []})
+        entry["messages"] += int(row["n"])
+        name = row["sender_username"] or ""
+        if name and name not in entry["aliases"]:
+            entry["aliases"].append(name)
+        if str(row["last_at"] or "") > entry["last_at"]:
+            entry["last_at"] = str(row["last_at"] or "")[:19]
+    return {"members": sorted(seen.values(), key=lambda e: -e["messages"]), "count": len(seen)}
+
+
+# ── 操作台：可执行的动作（白名单）────────────────────────
+ACTIONS = [
+    {"name": "humanlike_set", "label": "设置拟人模式会话", "params": "scopes: [qq:group:<id>, ...]", "desc": "全量覆盖：只有列表里的会话开着拟人模式"},
+    {"name": "proactive_set", "label": "设置某会话主动发言上限", "params": "scope, limit", "desc": "改 proactive.txt 里该会话的每日上限"},
+    {"name": "send_message", "label": "以 FM 身份发一条消息", "params": "chat_id, text", "desc": "直接调用后台的发消息接口"},
+]
+
+
+def action_catalog() -> dict:
+    return {"actions": ACTIONS}
+
+
+def run_action(name: str, payload: dict, send_message) -> dict:
+    if name == "humanlike_set":
+        scopes = payload.get("scopes") if isinstance(payload.get("scopes"), list) else []
+        return {"ok": True, "result": humanlike_set_scopes(scopes)}
+    if name == "proactive_set":
+        scope = str(payload.get("scope") or "").strip()
+        limit = str(payload.get("limit") or "20").strip()
+        if not scope:
+            return {"ok": False, "error": "缺少 scope"}
+        today = time.strftime("%Y-%m-%d")
+        rows = []
+        for row in _read(os.path.join(HUMANLIKE_DIR, "proactive.txt"), 8192).splitlines():
+            parts = row.split("\t")
+            if parts and parts[0].strip() == scope:
+                rows.append(f"{scope}\t{parts[1] if len(parts) > 1 else today}\t{limit}\t{int(time.time())}")
+            else:
+                rows.append(row)
+        if not any(r.startswith(scope + "\t") for r in rows):
+            rows.append(f"{scope}\t{today}\t{limit}\t{int(time.time())}")
+        _write(os.path.join(HUMANLIKE_DIR, "proactive.txt"), "\n".join(rows) + "\n")
+        return {"ok": True, "result": humanlike_state()}
+    if name == "send_message":
+        chat_id = str(payload.get("chat_id") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        if not chat_id or not text:
+            return {"ok": False, "error": "缺少 chat_id 或 text"}
+        return {"ok": True, "result": send_message(chat_id, text)}
+    return {"ok": False, "error": "未知动作"}
+
+
 ROUTES: dict[str, Callable[..., dict]] = {
     "overview": overview,
     "humanlike": humanlike_state,
@@ -344,4 +460,7 @@ ROUTES: dict[str, Callable[..., dict]] = {
     "group": group_detail,
     "novels": novels,
     "novel": novel_detail,
+    "browse/tables": browse_tables,
+    "members/all": all_members,
+    "actions": action_catalog,
 }

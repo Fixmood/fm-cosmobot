@@ -1656,6 +1656,24 @@ class Api(BaseHTTPRequestHandler):
                 data = v2.groups_overview(fetch_domain)
             elif route == "group":
                 data = v2.group_detail(arg("id"), fetch_domain)
+            elif route == "browse/tables":
+                data = v2.browse_tables()
+            elif route == "browse/rows":
+                data = v2.browse_rows(arg("table"), arg("q"), int(arg("limit", "50") or 50), int(arg("offset", "0") or 0))
+            elif route == "members/all":
+                data = v2.all_members(int(arg("limit", "500") or 500))
+            elif route == "actions":
+                data = v2.action_catalog()
+            elif route == "actions/run" and self.command == "POST":
+                payload = self.read_json() or {}
+                action_name = str(payload.get("name") or "")
+                if action_name == "send_message":
+                    data = {"ok": True, "result": fetch_rpc("chat.send", {
+                        "chat_id": str(payload.get("chat_id") or ""),
+                        "text": str(payload.get("text") or ""),
+                    })}
+                else:
+                    data = v2.run_action(action_name, payload, None)
             elif route == "novels":
                 data = v2.novels(fetch_domain)
             elif route == "novel":

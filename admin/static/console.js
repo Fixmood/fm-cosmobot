@@ -144,6 +144,25 @@ VIEWS.models = { name: '模型与配置', async render(main) {
   },
 };
 
+
+VIEWS.novels = { name: '番茄小说', async render(main) {
+  const r = await get('/api/v2/novels').catch(e => ({ data: { ok: false, error: e.message } }));
+  const d = r.data || {};
+  main.innerHTML = `<h1>番茄小说</h1><div class="sub">书架 / 章节 / 进度</div>` +
+    (d.ok ? stats([['书', num0(d.books)], ['章节', num0(d.chapters)], ['进度记录', num0(d.progress)]]) +
+      card('书架', table([['书名', 'title'], ['作者', 'author'], ['章节', 'total_chapters'], ['字数', 'word_count']], d.items || [],
+        { onRow: (b) => loadNovel(main, b.book_id || b.title) })) + `<div id="novel-detail"></div>`
+      : card('番茄', `<div class="err">domain 接口不可用：${esc(d.error || '未知')}</div>`));
+  const loadNovel = async (main2, id) => {
+    const res = await get('/api/v2/novel?id=' + encodeURIComponent(id)).catch(e => ({ data: { error: e.message } }));
+    const box = document.getElementById('novel-detail');
+    if (!box) return;
+    const nd = res.data || {};
+    box.innerHTML = nd.ok ? card('书籍详情', pre(nd.book) + table([['序', 'chapter_index'], ['标题', 'title'], ['字数', 'word_count']], (nd.chapters || []).slice(0, 200))) : `<div class="err">${esc(nd.error || '加载失败')}</div>`;
+  };
+  },
+};
+
 VIEWS.tools = { name: '工具与审计', async render(main) {
   main.innerHTML = `<h1>工具与审计</h1><div class="sub">工具调用统计（近 7 天）+ 明细</div><div id="t-out" class="muted">加载中…</div>`;
   const [st, au] = await Promise.all([get('/api/v2/tools/stats?days=7'), get('/api/v2/tools/audit?days=7&limit=200').catch(() => null)]);
@@ -203,13 +222,102 @@ VIEWS.ops = { name: '运维', async render(main) {
   },
 };
 
+
+VIEWS.membersAll = { name: '全部成员', async render(main) {
+  const r = await get('/api/v2/members/all?limit=800');
+  const ms = r.data.members;
+  main.innerHTML = `<h1>全部成员</h1><div class="sub">${ms.length} 人（按消息数排序）· 点一行看该成员全部昵称</div>` +
+    card('成员列表', table([['QQ', 'user_id'], ['消息', 'messages', (x) => num0(x.messages)],
+      ['最近', 'last_at'], ['见过几个名字', 'aliases', (x) => (x.aliases || []).length + ' 个']], ms,
+      { onRow: (m) => { main.innerHTML = document.querySelector('main').innerHTML; showMember(main, m); } })) +
+    `<div id="member-detail"></div>`;
+  const showMember = (main2, m) => {
+    const box = document.getElementById('member-detail');
+    if (box) box.innerHTML = card('成员详情 QQ ' + m.user_id,
+      `<div class="row"><a href="#membersAll">← 返回</a></div>` + stats([['消息', num0(m.messages)], ['最近', esc(m.last_at || '-')]]) +
+      '<div>' + (m.aliases || []).map(a => `<span class="tag">${esc(a)}</span>`).join(' ') + '</div>');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  },
+};
+
+VIEWS.browse = { name: '数据浏览器', async render(main) {
+  const r = await get('/api/v2/browse/tables');
+  const tables = r.data.tables;
+  main.innerHTML = `<h1>数据浏览器</h1><div class="sub">所有本地表 + 任意后台接口，都能点开看原始数据</div>` +
+    card('数据表', table([['表', 'table'], ['说明', 'label'], ['行数', 'rows', (x) => num0(x.rows)]], tables,
+      { onRow: (tb) => { $('#browse-out').innerHTML = '加载中…'; loadRows(tb.table); } })) +
+    card('原始接口', `<div class="row">${input('raw-path', '/api/v2/overview', '/api/v2/overview')}${btn('请求', 'raw-go')}</div><div id="raw-out"></div>`) +
+    `<div id="browse-out"></div>`;
+  let state = { table: '', offset: 0, q: '' };
+  const loadRows = async (tableName, offset, q) => {
+    state.table = tableName; state.offset = offset || 0; state.q = q || '';
+    $('#browse-out').innerHTML = `<section class="card"><h2>${esc(tableName)}</h2><div class="row">${input('bq', '过滤关键词', state.q)}${btn('刷新', 'bgo')}</div><div id="browsedata" class="loading">加载中…</div></section>`;
+    $("#bgo").onclick = () => loadRows(state.table, 0, $('#bq').value.trim());
+    const res = await get(`/api/v2/browse/rows?table=${encodeURIComponent(tableName)}&q=${encodeURIComponent(state.q)}&limit=50&offset=${state.offset}`);
+    const d = res.data;
+    if (d.error) { $('#browsedata').innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
+    const rows = d.rows || [];
+    const cols = rows.length ? Object.keys(rows[0]) : [];
+    $('#browsedata').innerHTML =
+      `<div class="row"><span class="muted">${num0(d.total)} 行，当前 ${d.offset + 1}-${d.offset + rows.length}</span>
+        ${btn('上一页', 'bprev', 'ghost')} ${btn('下一页', 'bnext', 'ghost')}</div>` +
+      table(cols.map(c => [c, c, (x) => esc(String(typeof x[c] === 'object' ? JSON.stringify(x[c]) : x[c] ?? '').slice(0, 70))]), rows,
+        { onRow: (row) => { $('#browsedata').innerHTML = '<div class="row"><a href="#" id="bback">← 返回列表</a></div>' + pre(row); $('#bback').onclick = (e) => { e.preventDefault(); loadRows(state.table, state.offset, state.q); }; } }) +
+      `<div id="detail-json"></div>`;
+    $('#bprev').onclick = () => loadRows(state.table, Math.max(0, state.offset - 50), state.q);
+    $('#bnext').onclick = () => loadRows(state.table, state.offset + 50, state.q);
+  };
+  $('#raw-go').onclick = async () => {
+    const p = $('#raw-path').value.trim();
+    $('#raw-out').innerHTML = '请求中…';
+    try { const res = await get(p); $('#raw-out').innerHTML = pre(res); }
+    catch (e) { $('#raw-out').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  },
+};
+
+VIEWS.actions = { name: '操作台', async render(main) {
+  const [hl, groups] = await Promise.all([get('/api/v2/humanlike'), get('/api/v2/groups').catch(() => ({ data: { groups: [] } }))]);
+  const scopes = hl.data.scopes || [];
+  const gs = groups.data.groups || [];
+  main.innerHTML = `<h1>操作台</h1><div class="sub">改功能：每项都先显示影响，再执行</div>` +
+    card('① 拟人模式（全量覆盖）', `<div class="muted">勾选的会话 = 开启拟人模式；取消 = 关闭。当前 ${scopes.length} 个开启。</div>
+      <div class="row" style="margin-top:8px">${gs.slice(0, 40).map(g => `<label class="tag"><input type="checkbox" class="hl-pick" value="qq:group:${esc(g.group_id)}" ${scopes.includes('qq:group:' + g.group_id) ? 'checked' : ''}/> ${esc(g.name || g.group_id).slice(0, 14)}</label>`).join(' ')}</div>
+      <div class="row" style="margin-top:8px">${btn('保存拟人模式', 'act-hl')}</div>`) +
+    card('② 主动发言上限（单会话）', `<div class="row">${input('act-scope', 'qq:group:123 或 qq:private:456', scopes[0] || '')}${input('act-limit', '每日上限', '20')}${btn('设置', 'act-pro')}</div>`) +
+    card('③ 以 FM 身份发消息（测试用）', `<div class="row" style="flex-direction:column;align-items:stretch">${input('act-chat', '群号 或 QQ 号', '')}<textarea id="act-text" placeholder="要发的内容"></textarea><div>${btn('发送', 'act-send')}</div></div>`) +
+    card('④ 危险操作', `<div class="row">${btn('重启 fm-cosmobot（会短暂离线）', 'act-restart', 'ghost')}</div><div id="act-out"></div>`);
+  $('#act-hl').onclick = async () => {
+    const picked = Array.from(document.querySelectorAll('.hl-pick:checked')).map(x => x.value);
+    if (!confirm('确认把拟人模式设为 ' + picked.length + ' 个会话？')) return;
+    try { await api('/api/v2/humanlike', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scopes: picked }) }); alert('已保存'); VIEWS.actions.render(main); } catch (e) { alert('失败：' + e.message); }
+  };
+  $('#act-pro').onclick = async () => {
+    const scope = $('#act-scope').value.trim(), limit = $('#act-limit').value.trim();
+    if (!scope || !confirm('把 ' + scope + ' 的每日主动发言上限设为 ' + limit + '？')) return;
+    try { await api('/api/v2/actions/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'proactive_set', scope, limit }) }); alert('已设置'); } catch (e) { alert('失败：' + e.message); }
+  };
+  $('#act-send').onclick = async () => {
+    const chat_id = $('#act-chat').value.trim(), text = $('#act-text').value.trim();
+    if (!chat_id || !text) return;
+    if (!confirm('确认以 FM 身份发到 ' + chat_id + '？')) return;
+    try { await api('/api/v2/actions/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'send_message', chat_id, text }) }); alert('已发送'); } catch (e) { alert('失败：' + e.message); }
+  };
+  $('#act-restart').onclick = async () => {
+    if (!confirm('确认重启 fm-cosmobot？会短暂离线。')) return;
+    try { await api('/api/system/restart/bot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); $('#act-out').innerHTML = '<div class="tag ok">已发起重启</div>'; } catch (e) { $('#act-out').innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  },
+};
+
 /* ── 导航与路由 ───────────────────────────────────────── */
 const NAV = [
   ['概览', ['overview']],
-  ['会话', ['groups', 'members', 'messages']],
-  ['机器人', ['humanlike', 'models', 'tools']],
-  ['业务', ['business', 'collections']],
-  ['系统', ['logs', 'ops']],
+  ['会话', ['groups', 'membersAll', 'members', 'messages']],
+  ['机器人', ['humanlike', 'actions', 'models', 'tools']],
+  ['业务', ['business', 'collections', 'novels']],
+  ['系统', ['browse', 'logs', 'ops']],
 ];
 
 function drawNav(active) {
