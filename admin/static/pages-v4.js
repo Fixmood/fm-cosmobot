@@ -104,6 +104,47 @@
       (path ? '<p class="mono">' + esc(path) + '</p>' : '') + '</div>';
   }
 
+  /* 缓存徽标：后端 ops 接口会返回 cached / cache_age_seconds / cache_ttl（P1-2） */
+  function cacheAgeText(data) {
+    if (!data) return '实时';
+    if (data.cached === true) {
+      const age = Number(data.cache_age_seconds);
+      const ttl = Number(data.cache_ttl);
+      let text = '缓存命中';
+      if (isFinite(age) && age >= 0) text += ' · ' + age.toFixed(1) + 's 前';
+      if (isFinite(ttl) && ttl > 0) text += ' / TTL ' + ttl + 's';
+      return text;
+    }
+    return '实时';
+  }
+
+  function cacheBadgeHtml(res, data) {
+    if (!res || !res.ok) return '<span class="tag tag-warn">' + icon('x-circle') + '读取失败</span>';
+    const cached = data && data.cached === true;
+    return '<span class="tag ' + (cached ? 'tag-info' : 'tag-ok') + '">' + icon(cached ? 'database' : 'activity') + esc(cacheAgeText(data)) + '</span>';
+  }
+
+  /* 运行中进度条：慢接口等待期间显示（不提前判定失败） */
+  function runProgressHtml(id, label, hint) {
+    return '<div class="run-progress" id="' + escAttr(id) + '">' +
+      '<div class="rp-head"><span class="rp-title mono">' + icon('loader', 'spin') + ' ' + esc(label) + '</span>' +
+      '<span class="rp-time mono" data-elapsed>0s</span></div>' +
+      '<div class="progress-track"><div class="progress-fill indeterminate"></div></div>' +
+      (hint ? '<div class="rp-hint muted-2 text-xs">' + esc(hint) + '</div>' : '') +
+      '</div>';
+  }
+
+  function startElapsedTimer(scope, id) {
+    const root = scope && scope.querySelector ? scope.querySelector('#' + id) : null;
+    const node = root ? root.querySelector('[data-elapsed]') : null;
+    const startedAt = Date.now();
+    if (!node) return function noop() {};
+    const timer = setInterval(function () {
+      if (node.isConnected) node.textContent = Math.round((Date.now() - startedAt) / 1000) + 's';
+    }, 500);
+    return function stop() { clearInterval(timer); };
+  }
+
   function timelineHtml(points) {
     if (!points || !points.length) {
       return '<div class="empty" style="padding:22px"><div class="empty-ico">' + icon('activity') + '</div><b>还没有健康检查点</b>' +
@@ -1361,22 +1402,24 @@
     },
   };
 
-  async function renderOpsOverview(ctx, body) {
-    /* 先画骨架：/api/v2/ops/metrics 在 1–3s，避免慢接口造成空白 */
+  async function renderOpsOverview(ctx, body, force) {
+    /* 慢接口体验（P1-2）：先出骨架 + 进度条；ops/metrics 恒 ~3s、代理排队时更久，最长等 35s，不提前判失败 */
     body.innerHTML = '<div class="ops-stats" style="margin-bottom:14px">' +
       ['主机负载', '内存占用', '磁盘占用', '容器健康', '运行时长', '采样时间'].map((label) =>
         '<div class="ops-stat"><div class="k">' + esc(label) + '</div><div class="v"><span class="sk" style="display:block;height:20px;width:72%"></span></div></div>').join('') +
-      '</div><div class="load-inline">' + icon('loader', 'spin') + ' 正在读取主机指标…</div>';
-    /* 硬截止：任何慢接口最多等 9 秒，之后用健康历史采样兜底，保证首屏不空白 */
+      '</div>' + runProgressHtml('ops-metrics-progress', '正在读取主机指标（宿主代理排队时最长 35 秒）…', '宿主机代理串行执行 docker stats，冷启动或排队时会明显变慢；这里不会提前判定失败。');
+    const stopMetricsTimer = startElapsedTimer(body, 'ops-metrics-progress');
+    const metricsPath = '/api/v2/ops/metrics' + qs(force ? { force: 1 } : {});
     const deadline = (promise, ms, fallback) => Promise.race([
       promise.catch(() => fallback),
       new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
     ]);
     const results = await Promise.all([
-      deadline(probeApi(['/api/v2/ops/metrics'], { timeout: 20000 }), 9000, { ok: false, pending: true, error: new ApiError('主机指标接口超时（>9s）', { status: 0 }) }),
-      deadline(probeApi(['/api/v2/health/history?days=7'], { timeout: 15000 }), 8000, { ok: false, error: new ApiError('健康历史接口超时', { status: 0 }) }),
-      deadline(probeApi(['/api/errors/stats'], { timeout: 12000 }), 8000, { ok: false }),
+      deadline(probeApi([metricsPath], { timeout: 42000 }), 35000, { ok: false, pending: true, path: metricsPath, error: new ApiError('主机指标接口超时（>35s）', { status: 0 }) }),
+      deadline(probeApi(['/api/v2/health/history?days=7'], { timeout: 20000 }), 15000, { ok: false, error: new ApiError('健康历史接口超时', { status: 0 }) }),
+      deadline(probeApi(['/api/errors/stats'], { timeout: 20000 }), 15000, { ok: false }),
     ]);
+    stopMetricsTimer();
     if (!ctx.alive()) return;
     const statsRes = results[0];
     const healthRes = results[1];
@@ -1393,9 +1436,9 @@
 
     if (!statsRes.ok && !healthRes.ok) {
       body.innerHTML = pendingState({
-        title: '运维接口尚未就绪',
-        hint: '主机运维代理（ops_agent）可能离线，或 /api/v2/ops/stats 尚未部署。',
-        path: '/api/v2/ops/stats',
+        title: '运维接口暂时不可用',
+        hint: '主机运维代理（ops_agent）可能离线或排队超时。可点「强制刷新」再试；这条请求最长等 35s，超出才判定失败。',
+        path: '/api/v2/ops/metrics',
         raw: statsRes.error || healthRes.error,
       });
       return;
@@ -1412,7 +1455,17 @@
     const load1 = load['1m'] != null ? load['1m'] : latestHealth.load1;
     const healthyContainers = containers.filter((c) => c.running && (!c.health || c.health === 'healthy'));
     body.innerHTML =
-      (statsRes.ok ? '' : notice('warn', '<b>主机指标接口暂时不可用</b>（' + esc((statsRes.error && statsRes.error.message) || 'ops_agent 无响应') + '），下面用健康历史采样兜底显示；点「刷新」可重试。')) +
+      (statsRes.ok ? '' : notice('warn', '<b>主机指标接口暂时不可用</b>（' + esc((statsRes.error && statsRes.error.message) || 'ops_agent 无响应') + '），已用健康历史采样兜底显示；可点右侧「强制刷新」绕过缓存重试。')) +
+      '<div class="row" style="justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">' +
+        '<div class="row">' + cacheBadgeHtml(statsRes, stats) +
+          '<span class="muted-2 text-xs mono">' + esc(stats.source || 'host-ops-agent') +
+            (stats.duration_ms != null ? ' · duration ' + fmtNum(stats.duration_ms) + 'ms' : '') +
+            (stats.request_id ? ' · ' + esc(String(stats.request_id).slice(0, 18)) : '') + '</span></div>' +
+        '<div class="row">' +
+          '<button class="btn btn-sm btn-ghost" id="ops-force-refresh" type="button" title="?force=1 绕过 15s 缓存">' + icon('zap') + '强制刷新</button>' +
+          '<a class="btn btn-sm btn-ghost" href="#/ops/logs">' + icon('terminal') + '容器日志</a>' +
+        '</div>' +
+      '</div>' +
       '<div class="ops-stats" style="margin-bottom:14px">' +
         miniStat('主机负载 1m', fmtNum(load1, 2), (host.cpu_count ? host.cpu_count + ' 核 · 5m ' + fmtNum(load['5m'], 2) + ' · 15m ' + fmtNum(load['15m'], 2) : ''), 'activity', Number(load1) > (host.cpu_count || 4) ? 'warn' : 'ok') +
         miniStat('内存占用', memPercent == null ? '—' : fmtNum(memPercent, 1) + '<small>%</small>', memHuman, 'cpu', Number(memPercent) > 90 ? 'bad' : '') +
@@ -1450,7 +1503,12 @@
       '</div>';
 
     const jsonBtn = $('#ops-json');
-    if (jsonBtn) jsonBtn.addEventListener('click', () => openJsonDrawer('运维统计原始响应', stats, '/api/v2/ops/stats'));
+    if (jsonBtn) jsonBtn.addEventListener('click', () => openJsonDrawer('运维指标原始响应', stats, '/api/v2/ops/metrics'));
+    const forceBtn = $('#ops-force-refresh');
+    if (forceBtn) forceBtn.addEventListener('click', () => {
+      toast('已请求强制刷新（?force=1）', 'info', { timeout: 1600 });
+      renderOpsOverview(ctx, body, true);
+    });
   }
 
   function tagForStatus(row) {
@@ -1521,26 +1579,33 @@
         '<input class="input input-sm" id="ops-grep" placeholder="grep 关键词（如 error / 776227233）" value="' + escAttr(grep) + '" style="max-width:260px">' +
         '<button class="btn btn-sm btn-soft" id="ops-logs-apply" type="button">' + icon('filter') + '应用</button>' +
         '<label class="switch" style="margin-left:auto"><input type="checkbox" id="ops-logs-auto"><span class="track"></span><span class="text-sm">自动刷新 10s</span></label>' +
+        '<button class="btn btn-sm btn-ghost" id="ops-logs-force" type="button" title="?force=1 绕过缓存">' + icon('zap') + '强制刷新</button>' +
         '<button class="btn btn-sm btn-ghost" id="ops-logs-refresh" type="button">' + icon('refresh') + '刷新</button>' +
       '</div>' +
       '<div class="card"><div class="card-head"><h3>' + icon('terminal') + 'fm-cosmobot 容器日志</h3>' +
-        '<div class="card-head-actions"><span class="muted-2 text-xs" id="ops-log-meta">加载中…</span></div></div>' +
-        '<div class="card-body"><div id="ops-log-view"><div class="load-inline">' + icon('loader', 'spin') + ' 读取容器日志…</div></div></div></div>' +
-      notice('info', '日志通过宿主机运维代理执行 <code class="inline">docker logs fm-cosmobot</code> 获取，最多 500 行，只读。');
+        '<div class="card-head-actions"><span id="ops-log-cache"></span><span class="muted-2 text-xs" id="ops-log-meta">加载中…</span></div></div>' +
+        '<div class="card-body"><div id="ops-log-view"></div></div></div>' +
+      notice('info', '日志通过宿主机运维代理执行 <code class="inline">docker logs fm-cosmobot</code> 获取，最多 500 行，只读。冷启动可能 20–30 秒，页面最长等 45 秒；「强制刷新」会带 ?force=1 绕过缓存。');
 
     let autoTimer = 0;
-    const load = async () => {
+    const load = async (forceFetch) => {
       const view = $('#ops-log-view');
       const meta = $('#ops-log-meta');
-      const res = await probeApi(['/api/v2/ops/logs' + qs({ tail: $('#ops-tail') ? $('#ops-tail').value : tail, grep: $('#ops-grep') ? $('#ops-grep').value : '' })], { timeout: 25000 });
+      const cacheNode = $('#ops-log-cache');
+      if (view) view.innerHTML = runProgressHtml('ops-log-progress', '正在读取容器日志（冷启动 20–30 秒，最长 45 秒）…', '宿主机代理需要执行 docker logs，排队/冷启动时会慢；等待期间不判定失败。');
+      const stopTimer = startElapsedTimer(body, 'ops-log-progress');
+      const res = await probeApi(['/api/v2/ops/logs' + qs({ tail: $('#ops-tail') ? $('#ops-tail').value : tail, grep: $('#ops-grep') ? $('#ops-grep').value : '', force: forceFetch ? 1 : '' })], { timeout: 50000 });
+      stopTimer();
       if (!ctx.alive()) return;
       if (!view) return;
       if (!res.ok) {
-        view.innerHTML = pendingState({ title: '容器日志暂不可用', hint: (res.error && res.error.message) || '运维代理离线或接口未就绪。', path: '/api/v2/ops/logs', raw: res.error });
+        view.innerHTML = pendingState({ title: '容器日志暂不可用', hint: (res.error && res.error.message) || '运维代理离线或接口未就绪；可点「强制刷新」再试。', path: '/api/v2/ops/logs', raw: res.error });
+        if (cacheNode) cacheNode.innerHTML = '<span class="tag tag-warn">' + icon('x-circle') + '读取失败</span>';
         return;
       }
       const data = res.data || {};
       const lines = data.lines || [];
+      if (cacheNode) cacheNode.innerHTML = cacheBadgeHtml(res, data);
       if (meta) meta.textContent = (data.total_lines != null ? '总行 ' + fmtNum(data.total_lines) + ' · ' : '') + '返回 ' + lines.length + ' 行' + (data.grep_matched ? ' · 命中 ' + fmtNum(data.grep_matched) : '');
       view.innerHTML = lines.length
         ? '<pre class="v3-log">' + lines.map((line) => {
@@ -1554,11 +1619,16 @@
     const applyBtn = $('#ops-logs-apply');
     if (applyBtn) applyBtn.addEventListener('click', apply);
     const refreshBtn = $('#ops-logs-refresh');
-    if (refreshBtn) refreshBtn.addEventListener('click', load);
+    if (refreshBtn) refreshBtn.addEventListener('click', () => load(false));
+    const forceBtn = $('#ops-logs-force');
+    if (forceBtn) forceBtn.addEventListener('click', () => {
+      toast('已请求强制刷新（?force=1）', 'info', { timeout: 1600 });
+      load(true);
+    });
     const auto = $('#ops-logs-auto');
     if (auto) auto.addEventListener('change', () => {
       if (auto.checked) {
-        autoTimer = setInterval(() => { if (!document.hidden) load(); }, 10000);
+        autoTimer = setInterval(() => { if (!document.hidden) load(false); }, 10000);
         ctx.cleanup(() => clearInterval(autoTimer));
         toast('日志自动刷新已开启（10 秒）', 'ok', { timeout: 1800 });
       } else {
@@ -1570,8 +1640,10 @@
   }
 
   async function renderOpsCron(ctx, body) {
-    body.innerHTML = '<div class="load-inline">' + icon('loader', 'spin') + ' 正在读取宿主机 crontab（可能需要 5–20 秒）…</div>';
-    const res = await probeApi(['/api/v2/ops/cron'], { timeout: 45000 });
+    body.innerHTML = runProgressHtml('ops-cron-progress', '正在读取宿主机 crontab（可能需要 5–20 秒）…', '宿主机代理串行执行 crontab -l，排队时会慢；等待期间不判定失败。');
+    const stopCronTimer = startElapsedTimer(body, 'ops-cron-progress');
+    const res = await probeApi(['/api/v2/ops/cron'], { timeout: 50000 });
+    stopCronTimer();
     if (!ctx.alive()) return;
     if (!res.ok) {
       body.innerHTML = pendingState({ title: '定时任务暂不可用', hint: (res.error && res.error.message) || '运维代理离线或 crontab 接口未就绪。', path: '/api/v2/ops/cron', raw: res.error });

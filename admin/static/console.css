@@ -580,8 +580,12 @@ html[data-theme="light"] .ico-theme-dark { display: none; }
   border-bottom: 1px solid var(--line-1);
 }
 .v3-check-list-item:last-child, .v3-check-row:last-child { border-bottom: 0; }
-.v3-check-name { flex: 1; min-width: 0; color: var(--text-1); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.v3-check-path { color: var(--text-4); font-family: var(--font-mono); font-size: var(--fs-2xs); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-check-name { flex: 1 1 auto; min-width: 140px; color: var(--text-1); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.v3-check-path { flex: 0 1 300px; min-width: 0; color: var(--text-4); font-family: var(--font-mono); font-size: var(--fs-2xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-check-flex { flex: 0 1 auto; }
+.v3-check-row .tag,
+.v3-check-row .muted-2 { white-space: nowrap; }
+.v3-check-row > .muted-2.mono { min-width: 64px; text-align: right; }
 .v3-check-error { color: var(--bad); font-size: var(--fs-xs); }
 .v3-col-picker { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; }
 
@@ -817,6 +821,53 @@ th.sorted .th-sort svg.ico { opacity: 1; }
 .placeholder-card p { margin: 0; font-size: var(--fs-xs); line-height: 1.6; }
 
 .load-inline { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: var(--fs-xs); padding: 20px; justify-content: center; }
+
+/* ── 7.1 只读账号门禁 / 慢接口进度条 / 自检分级 ─────────────────────────── */
+.is-admin-gated,
+button.is-admin-gated {
+  opacity: .48 !important;
+  cursor: not-allowed !important;
+  box-shadow: none !important;
+  filter: saturate(.6);
+}
+.is-admin-gated:hover { transform: none !important; }
+.admin-readonly-banner {
+  margin-bottom: 14px;
+  border-left-color: var(--warn);
+}
+.admin-readonly-banner > svg.ico { color: var(--warn); }
+
+/* 慢接口运行中进度条（指标 / 日志 / 自检 / crontab） */
+.run-progress {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-1);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+}
+.rp-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.rp-title { display: inline-flex; align-items: center; gap: 7px; font-size: var(--fs-xs); color: var(--text-2); }
+.rp-title svg.ico { width: 14px; height: 14px; color: var(--accent); }
+.rp-time { font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.rp-hint { margin-top: 7px; line-height: 1.55; }
+.progress-track { height: 6px; border-radius: 99px; background: var(--surface-3); overflow: hidden; }
+.progress-fill {
+  height: 100%; width: 40%;
+  border-radius: 99px;
+  background: var(--brand-grad);
+}
+.progress-fill.indeterminate {
+  width: 42%;
+  animation: fm-indeterminate 1.5s var(--ease) infinite;
+}
+@keyframes fm-indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(260%); }
+}
+
+/* 自检行内权限说明 */
+.v3-check-hint { margin: 4px 0 0 18px; color: var(--text-3); line-height: 1.55; }
+.v3-check-list-item:has(.v3-check-hint) { background: var(--warn-soft); border-radius: var(--radius-xs); }
 
 /* ── 8. 响应式 ─────────────────────────────────────────────────────────── */
 @media (max-width: 1240px) {

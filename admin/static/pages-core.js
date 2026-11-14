@@ -889,7 +889,9 @@ async function renderMemberDetail(ctx, uid) {
   ]);
   if (!ctx.alive()) return;
   const profile = profileRes.ok ? profileRes.data : null;
-  const loadError = !profileRes.ok && !profileRes.pending ? profileRes.error : null;
+  const profileStatus = Number(profileRes.error && profileRes.error.status) || 0;
+  const notFoundMember = !profile && profileStatus === 404;
+  const loadError = !profileRes.ok && !profileRes.pending && !notFoundMember ? profileRes.error : null;
   let fallback = null;
   if (!profile) {
     try {
@@ -925,6 +927,7 @@ async function renderMemberDetail(ctx, uid) {
       '<button class="btn btn-ghost btn-sm" id="member-refresh" type="button">' + icon('refresh') + '刷新</button>',
     ],
   }) +
+  (notFoundMember ? '<div class="mb-16">' + notice('warn', '<b>查无此成员</b>：QQ <span class="mono">' + esc(uid) + '</span> 在成员库中没有记录（接口返回 404）。可能已退群、从未发言，或 QQ 号有误。') + '</div>' : '') +
   (loadError ? '<div class="mb-16">' + errorState(loadError, 'member-retry') + '</div>' : '') +
   kpiGrid([
     { label: '发言总数', icon: 'message', valueHtml: fmtNum(messageCount), tone: 'acc', hint: perGroup.length ? '覆盖 ' + perGroup.length + ' 个会话' : '' },
@@ -2518,6 +2521,9 @@ async function renderBrowseRows(ctx, table) {
   let loadError = null;
   try {
     data = unwrap(await apiGet('/api/v2/browse/rows' + qs({ table: table, q: query, limit: limit, offset: offset })));
+    if (data && typeof data === 'object' && data.error) {
+      throw new ApiError(String(data.error), { status: 400, path: '/api/v2/browse/rows' });
+    }
   } catch (err) { loadError = err; }
   if (!ctx.alive()) return;
   if (loadError) {
@@ -3227,11 +3233,13 @@ VIEWS.settings = {
   async render(ctx) {
     const root = ctx.root;    const [meRes, tokensRes] = await Promise.all([
       apiGet('/api/auth/me').catch((err) => ({ __error: err })),
-      apiGet('/api/auth/tokens').catch(() => null),
+      apiGet('/api/auth/tokens').catch((err) => ({ __error: err })),
     ]);
     if (!ctx.alive()) return;
     const me = meRes && !meRes.__error ? meRes : (APP.user || { username: 'admin', is_admin: true });
-    const tokens = (tokensRes && (tokensRes.items || [])) || [];
+    const tokensError = tokensRes && tokensRes.__error ? tokensRes.__error : null;
+    const tokensForbidden = !!tokensError && Number(tokensError.status) === 403;
+    const tokens = (tokensRes && !tokensRes.__error && (tokensRes.items || [])) || [];
 
     root.innerHTML = pageHead({
       title: '设置',
@@ -3243,7 +3251,7 @@ VIEWS.settings = {
     kpiGrid([
       { label: '当前账号', icon: 'user', valueHtml: '<span style="font-size:16px">' + esc(me.username || 'admin') + '</span>', tone: 'acc' },
       { label: '权限', icon: 'shield', valueHtml: me.is_admin ? '<span class="tag tag-ok">管理员</span>' : '<span class="tag tag-warn">只读令牌</span>' },
-      { label: '访问令牌', icon: 'key', valueHtml: fmtNum(tokens.length), hint: tokens.filter((item) => item.enabled).length + ' 个有效' },
+      { label: '访问令牌', icon: 'key', valueHtml: tokensForbidden ? '—' : fmtNum(tokens.length), hint: tokensForbidden ? '需要管理员权限才能查看' : tokens.filter((item) => item.enabled).length + ' 个有效' },
       { label: '自动刷新', icon: 'clock', valueHtml: APP.autoRefresh ? '<span class="tag tag-ok">已开启</span>' : '<span class="tag tag-muted">已关闭</span>', hint: '10 秒间隔 / 页面隐藏时暂停' },
     ]) +
     '<div class="grid grid-2 mt-16">' +
@@ -3318,7 +3326,12 @@ VIEWS.settings = {
 
     /* 令牌 */
     const tokenTable = $('#token-table', root);
-    if (tokenTable) {
+    if (tokenTable && tokensForbidden) {
+      tokenTable.innerHTML = notice('warn', '<b>需要管理员权限</b>：<code class="inline">GET /api/auth/tokens</code> 对只读账号返回 HTTP 403，因此这里不展示令牌列表。如需创建 / 吊销令牌，请使用管理员令牌登录。') +
+        '<div class="row mt-12"><button class="btn btn-sm btn-ghost" data-goto="#/settings" type="button">' + icon('refresh') + '重试</button></div>';
+    } else if (tokenTable && tokensError) {
+      tokenTable.innerHTML = notice('bad', '读取令牌失败：' + esc(tokensError.message || '未知错误') + '（不是权限问题，可稍后重试）');
+    } else if (tokenTable) {
       renderTable(tokenTable, {
         columns: [
           { key: 'name', label: '名称', render: (row) => esc(row.name || '-') },

@@ -9,8 +9,8 @@
 /* ── 0. 元信息 ─────────────────────────────────────────────────────────── */
 const APP = {
   title: 'FM Console',
-  version: '4.0.0',
-  build: 'v4-20261115',
+  version: '4.1.0',
+  build: 'v4.1-r2-20261115',
   routeToken: 0,
   autoRefresh: false,
   user: null,
@@ -326,6 +326,36 @@ function redirectToLogin() {
   setTimeout(() => { location.replace('/login?next=' + encodeURIComponent(next)); }, 500);
 }
 
+/* ── 只读账号（is_admin=false）权限控制 ───────────────────────────────── */
+const READONLY_WRITE_ALLOWLIST = ['/api/logout', '/api/rpc'];
+const READONLY_TOAST_INTERVAL = 2500;
+let lastReadonlyToastAt = 0;
+
+function isAdmin() {
+  return !!(APP.user && APP.user.is_admin === true);
+}
+
+function isReadonly() {
+  return !!(APP.user && APP.user.is_admin === false);
+}
+
+function isWriteMethod(method) {
+  return /^(POST|PUT|PATCH|DELETE)$/i.test(String(method || 'GET'));
+}
+
+function isReadonlyBlocked(path, method) {
+  if (!isReadonly() || !isWriteMethod(method)) return false;
+  const target = String(path || '');
+  return !READONLY_WRITE_ALLOWLIST.some((prefix) => target.indexOf(prefix) === 0);
+}
+
+function toastReadonly(message) {
+  const now = Date.now();
+  if (now - lastReadonlyToastAt < READONLY_TOAST_INTERVAL) return;
+  lastReadonlyToastAt = now;
+  toast(message || '只读账号无权修改，请使用管理员令牌登录', 'warn', { title: '权限不足', timeout: 3200 });
+}
+
 async function apiFetch(path, opts) {
   const options = opts || {};
   const method = options.method || 'GET';
@@ -333,6 +363,10 @@ async function apiFetch(path, opts) {
   if (cacheKey) {
     const hit = API.cache.get(cacheKey);
     if (hit && Date.now() - hit.at < options.cache) return hit.data;
+  }
+  if (isReadonlyBlocked(path, method)) {
+    toastReadonly('只读账号无权修改（需要管理员），请求未发送');
+    throw new ApiError('只读账号无权修改（需要管理员）', { status: 403, path: path, readonly: true });
   }
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timeout = options.timeout || API.timeout;
@@ -362,6 +396,15 @@ async function apiFetch(path, opts) {
     if (response.status === 401) {
       redirectToLogin();
       throw new ApiError('未登录或会话已过期', { status: 401, data: data, path: path });
+    }
+    if (response.status === 403) {
+      const write = isWriteMethod(method);
+      if (write) toastReadonly('只读账号无权修改，请使用管理员令牌登录');
+      updateNetBadge(true, elapsed);
+      throw new ApiError(
+        write ? '只读账号无权修改（需要管理员）' : '需要管理员权限（当前为只读账号，该接口仅管理员可用）',
+        { status: 403, data: data, path: path, readonly: true },
+      );
     }
     if (!response.ok) {
       const message = (data && (data.error || data.message)) || ('HTTP ' + response.status);
@@ -413,21 +456,28 @@ function qs(params) {
 async function probeApi(paths, opts) {
   const options = opts || {};
   const list = Array.isArray(paths) ? paths : [paths];
-  let lastError = null;
+  const attempts = [];
   for (let i = 0; i < list.length; i += 1) {
     try {
       const response = await apiFetch(list[i], options);
-      return { ok: true, data: unwrap(response), raw: response, path: list[i] };
+      return { ok: true, data: unwrap(response), raw: response, path: list[i], attempts: attempts };
     } catch (err) {
       if (err.status === 401) throw err;
-      lastError = err;
-      if (err.status !== 404 && err.status !== 501 && err.status !== 0 && err.status !== 502 && err.status !== 503) {
-        return { ok: false, pending: false, error: err, path: list[i] };
-      }
+      attempts.push({ path: list[i], error: err });
+      if (err.status !== 404 && err.status !== 501 && err.status !== 0 && err.status !== 502 && err.status !== 503) break;
     }
   }
-  const pending = !lastError || lastError.status === 404 || lastError.status === 501 || lastError.status === 503;
-  return { ok: false, pending: pending, error: lastError, path: list[list.length - 1] };
+  const lastError = attempts.length ? attempts[attempts.length - 1].error : null;
+  const pending = !lastError || lastError.status === 404 || lastError.status === 501 || lastError.status === 503 || lastError.status === 0;
+  /* 展示用错误：跳过「缺少参数 / 未知接口」这类降级噪声，优先取第一次有业务含义的错误（如 404 没有该成员） */
+  const meaningful = attempts.filter((item) => {
+    const message = String((item.error && item.error.message) || '');
+    return !/缺少|未知的 v2 接口|not found|Not Found/i.test(message);
+  });
+  const displayError = pending
+    ? ((attempts[0] && attempts[0].error) || lastError)
+    : ((meaningful[0] && meaningful[0].error) || lastError);
+  return { ok: false, pending: pending, error: displayError, attempts: attempts, path: list[list.length - 1] };
 }
 
 /* ── 3. 全局状态 ──────────────────────────────────────────────────────── */
@@ -872,10 +922,11 @@ function renderTable(container, config) {
     visible.forEach((col) => {
       const isSorted = currentSort && String(currentSort.key) === String(col.key);
       const sortBtn = cfg.sortable !== false
-        ? '<span class="th-sort" data-sort-key="' + escAttr(String(col.key)) + '">' + esc(col.label) + (isSorted ? icon(currentSort.dir === 'desc' ? 'arrow-down' : 'arrow-up') : '<span style="width:0"></span>') + '</span>'
+        ? '<span class="th-sort" role="button" tabindex="0" aria-label="按 ' + escAttr(String(col.label)) + ' 排序" data-sort-key="' + escAttr(String(col.key)) + '">' + esc(col.label) + (isSorted ? icon(currentSort.dir === 'desc' ? 'arrow-down' : 'arrow-up') : '<span style="width:0"></span>') + '</span>'
         : esc(col.label);
       const style = col.width ? ' style="width:' + escAttr(col.width) + '"' : '';
-      head.push('<th' + style + ' class="' + clsx({ num: col.num, mono: col.mono, 'hide-sm': col.hideSm, sorted: isSorted }) + '">' + sortBtn + '</th>');
+      const ariaSort = isSorted ? (currentSort.dir === 'desc' ? 'descending' : 'ascending') : 'none';
+      head.push('<th' + style + ' aria-sort="' + ariaSort + '" class="' + clsx({ num: col.num, mono: col.mono, 'hide-sm': col.hideSm, sorted: isSorted }) + '">' + sortBtn + '</th>');
     });
     const colCount = visible.length + (showIndex ? 1 : 0);
     const body = sorted.map((row, index) => {
@@ -899,6 +950,14 @@ function renderTable(container, config) {
     }).join('');
     container.innerHTML = '<div class="table-wrap' + (cfg.flush ? ' flush' : '') + '"><table class="table"><thead><tr>' + head.join('') +
       '</tr></thead><tbody>' + body + '</tbody></table></div>';
+
+    container.querySelectorAll('.th-sort').forEach((node) => {
+      node.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        node.click();
+      });
+    });
 
     const toggleRow = (tr) => {
       const index = Number(tr.getAttribute('data-row'));
@@ -1437,6 +1496,118 @@ function setDocumentTitle(view, route) {
   document.title = (view.name || 'Console') + (param ? ' · ' + param : '') + ' · ' + APP.title;
 }
 
+/* ── 只读账号 UI 门禁：写操作按钮置灰 + tooltip + 顶部提示 ─────────────── */
+const ADMIN_WRITE_RE = /(保存|写入|提交|发送|回滚|重启|删除|移除|创建|新建|吊销|撤销|更新密码|生成令牌|立即备份|建备份|清空人设|写入上限|切换模型|保存修改|保存配置|保存并应用|执行回滚)/;
+const ADMIN_SAFE_RE = /(刷新|重试|搜索|筛选|详情|查看|展开|收起|导出|复制|返回|上一页|下一页|跳转|取消|JSON|全选|反选|过滤|应用筛选|清空筛选|清除本地|重置未保存|打开|主题|深色|浅色)/;
+const ADMIN_GATE_ATTR = 'data-admin-gate';
+
+function adminGateText(el) {
+  const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  return text || el.getAttribute('title') || el.getAttribute('aria-label') || '';
+}
+
+function shouldGateAsWrite(el) {
+  if (el.hasAttribute('data-admin-safe')) return false;
+  if (el.hasAttribute(ADMIN_GATE_ATTR)) return true;
+  /* 页签 / 导航 / 命令面板里的按钮只负责跳转，不当作写操作 */
+  if (el.hasAttribute('data-tab') || el.closest('.tabs, .nav, .palette-box, .user-menu')) return false;
+  const text = adminGateText(el);
+  if (ADMIN_WRITE_RE.test(text)) return true;
+  if (el.classList.contains('switch')) {
+    const id = el.id || '';
+    if (!/pref-auto|auto-refresh|theme|nav/i.test(id)) return true;
+  }
+  return false;
+}
+
+function clearAdminGates(root) {
+  (root || document).querySelectorAll('[' + ADMIN_GATE_ATTR + ']').forEach((el) => {
+    el.removeAttribute(ADMIN_GATE_ATTR);
+    el.removeAttribute('aria-disabled');
+    el.classList.remove('is-admin-gated');
+    if (el.tagName === 'BUTTON') el.disabled = false;
+    if (el.dataset.adminOldTitle !== undefined) {
+      if (el.dataset.adminOldTitle) el.setAttribute('title', el.dataset.adminOldTitle);
+      else el.removeAttribute('title');
+      delete el.dataset.adminOldTitle;
+    }
+    el.removeAttribute('tabindex');
+  });
+}
+
+function applyAdminGating(root) {
+  const scope = root || document;
+  if (!isReadonly()) { clearAdminGates(scope); return 0; }
+  let count = 0;
+  scope.querySelectorAll('button, a.btn, [role="button"], .switch').forEach((el) => {
+    if (!shouldGateAsWrite(el)) return;
+    const text = adminGateText(el);
+    if (ADMIN_SAFE_RE.test(text) && !ADMIN_WRITE_RE.test(text)) return;
+    if (!el.hasAttribute(ADMIN_GATE_ATTR)) {
+      if (el.dataset.adminOldTitle === undefined) el.dataset.adminOldTitle = el.getAttribute('title') || '';
+      el.setAttribute(ADMIN_GATE_ATTR, '1');
+      el.setAttribute('aria-disabled', 'true');
+      el.classList.add('is-admin-gated');
+      el.setAttribute('title', '需要管理员权限（当前为只读账号）');
+      if (el.tagName === 'BUTTON') el.disabled = true;
+      el.setAttribute('data-admin-old-tabindex', el.getAttribute('tabindex') || '');
+    }
+    count += 1;
+  });
+  return count;
+}
+
+function maybeReadonlyBanner() {
+  if (!isReadonly()) return;
+  const main = $('#main');
+  if (!main || main.querySelector('.admin-readonly-banner')) return;
+  if (!main.querySelector('[' + ADMIN_GATE_ATTR + ']')) return;
+  const banner = document.createElement('div');
+  banner.className = 'notice warn admin-readonly-banner';
+  banner.innerHTML = icon('lock') + '<div><b>只读账号：</b>本页的写操作按钮已全部禁用（需要管理员权限）。如确需修改，请让管理员创建管理员令牌后重新登录。</div>';
+  main.insertBefore(banner, main.firstChild);
+}
+
+let adminGatingTimer = 0;
+let adminGatingObserver = null;
+function scheduleAdminGating() {
+  clearTimeout(adminGatingTimer);
+  adminGatingTimer = setTimeout(() => {
+    const gated = applyAdminGating(document);
+    if (gated > 0) maybeReadonlyBanner();
+  }, 120);
+}
+
+function initAdminGating() {
+  if (adminGatingObserver) return;
+  const targets = [$('#main'), $('#drawer'), $('#modal-root')].filter(Boolean);
+  if (!targets.length) return;
+  adminGatingObserver = new MutationObserver(() => scheduleAdminGating());
+  targets.forEach((node) => adminGatingObserver.observe(node, { childList: true, subtree: true }));
+}
+
+/* ── 未知路由：显式 404 页面（不再静默回退仪表盘） ─────────────────────── */
+function renderNotFound(ctx, viewId) {
+  const root = ctx.root;
+  document.title = '页面不存在 · ' + APP.title;
+  root.innerHTML = pageHead({
+    eyebrow: '404',
+    title: '页面不存在',
+    icon: 'alert',
+    sub: '找不到 #/' + viewId + ' 对应的页面，可能链接已过期或拼写有误。',
+    actions: ['<a class="btn btn-sm btn-solid" href="#/dashboard">' + icon('dash') + '返回仪表盘</a>',
+      '<button class="btn btn-sm btn-ghost" id="nf-search" type="button">' + icon('search') + '搜索页面</button>'],
+  }) + emptyState({
+    icon: 'search',
+    title: '没有这个页面',
+    hint: '用 Ctrl+K 可以搜索页面 / 群 / 成员 / 消息，或返回仪表盘继续操作。',
+    actions: ['<button class="btn btn-sm btn-ghost" id="nf-palette" type="button">' + icon('command') + '打开命令面板</button>',
+      '<a class="btn btn-sm btn-ghost" href="#/dashboard">' + icon('dash') + '回到仪表盘</a>'],
+  });
+  const paletteBtn = $('#nf-palette', root) || $('#nf-search', root);
+  if (paletteBtn) paletteBtn.addEventListener('click', () => Palette.openWith(viewId));
+}
+
 function makeCtx(route) {
   const token = ++APP.routeToken;
   const root = $('#main');
@@ -1490,7 +1661,8 @@ const RootScroller = { restore: 0 };
 
 async function route() {
   const parsed = parseRoute();
-  const view = VIEWS[parsed.viewId] || VIEWS.dashboard;
+  const knownView = Object.prototype.hasOwnProperty.call(VIEWS, parsed.viewId) ? VIEWS[parsed.viewId] : null;
+  const view = knownView || VIEWS.dashboard;
   const normalized = parsed.viewId === view.id ? parsed : { segments: [view.id], query: parsed.query, viewId: view.id };
   const routeKey = (location.hash || '#/dashboard');
   const sameRouteRefresh = routeKey === lastRouteKey && Date.now() - lastRouteAt < 25000;
@@ -1505,6 +1677,21 @@ async function route() {
   document.body.classList.remove('nav-open');
   const navBackdrop = $('#nav-backdrop');
   if (navBackdrop) navBackdrop.hidden = true;
+
+  if (!knownView) {
+    const ctx = makeCtx({ segments: parsed.segments, query: parsed.query, viewId: parsed.viewId });
+    renderNav('');
+    const crumbs = $('#crumbs');
+    if (crumbs) {
+      crumbs.innerHTML = '<a href="#/dashboard" aria-label="仪表盘" title="仪表盘">' + icon('dash') + '</a>' +
+        '<span class="sep">' + icon('chevron-right') + '</span>' +
+        '<span class="current">页面不存在</span>';
+    }
+    updateAutoRefreshButton();
+    renderNotFound(ctx, parsed.viewId);
+    scheduleAdminGating();
+    return;
+  }
 
   renderNav(view.id);
   renderCrumbs(normalized);
@@ -1529,6 +1716,12 @@ async function route() {
     root.innerHTML = pageHead({ title: view.name || view.id, icon: view.icon }) + pendingState({ title: '页面还没实现', hint: '该视图尚未注册 render 方法。', path: '#/' + view.id });
   }
   if (ctx.alive() && sameRouteRefresh) window.scrollTo({ top: RootScroller.restore });
+  if (ctx.alive()) {
+    /* 只读账号：把本页写按钮置灰，并在写页顶部显示只读提示 */
+    const gated = applyAdminGating(root);
+    if (gated > 0) maybeReadonlyBanner();
+    scheduleAdminGating();
+  }
 }
 
 /* ── 10. 命令面板 ─────────────────────────────────────────────────────── */
@@ -1904,7 +2097,16 @@ async function loadIdentity() {
     if (menuName) menuName.textContent = name;
     const menuRole = $('#user-menu-role');
     if (menuRole) menuRole.textContent = me && me.is_admin ? '管理员' : '只读令牌';
-    setSidebarStatus('ok', '已登录 · ' + name);
+    const admin = !!(me && me.is_admin === true);
+    document.body.setAttribute('data-role', admin ? 'admin' : 'readonly');
+    if (!admin) document.body.setAttribute('data-readonly', '1');
+    else document.body.removeAttribute('data-readonly');
+    const chip = $('#user-chip');
+    if (chip) chip.setAttribute('title', admin ? '当前账号：管理员' : '当前账号：只读（写操作已禁用）');
+    const roleTag = $('.user-menu-head small');
+    if (roleTag) roleTag.setAttribute('title', admin ? '管理员令牌：可读写' : '只读令牌：所有写操作已禁用');
+    setSidebarStatus('ok', '已登录 · ' + name + (admin ? '' : '（只读）'));
+    scheduleAdminGating();
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) return;
     setSidebarStatus('bad', '身份校验失败');
@@ -2159,13 +2361,20 @@ async function boot() {
   /* 先渲染一次骨架，再拉身份与数据，保证首屏 < 1.5s 有内容 */
   await loadIdentity();
   mergeNavIndex();
+  initAdminGating();
   await route();
+  applyAdminGating(document);
+  maybeReadonlyBanner();
   getGroups().then(refreshNavBadges).catch(() => {});
   getHumanlike().then(refreshNavBadges).catch(() => {});
   refreshEnvHealth();
   console.info('[FM Console ' + APP.version + '] boot 完成 ' + Math.round(performance.now()) + 'ms');
   window.FM = window.FM || {};
-  window.FM.app = { APP: APP, VIEWS: VIEWS, NAV: NAV, route: route, go: go, theme: Theme };
+  window.FM.app = {
+    APP: APP, VIEWS: VIEWS, NAV: NAV, route: route, go: go, theme: Theme,
+    isAdmin: isAdmin, isReadonly: isReadonly, applyAdminGating: applyAdminGating,
+    toastReadonly: toastReadonly,
+  };
 }
 
 if (document.readyState === 'loading') {

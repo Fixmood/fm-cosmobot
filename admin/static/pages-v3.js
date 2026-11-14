@@ -2379,6 +2379,12 @@
       if (!item || typeof item !== 'object') return null;
       const name = textOf(item.name || item.title || item.label || item.path || ('check ' + (index + 1)));
       const ok = item.ok !== false && item.passed !== false && item.status !== 'fail' && item.success !== false;
+      const httpStatus = item.http_status != null ? Number(item.http_status)
+        : (item.status_code != null ? Number(item.status_code) : null);
+      /* 后端 selftest 的 level：ok / warn / fail；warn 多为只读令牌的预期 403，不能标红 */
+      const level = textOf(item.level || (ok ? 'ok' : (httpStatus === 403 ? 'warn' : 'fail'))) || (ok ? 'ok' : 'fail');
+      const required = item.required !== false;
+      const adminOnly = httpStatus === 403 && /sessions|tokens|auth/i.test(name + ' ' + textOf(item.path || ''));
       return {
         name: name,
         path: textOf(item.path || item.endpoint || item.url || ''),
@@ -2386,6 +2392,10 @@
         ms: item.ms != null ? item.ms : (item.elapsed_ms != null ? item.elapsed_ms : item.duration),
         error: textOf(item.error || item.reason || item.message || ''),
         group: textOf(item.group || item.kind || ''),
+        level: level,
+        required: required,
+        httpStatus: httpStatus,
+        adminOnly: adminOnly,
       };
     }).filter(Boolean);
   }
@@ -2403,6 +2413,8 @@
           rows.push({ name: item[1], path: path, ok: true, ms: Math.round(((performance && performance.now) ? performance.now() : Date.now()) - started), group: item[2] });
         } catch (err) {
           if (err && err.status === 401) throw err;
+          const httpStatus = Number(err && err.status) || null;
+          const adminOnly = httpStatus === 403 && /\/api\/v2\/(sessions|tokens)|\/api\/auth\/tokens/.test(path);
           rows.push({
             name: item[1],
             path: path,
@@ -2411,6 +2423,9 @@
             ms: Math.round(((performance && performance.now) ? performance.now() : Date.now()) - started),
             error: err && err.message ? err.message : String(err),
             group: item[2],
+            level: adminOnly ? 'warn' : 'fail',
+            httpStatus: httpStatus,
+            adminOnly: adminOnly,
           });
         }
       }
@@ -2429,44 +2444,92 @@
     skeleton: 'default',
     async render(ctx) {
       const root = ctx.root;
-      const serverRes = await tryApi(['/api/v2/selftest'], { timeout: 60000 });
-      if (!ctx.alive()) return;
-      let viaServer = false;
-      let rows = [];
-      let serverError = null;
-      if (serverRes.ok) {
-        rows = normalizeSelfTestRows(serverRes.data || {});
-        viaServer = rows.length > 0;
-        if (!rows.length) serverError = '接口返回了空结果';
-      } else {
-        serverError = serverRes.error;
-      }
-      const serverPending = !viaServer && serverRes.pending;
-
       root.innerHTML = pageHead({
         title: '接口自检',
         icon: 'shield',
-        sub: '逐项探测后台 v2 / 新增 v3 / Domain 接口，红绿 + 耗时 + 失败原因；「全部重测」重新跑一遍',
+        sub: '逐项探测后台 v2 / 新增 v3 / Domain 接口，绿=通过、黄=只读预期/未就绪、红=真实失败；「全部重测」重新跑一遍',
         actions: [
           '<button class="btn btn-soft btn-sm" id="selftest-run" type="button">' + icon('play') + '全部重测</button>',
           '<button class="btn btn-ghost btn-sm" id="selftest-copy" type="button">' + icon('copy') + '复制结果</button>',
           '<a class="btn btn-ghost btn-sm" href="#/browse">' + icon('database') + '接口调试器</a>',
         ],
       }) +
+      '<div id="selftest-progress" class="run-progress" hidden>' +
+        '<div class="rp-head"><span class="rp-title mono" id="selftest-progress-label">' + icon('loader', 'spin') + ' 正在运行接口自检…</span>' +
+        '<span class="rp-time mono" id="selftest-elapsed">0s</span></div>' +
+        '<div class="progress-track"><div class="progress-fill indeterminate"></div></div>' +
+        '<div class="rp-hint muted-2 text-xs">接口自检会依次探测约 90 个接口，通常需要 19–53 秒；期间不用反复刷新。</div>' +
+      '</div>' +
+      '<div id="selftest-source"></div>' +
       '<div id="selftest-summary"></div>' +
-      (serverPending
-        ? notice('warn', '后端 <span class="mono">/api/v2/selftest</span> 尚未就绪（' + esc(serverError && serverError.message ? serverError.message : 'HTTP 404') + '），当前已自动切换为<b>前端逐项探测</b>：同样逐项请求真实接口并显示耗时与原因。')
-        : (viaServer ? notice('ok', '数据源：后端 <span class="mono">/api/v2/selftest</span> 自检矩阵' + (normalizeSelfTestRows(serverRes.data || {}).length ? '（' + rows.length + ' 项）' : '')) : notice('bad', '自检接口失败：' + esc(serverError && serverError.message ? serverError.message : '未知错误') + '，已回退前端探测。'))) +
       '<div class="filters mt-12">' +
-        '<label class="check"><input type="checkbox" id="selftest-only-bad">只看失败 / 未就绪</label>' +
+        '<label class="check"><input type="checkbox" id="selftest-only-bad">只看未通过 / 未就绪</label>' +
         '<div class="field grow"><input class="input input-sm" id="selftest-q" placeholder="过滤检查项 / 路径…"></div>' +
         '<span class="muted text-xs" id="selftest-count"></span>' +
       '</div>' +
       '<div class="card mt-12"><div class="card-body" id="selftest-list"></div></div>' +
       '<div class="grid grid-4 mt-16" id="selftest-groups"></div>' +
-      '<div class="notice mt-16">' + icon('info') + '<div>说明：后端自检接口返回矩阵时以前端展示为主；后端未就绪时前端会逐项请求 <span class="mono">/api/v2/*</span> 与 <span class="mono">/api/domain/*</span>，404/501 记为「未就绪」，其它错误记为「失败」并展示原因。</div></div>';
+      '<div class="notice mt-16">' + icon('info') + '<div>说明：<b>绿色=通过</b>，<b>黄色=只读账号的预期权限（403，需管理员）或接口未就绪</b>，<b>红色=真实失败</b>。后端 <span class="mono">/api/v2/selftest</span> 返回矩阵时以后端结果为准，未就绪时自动回退前端逐项探测。</div></div>';
 
+      const progressRoot = document.getElementById('selftest-progress');
+      const progressLabel = document.getElementById('selftest-progress-label');
+      const elapsedNode = document.getElementById('selftest-elapsed');
       const listRoot = document.getElementById('selftest-list');
+      const sourceRoot = document.getElementById('selftest-source');
+      if (listRoot) listRoot.innerHTML = '<div class="sk sk-line w60"></div><div class="sk sk-line"></div><div class="sk sk-line"></div><div class="sk sk-line"></div>';
+      let progressTimer = 0;
+      let progressStartedAt = 0;
+      function startProgress(label) {
+        if (!progressRoot) return;
+        progressRoot.hidden = false;
+        progressStartedAt = Date.now();
+        if (progressLabel && label) progressLabel.innerHTML = icon('loader', 'spin') + ' ' + esc(label);
+        if (progressTimer) clearInterval(progressTimer);
+        progressTimer = setInterval(function () {
+          if (elapsedNode) elapsedNode.textContent = Math.round((Date.now() - progressStartedAt) / 1000) + 's';
+        }, 500);
+      }
+      function stopProgress() {
+        if (progressRoot) progressRoot.hidden = true;
+        if (progressTimer) clearInterval(progressTimer);
+        progressTimer = 0;
+        if (elapsedNode) elapsedNode.textContent = '0s';
+      }
+      ctx.cleanup(stopProgress);
+
+      startProgress('正在运行后端自检（19–53 秒）…');
+      const serverRes = await tryApi(['/api/v2/selftest'], { timeout: 90000 });
+      stopProgress();
+      if (!ctx.alive()) return;
+      let viaServer = false;
+      let rows = [];
+      let serverError = null;
+      let serverSummary = null;
+      if (serverRes.ok) {
+        rows = normalizeSelfTestRows(serverRes.data || {});
+        serverSummary = serverRes.data && serverRes.data.summary ? serverRes.data.summary : null;
+        viaServer = rows.length > 0;
+        if (!rows.length) serverError = '接口返回了空结果';
+      } else {
+        serverError = serverRes.error;
+      }
+      const serverPending = !viaServer && serverRes.pending;
+      if (sourceRoot) {
+        if (serverPending) {
+          sourceRoot.innerHTML = notice('warn', '后端 <span class="mono">/api/v2/selftest</span> 尚未就绪（' + esc(serverError && serverError.message ? serverError.message : 'HTTP 404') + '），当前已自动切换为<b>前端逐项探测</b>：同样逐项请求真实接口并显示耗时与原因。');
+        } else if (viaServer) {
+          let summaryText = '';
+          if (serverSummary) {
+            summaryText = ' · 后端摘要：通过 ' + fmtNum(serverSummary.passed) + ' / ' + fmtNum(serverSummary.total);
+            if (serverSummary.failed_optional) summaryText += '，需管理员 ' + fmtNum(serverSummary.failed_optional);
+            summaryText += '，失败 ' + fmtNum(serverSummary.failed_required || 0);
+            if (serverSummary.wall_ms) summaryText += ' · 全量 ' + (Number(serverSummary.wall_ms) / 1000).toFixed(1) + 's';
+          }
+          sourceRoot.innerHTML = notice('ok', '数据源：后端 <span class="mono">/api/v2/selftest</span> 自检矩阵（' + rows.length + ' 项）' + summaryText);
+        } else {
+          sourceRoot.innerHTML = notice('bad', '自检接口失败：' + esc(serverError && serverError.message ? serverError.message : '未知错误') + '，已回退前端探测。');
+        }
+      }
       const summaryRoot = document.getElementById('selftest-summary');
       const countNode = document.getElementById('selftest-count');
       const badCheck = document.getElementById('selftest-only-bad');
@@ -2483,16 +2546,22 @@
           return (row.name + ' ' + row.path + ' ' + (row.error || '')).toLowerCase().indexOf(kw) >= 0;
         });
         const pass = currentRows.filter(function (row) { return row.ok; }).length;
-        const pending = currentRows.filter(function (row) { return !row.ok && row.pending; }).length;
-        const fail = currentRows.length - pass - pending;
+        const needAdmin = currentRows.filter(function (row) {
+          return !row.ok && (row.adminOnly || row.httpStatus === 403 || row.level === 'warn');
+        }).length;
+        const pending = currentRows.filter(function (row) {
+          return !row.ok && !row.adminOnly && row.httpStatus !== 403 && row.level !== 'warn' && row.pending;
+        }).length;
+        const fail = currentRows.length - pass - needAdmin - pending;
         const slowest = currentRows.slice().sort(function (a, b) { return (Number(b.ms) || 0) - (Number(a.ms) || 0); })[0];
         if (summaryRoot) {
           summaryRoot.innerHTML = kpiGrid([
             { label: '检查项', icon: 'shield', valueHtml: fmtNum(currentRows.length), hint: viaServer ? '后端自检矩阵' : '前端逐项探测' },
-            { label: '通过', icon: 'check', valueHtml: fmtNum(pass), tone: 'ok', hint: pass === currentRows.length && currentRows.length ? '全部通过' : '' },
-            { label: '未就绪', icon: 'clock', valueHtml: fmtNum(pending), tone: pending ? 'warn' : '', hint: '404 / 501' },
-            { label: '失败', icon: 'alert', valueHtml: fmtNum(fail), tone: fail ? 'bad' : '', hint: slowest ? '最慢 ' + esc(slowest.name) + ' ' + fmtNum(slowest.ms) + ' ms' : '' },
-          ]);
+            { label: '通过', icon: 'check-circle', valueHtml: fmtNum(pass), tone: 'ok', hint: pass === currentRows.length && currentRows.length ? '全部通过' : '' },
+            { label: '需管理员', icon: 'lock', valueHtml: fmtNum(needAdmin), tone: needAdmin ? 'warn' : '', hint: '只读账号的预期 403（sessions / tokens）' },
+            { label: '未就绪', icon: 'clock', valueHtml: fmtNum(pending), tone: pending ? 'warn' : '', hint: '404 / 501 / 超时' },
+            { label: '失败', icon: 'alert', valueHtml: fmtNum(fail), tone: fail ? 'bad' : 'ok', hint: fail ? '红色仅代表真实失败' : (slowest ? '最慢 ' + esc(slowest.name) + ' ' + fmtNum(slowest.ms) + ' ms' : '无真实失败') },
+          ], { cols: 5 });
         }
         if (countNode) countNode.textContent = visible.length + ' / ' + currentRows.length + ' 项';
         if (!visible.length) {
@@ -2500,18 +2569,22 @@
           return;
         }
         listRoot.innerHTML = visible.map(function (row) {
-          const tone = row.ok ? 'ok' : row.pending ? 'warn' : 'bad';
-          const statusText = row.ok ? '通' : row.pending ? '未就绪' : '失败';
+          const adminOnly = !row.ok && (row.adminOnly || row.httpStatus === 403 || row.level === 'warn');
+          const pendingRow = !row.ok && !adminOnly && row.pending;
+          const tone = row.ok ? 'ok' : adminOnly ? 'warn' : pendingRow ? 'warn' : 'bad';
+          const statusText = row.ok ? '通过' : adminOnly ? '需管理员' : pendingRow ? '未就绪' : '失败';
+          const detail = !row.ok && !adminOnly && row.error ? '<div class="v3-check-error mono">' + esc(row.error) + '</div>'
+            : (adminOnly ? '<div class="v3-check-hint text-xs">只读账号无权访问管理员接口（HTTP 403），属预期；使用管理员令牌即为绿色。</div>' : '');
           return '<div class="v3-check-list-item">' +
             '<div class="v3-check-row">' +
               '<span class="dot" data-tone="' + tone + '"></span>' +
-              '<span class="v3-check-name">' + esc(row.name) + '</span>' +
-              '<span class="v3-check-path mono">' + esc(row.path) + '</span>' +
-              '<span class="spacer"></span>' +
+              '<span class="v3-check-name" title="' + escAttr(row.name) + '">' + esc(row.name) + '</span>' +
+              '<span class="v3-check-path mono" title="' + escAttr(row.path) + '">' + esc(row.path) + '</span>' +
+              '<span class="v3-check-flex"></span>' +
+              (row.httpStatus && !row.ok ? '<span class="muted-2 text-xs mono">HTTP ' + esc(row.httpStatus) + '</span>' : '') +
               (row.ms != null ? '<span class="muted-2 text-xs mono">' + fmtNum(row.ms) + ' ms</span>' : '') +
               '<span class="tag tag-' + tone + '">' + statusText + '</span>' +
-            '</div>' +
-            (!row.ok && row.error ? '<div class="v3-check-error mono">' + esc(row.error) + '</div>' : '') +
+            '</div>' + detail +
           '</div>';
         }).join('');
       }
@@ -2522,19 +2595,24 @@
         const btn = document.getElementById('selftest-run');
         if (btn) { btn.disabled = true; btn.innerHTML = icon('clock') + '检测中…'; }
         listRoot.innerHTML = '<div class="sk sk-line w60"></div><div class="sk sk-line"></div><div class="sk sk-line"></div><div class="sk sk-line"></div>';
+        startProgress(viaServer ? '正在重新运行后端自检（19–53 秒）…' : '正在逐项探测接口…');
         try {
           if (viaServer) {
-            const res = await tryApi(['/api/v2/selftest'], { timeout: 60000 });
-            if (res.ok) currentRows = normalizeSelfTestRows(res.data || {});
-            else currentRows = await runLocalSelfTest();
+            const res = await tryApi(['/api/v2/selftest'], { timeout: 90000 });
+            if (res.ok) {
+              currentRows = normalizeSelfTestRows(res.data || {});
+              if (sourceRoot) sourceRoot.innerHTML = notice('ok', '数据源：后端 <span class="mono">/api/v2/selftest</span> 自检矩阵（' + currentRows.length + ' 项）');
+            } else currentRows = await runLocalSelfTest();
           } else {
             currentRows = await runLocalSelfTest();
           }
+          stopProgress();
           if (!ctx.alive()) return;
           paint();
           const pass = currentRows.filter(function (row) { return row.ok; }).length;
           toast('自检完成：' + pass + ' / ' + currentRows.length + ' 通过', pass === currentRows.length ? 'ok' : 'warn');
         } catch (err) {
+          stopProgress();
           if (!ctx.alive()) return;
           listRoot.innerHTML = errorState(err, 'selftest-retry');
           const retry = document.getElementById('selftest-retry');
