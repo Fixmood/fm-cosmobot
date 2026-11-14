@@ -838,11 +838,19 @@ allCompetitionRankQuickHandler =
               | pair@(contest, _) <- parseContestTodayItems (responseBody response)
               , contest `elem` allowed
               ]
+            -- 2026-11-15 所有者指定的顺序：虎杯 → 锦标赛 → 极速杯 → 极速联赛 → 555 → 群赛文
+            order = ["HB" :: Text, "100000", "99999", "100004", "555", "999"]
+            orderedPicks =
+              [ pair
+              | key <- order
+              , pair@(contest, _) <- picked
+              , contest == key
+              ]
             urls =
               [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
                   <> "&group_id=" <> urlEncodeText groupId
                   <> "&limit=5&_=" <> cacheBase <> contest <> groupId
-              | (contest, groupId) <- picked
+              | (contest, groupId) <- orderedPicks
               ]
         if null urls
           then sendStandalone message "今天还没有任何赛文有成绩，晚点再来看看。"
