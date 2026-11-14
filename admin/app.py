@@ -2210,9 +2210,22 @@ class Api(BaseHTTPRequestHandler):
     # ══ v3 扩展：SSE 日志流 / CSV 导出流 / 自检矩阵 ══════════════════════════
 
     def _sse_send(self, event: str, payload: dict) -> None:
-        data = json.dumps(payload, ensure_ascii=False)
-        frame = ("event: %s\ndata: %s\n\n" % (event, data)).encode("utf-8")
+        """发一个 SSE data 帧。
+
+        兼容性考虑：用「默认 message 事件」而不是命名事件（event: xxx），
+        这样前端用 es.onmessage 也能直接收到；事件类型放在 data.type 里，
+        需要区分的实现可以用 addEventListener('message') + 判断 type。
+        """
+        body = {"type": event}
+        body.update(payload or {})
+        data = json.dumps(body, ensure_ascii=False)
+        frame = ("data: %s\n\n" % data).encode("utf-8")
         self.wfile.write(frame)
+        self.wfile.flush()
+
+    def _sse_comment(self, text: str) -> None:
+        """SSE 注释行（keepalive），浏览器不会当消息派发。"""
+        self.wfile.write((": %s\n\n" % str(text).replace("\n", " ")).encode("utf-8"))
         self.wfile.flush()
 
     def handle_logs_stream(self, tail: str = "100", since: str = "", seconds: str = "180") -> None:
@@ -2269,6 +2282,7 @@ class Api(BaseHTTPRequestHandler):
                         cursor = line_ts
                 self._sse_send("ping", {"at": int(time.time()), "sent": sent,
                                         "cursor": cursor, "remaining_seconds": int(deadline - time.time())})
+                self._sse_comment("keepalive at=%d" % int(time.time()))
                 first = False
                 time.sleep(2.0 if sent else 3.0)
         except (BrokenPipeError, ConnectionResetError, OSError):
