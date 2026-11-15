@@ -2458,7 +2458,7 @@
         '<div class="rp-head"><span class="rp-title mono" id="selftest-progress-label">' + icon('loader', 'spin') + ' 正在运行接口自检…</span>' +
         '<span class="rp-time mono" id="selftest-elapsed">0s</span></div>' +
         '<div class="progress-track"><div class="progress-fill indeterminate"></div></div>' +
-        '<div class="rp-hint muted-2 text-xs">接口自检会依次探测约 90 个接口，通常需要 19–53 秒；期间不用反复刷新。</div>' +
+        '<div class="rp-hint muted-2 text-xs">接口自检会依次探测约 92 个接口，通常 <b>2–10 秒</b>（首次冷启动略慢）；期间不用反复刷新。</div>' +
       '</div>' +
       '<div id="selftest-source"></div>' +
       '<div id="selftest-summary"></div>' +
@@ -2497,7 +2497,7 @@
       }
       ctx.cleanup(stopProgress);
 
-      startProgress('正在运行后端自检（19–53 秒）…');
+      startProgress('正在运行后端自检（约 2–10 秒，首次冷启动略慢）…');
       const serverRes = await tryApi(['/api/v2/selftest'], { timeout: 90000 });
       stopProgress();
       if (!ctx.alive()) return;
@@ -2595,7 +2595,7 @@
         const btn = document.getElementById('selftest-run');
         if (btn) { btn.disabled = true; btn.innerHTML = icon('clock') + '检测中…'; }
         listRoot.innerHTML = '<div class="sk sk-line w60"></div><div class="sk sk-line"></div><div class="sk sk-line"></div><div class="sk sk-line"></div>';
-        startProgress(viaServer ? '正在重新运行后端自检（19–53 秒）…' : '正在逐项探测接口…');
+        startProgress(viaServer ? '正在重新运行后端自检（约 2–10 秒，首次冷启动略慢）…' : '正在逐项探测接口…');
         try {
           if (viaServer) {
             const res = await tryApi(['/api/v2/selftest'], { timeout: 90000 });

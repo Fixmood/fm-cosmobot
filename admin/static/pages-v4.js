@@ -107,11 +107,18 @@
   /* 缓存徽标：后端 ops 接口会返回 cached / cache_age_seconds / cache_ttl（P1-2） */
   function cacheAgeText(data) {
     if (!data) return '实时';
+    const age = Number(data.cache_age_seconds);
+    const ttl = Number(data.cache_ttl);
+    const ageText = isFinite(age) && age >= 0 ? ' · ' + age.toFixed(1) + 's 前' : '';
+    /* 后端语义：warming=首次采集；stale=缓存过期先返旧值、后台刷新；cached=缓存命中；否则实时 */
+    if (data.warming === true) return '采集中（后台刷新中）';
+    if (data.stale === true) {
+      let text = '缓存（后台刷新中）' + ageText;
+      if (isFinite(ttl) && ttl > 0) text += ' / TTL ' + ttl + 's';
+      return text;
+    }
     if (data.cached === true) {
-      const age = Number(data.cache_age_seconds);
-      const ttl = Number(data.cache_ttl);
-      let text = '缓存命中';
-      if (isFinite(age) && age >= 0) text += ' · ' + age.toFixed(1) + 's 前';
+      let text = '缓存命中' + ageText;
       if (isFinite(ttl) && ttl > 0) text += ' / TTL ' + ttl + 's';
       return text;
     }
@@ -120,8 +127,12 @@
 
   function cacheBadgeHtml(res, data) {
     if (!res || !res.ok) return '<span class="tag tag-warn">' + icon('x-circle') + '读取失败</span>';
-    const cached = data && data.cached === true;
-    return '<span class="tag ' + (cached ? 'tag-info' : 'tag-ok') + '">' + icon(cached ? 'database' : 'activity') + esc(cacheAgeText(data)) + '</span>';
+    const warming = !!(data && data.warming === true);
+    const stale = !!(data && data.stale === true);
+    const cached = !!(data && data.cached === true);
+    const tone = warming ? 'tag-warn' : (stale || cached) ? 'tag-info' : 'tag-ok';
+    const iconName = warming ? 'loader' : stale ? 'refresh' : cached ? 'database' : 'activity';
+    return '<span class="tag ' + tone + '">' + icon(iconName) + esc(cacheAgeText(data)) + '</span>';
   }
 
   /* 运行中进度条：慢接口等待期间显示（不提前判定失败） */
@@ -1527,7 +1538,7 @@
     body.innerHTML =
       '<div class="row" style="justify-content:space-between;margin-bottom:12px">' +
         '<div class="row"><span class="tag ' + (res.ok ? 'tag-ok' : 'tag-warn') + '">' + esc(data.source || (res.ok ? '缓存' : '未就绪')) + '</span>' +
-        (warming ? '<span class="tag tag-warn">' + icon('clock') + '缓存预热中</span>' : '') +
+        (warming ? '<span class="tag tag-warn">' + icon('loader') + '采集中（后台刷新中）</span>' : '') +
         '<span class="muted-2 text-sm">共 ' + fmtNum(images.length) + ' 个镜像</span></div>' +
         '<button class="btn btn-sm btn-ghost" id="ops-images-refresh" type="button">' + icon('refresh') + '刷新</button>' +
       '</div>' +
@@ -1606,7 +1617,14 @@
       const data = res.data || {};
       const lines = data.lines || [];
       if (cacheNode) cacheNode.innerHTML = cacheBadgeHtml(res, data);
-      if (meta) meta.textContent = (data.total_lines != null ? '总行 ' + fmtNum(data.total_lines) + ' · ' : '') + '返回 ' + lines.length + ' 行' + (data.grep_matched ? ' · 命中 ' + fmtNum(data.grep_matched) : '');
+      const metaParts = [];
+      if (data.total_lines != null) metaParts.push('总行 ' + fmtNum(data.total_lines));
+      metaParts.push('返回 ' + lines.length + ' 行');
+      if (data.grep_matched) metaParts.push('命中 ' + fmtNum(data.grep_matched));
+      if (data.source) metaParts.push(String(data.source));
+      if (data.duration_ms != null) metaParts.push(fmtNum(data.duration_ms) + 'ms');
+      if (data.request_id) metaParts.push(String(data.request_id).slice(0, 18));
+      if (meta) meta.textContent = metaParts.join(' · ');
       view.innerHTML = lines.length
         ? '<pre class="v3-log">' + lines.map((line) => {
           const text = typeof line === 'string' ? line : (line.text || '');

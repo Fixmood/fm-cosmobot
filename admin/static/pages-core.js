@@ -938,7 +938,8 @@ async function renderMemberDetail(ctx, uid) {
   '<div class="grid grid-wide">' +
     card({ title: '成员档案', icon: 'user', headActions: [
         profile ? '<span class="tag tag-ok">' + icon('check') + '/api/v2/members/profile</span>'
-          : profileRes.pending ? '<span class="tag tag-warn">profile 接口待接入</span>' : '<span class="tag tag-bad">档案不可用</span>',
+          : notFoundMember ? '<span class="tag tag-muted">' + icon('search') + '查无此成员</span>'
+            : profileRes.pending ? '<span class="tag tag-warn">profile 接口待接入</span>' : '<span class="tag tag-bad">档案不可用</span>',
         '<button class="btn btn-ghost btn-sm" data-json-drawer="' + escAttr(jsonSum(profile || fallback || { user_id: uid }).slice(0, 6000)) + '" data-json-title="成员档案" type="button">' + icon('eye') + 'JSON</button>',
       ] },
       '<div class="kv-grid">' +
@@ -951,7 +952,7 @@ async function renderMemberDetail(ctx, uid) {
       '</div>' +
       '<div class="section-title mt-16">' + icon('members') + '曾用昵称<span class="section-sub">' + aliases.length + ' 个 · 按出现次数排序</span></div>' +
       '<div class="chips mt-8">' + (aliases.length ? aliases.map((alias) => '<span class="tag">' + esc(alias) + '</span>').join('') : '<span class="muted-2">暂无记录</span>') + '</div>' +
-      (!profile && profileRes.pending ? '<div class="notice mt-12">' + icon('clock') + '<div>后端 <code class="inline">/api/v2/members/profile?id=</code> 尚未就绪，当前展示成员搜索接口的聚合结果。</div></div>' : '')) +
+      (!notFoundMember && !profile && profileRes.pending ? '<div class="notice mt-12">' + icon('clock') + '<div>后端 <code class="inline">/api/v2/members/profile?id=</code> 尚未就绪，当前展示成员搜索接口的聚合结果。</div></div>' : '')) +
     card({ title: '按群活跃', icon: 'groups', headActions: ['<span class="muted text-xs">全部历史</span>'] },
       '<div id="member-groups"></div>' +
       '<div class="card-note">来自 chat_log 全量聚合（不是采样），按消息数排序。</div>') +
