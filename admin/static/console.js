@@ -1373,6 +1373,7 @@ const NAV = [
     items: [
       { id: 'ops', name: '运维监控', icon: 'activity', keys: 'ops 运维 监控 metrics 镜像 回滚 cron 日志' },
       { id: 'deploy', name: '部署与运维', icon: 'server', keys: 'deploy 部署 重启 镜像' },
+      { id: 'qq', name: 'QQ 登录', icon: 'message', keys: 'qq QQ 登录 snowluma 二维码 扫码 onebot 掉线 上线' },
       { id: 'logs', name: '日志', icon: 'terminal', keys: 'log 日志 错误 error' },
       { id: 'backup', name: '备份与导出', icon: 'download', keys: 'backup 备份 导出 csv' },
       { id: 'selftest', name: '接口自检', icon: 'shield-check', keys: 'selftest 自检 接口 健康' },
@@ -2290,7 +2291,7 @@ function onGlobalKey(event) {
     const targets = {
       d: '#/dashboard', a: '#/analytics-msg', g: '#/groups', c: '#/content',
       o: '#/ops', s: '#/settings', l: '#/logs', m: '#/members', t: '#/tools',
-      u: '#/analytics-senders', h: '#/humanlike', b: '#/browse',
+      u: '#/analytics-senders', h: '#/humanlike', b: '#/browse', q: '#/qq',
     };
     if (key === 'g') {
       pendingGoto = Date.now();

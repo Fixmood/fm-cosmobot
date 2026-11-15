@@ -1,0 +1,146 @@
+/* ══════════════════════════════════════════════════════════════════════════
+ * FM Console · QQ 登录页（#/qq）样式
+ * 依赖 design-system.css / console.css / responsive.css 的 tokens 与组件。
+ * ════════════════════════════════════════════════════════════════════════ */
+
+.qq-alert { margin-bottom: 14px; }
+.qq-alert .notice { align-items: flex-start; }
+.qq-alert .notice b { color: var(--text-1); }
+.qq-alert-title { display: flex; align-items: center; gap: 8px; font-size: var(--fs-md); font-weight: 650; }
+.qq-alert-desc { margin-top: 3px; color: var(--text-3); font-size: var(--fs-sm); line-height: 1.6; }
+
+/* 状态卡：复用 kpis，但让 6 张卡在页面里更紧凑 */
+.qq-status { margin-bottom: 14px; }
+.qq-status .kpi { padding: 13px 15px 12px; }
+.qq-status .kpi-value { font-size: var(--fs-xl); }
+
+.qq-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.qq-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+/* 登录 / QQ 界面大图 */
+.qq-screen-card .card-body { display: flex; flex-direction: column; gap: 11px; }
+.qq-screen-frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+  padding: 12px;
+  border: 1px dashed var(--accent-line);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(420px 200px at 20% 0%, var(--accent-soft), transparent 70%),
+    var(--surface-inset);
+  overflow: hidden;
+}
+.qq-screen-img {
+  display: block;
+  width: 100%;
+  max-height: 64vh;
+  object-fit: contain;
+  border-radius: var(--radius);
+  border: 1px solid var(--line-1);
+  background: var(--surface-0, #000);
+  box-shadow: var(--shadow-2);
+}
+.qq-screen-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+  background: var(--surface-inset);
+}
+.qq-screen-loading[hidden] { display: none; }
+.qq-screen-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+.qq-screen-error { margin-top: 4px; }
+
+/* 已登录时的折叠态 */
+.qq-collapsed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 18px;
+  text-align: center;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--radius-lg);
+  background: var(--surface-inset);
+}
+.qq-collapsed-title { display: flex; align-items: center; gap: 8px; font-size: var(--fs-md); font-weight: 650; color: var(--text-1); }
+.qq-collapsed p { margin: 0; color: var(--text-3); font-size: var(--fs-sm); line-height: 1.6; max-width: 460px; }
+
+/* 扫码步骤 */
+.qq-steps { display: flex; flex-direction: column; gap: 10px; }
+.qq-step { display: flex; align-items: flex-start; gap: 10px; }
+.qq-step-num {
+  flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-xs); font-weight: 700;
+}
+.qq-step-main { min-width: 0; }
+.qq-step-title { display: block; font-size: var(--fs-sm); font-weight: 580; color: var(--text-1); line-height: 1.5; }
+.qq-step-desc { display: block; margin-top: 2px; font-size: var(--fs-xs); color: var(--text-3); line-height: 1.55; }
+
+/* 管理员操作 */
+.qq-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.qq-actions .btn { flex: 0 1 auto; }
+.qq-action-log {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line-1);
+}
+.qq-log-row { display: flex; gap: 8px; font-size: var(--fs-xs); line-height: 1.55; }
+.qq-log-time { flex: none; color: var(--text-4); font-variant-numeric: tabular-nums; }
+.qq-log-text { color: var(--text-2); word-break: break-word; }
+.qq-log-row[data-tone="ok"] .qq-log-text { color: var(--ok); }
+.qq-log-row[data-tone="warn"] .qq-log-text { color: var(--warn); }
+.qq-log-row[data-tone="bad"] .qq-log-text { color: var(--bad); }
+.qq-action-progress { margin-top: 10px; }
+
+/* 状态详情 */
+.qq-detail-list { display: flex; flex-direction: column; gap: 0; }
+.qq-detail-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--line-1);
+  font-size: var(--fs-sm);
+}
+.qq-detail-row:last-child { border-bottom: 0; }
+.qq-detail-label { color: var(--text-3); flex: none; }
+.qq-detail-value { color: var(--text-1); text-align: right; word-break: break-word; font-variant-numeric: tabular-nums; }
+.qq-detail-value.mono { font-family: var(--font-mono); font-size: var(--fs-xs); }
+
+/* 响应式：平板/手机单列 */
+@media (max-width: 1100px) {
+  .qq-layout { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .qq-status .kpi-value { font-size: var(--fs-lg); }
+  .qq-screen-frame { min-height: 240px; padding: 8px; }
+  .qq-screen-img { max-height: 46vh; }
+  .qq-actions .btn { flex: 1 1 calc(50% - 4px); min-height: 36px; }
+  .qq-detail-row { font-size: var(--fs-xs); }
+}
