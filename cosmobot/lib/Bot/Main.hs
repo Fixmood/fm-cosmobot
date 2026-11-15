@@ -215,7 +215,7 @@ withRouteDebugLogging index route =
     logMatch decision message =
       logDebug
         [i|Route matched: index=#{index} label=#{routeLabel route} decision=#{decision} #{incomingMessageLogLine message}|]
-    routeDecideTimeoutMicros = 2_000_000
+    routeDecideTimeoutMicros = 800_000
     routeActionTimeoutMicros = 25_000_000
 
 routeLabel :: Route es -> Text

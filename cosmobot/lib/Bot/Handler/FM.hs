@@ -1191,11 +1191,14 @@ messagePayload message =
     ]
 
 postEvent :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
-postEvent _eventName _payload =
-  -- 2026-11-15 紧急隔离：事件归档到 fm-domain 在当前环境必超时，且失败会把消息流打死
-  -- （= 收得到消息但永不处理）。为保证回复优先，这里暂时不做外部归档，原样返回空。
-  -- 待 domain 网络问题定位后恢复为带 catch 的真实投递。
-  pure Aeson.Null
+postEvent eventName payload =
+  -- 归档到 fm-domain；失败只吞掉（网络抖动时绝不能把消息流打死）。
+  (do
+     response <- HTTP.runReq $
+       req POST (http "fm-domain" /: "events" /: eventName)
+         (ReqBodyJson payload) jsonResponse (port 8077)
+     pure (responseBody response :: Aeson.Value))
+    `catchSync` \_err -> pure Aeson.Null
 
 jsonFlag :: Text -> Aeson.Value -> Bool
 jsonFlag field =
