@@ -80,7 +80,7 @@ fmGroupStatusTool =
   withDescription "Read FM group status and enabled capabilities from the migrated FM data service."
     $ tool "fm_group_status" noArguments do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "groups") NoReqBody jsonResponse (port 8077)
+        req GET (http "fm-domain" /: "groups") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
 
 fmLibrarySearchTool :: HTTP.HTTP :> es => Tool (Eff es)
@@ -96,7 +96,7 @@ fmLibrarySearchTool =
         withCapability context "library" do
           let limit = max 1 (min 30 (fromMaybe 10 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "library" /: "search") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "library" /: "search") NoReqBody jsonResponse
               ("q" =: query <> "limit" =: limit <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: [Aeson.Value])
 
@@ -109,7 +109,7 @@ fmLibraryPickTool =
         context <- askToolContext
         withCapability context "library" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "library" /: "pick") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "library" /: "pick") NoReqBody jsonResponse
               ("q" =: query <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
@@ -217,7 +217,7 @@ fmLibraryStatsTool =
   withDescription "Read FM typing-practice library statistics, including total texts, characters, difficulty indexing, and active article sessions."
   $ tool "fm_library_stats" noArguments do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
+        req GET (http "fm-domain" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 librarySessionPayload :: Context -> Aeson.Value
@@ -258,7 +258,7 @@ libraryStartPayload context query difficulty length =
 postLibrarySession :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postLibrarySession action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "library" /: "session" /: action)
+    req POST (http "fm-domain" /: "library" /: "session" /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -362,7 +362,7 @@ writeNovelLastId path value = do
 postNovel :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postNovel action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "novel" /: action)
+    req POST (http "fm-domain" /: "novel" /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -422,7 +422,7 @@ typingStatsPayload context scope days book limit =
 postTypingStats :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
 postTypingStats payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "typing" /: "stats")
+    req POST (http "fm-domain" /: "typing" /: "stats")
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -512,7 +512,7 @@ fmContestChartTool =
                   "" -> Text.strip (fromMaybe "" context.message.senderUsername)
                   other -> other
               url =
-                "http://172.20.0.4:8077/contest/chart.png?contest="
+                "http://fm-domain:8077/contest/chart.png?contest="
                   <> Text.strip contest
                   <> "&group_id=" <> groupText
                   <> "&days=" <> dayText
@@ -613,7 +613,7 @@ fmRecallQueryTool =
         context <- askToolContext
         withCapability context "recall" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "recalls") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "recalls") NoReqBody jsonResponse
               ( "group_id" =: fromMaybe "" groupId
                 <> "q" =: fromMaybe "" query
                 <> port 8077
@@ -662,7 +662,7 @@ fmScoreQueryTool =
         withCapability context "scores" do
           let limit = max 1 (min 100 (fromMaybe 20 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "scores") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "scores") NoReqBody jsonResponse
               ( "group_id" =: fromMaybe "" groupId
                 <> "sender_id" =: fromMaybe "" senderId
                 <> "limit" =: limit
@@ -680,7 +680,7 @@ fmGroupSetOnlineTool =
       )
       \groupId online -> do
         response <- HTTP.runReq $
-          req POST (http "172.20.0.4" /: "group-state")
+          req POST (http "fm-domain" /: "group-state")
             (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
             jsonResponse
             (port 8077)
@@ -697,7 +697,7 @@ fmGroupSetCapabilityTool =
       )
       \groupId capability enabled -> do
         response <- HTTP.runReq $
-          req POST (http "172.20.0.4" /: "group-capability")
+          req POST (http "fm-domain" /: "group-capability")
             (ReqBodyJson (Aeson.object
               [ "group_id" Aeson..= groupId
               , "capability" Aeson..= capability
@@ -722,7 +722,7 @@ fmContestSearchTool =
         withCapability context "contest" do
           let limit = max 1 (min 30 (fromMaybe 10 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "contest" /: "search") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "contest" /: "search") NoReqBody jsonResponse
               ( "q" =: fromMaybe "" query
                 <> "source" =: fromMaybe "" source
                 <> "date" =: fromMaybe "" competitionDate
@@ -744,7 +744,7 @@ fmContestSendTool =
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req POST (http "172.20.0.4" /: "contest" /: "session" /: "start")
+            req POST (http "fm-domain" /: "contest" /: "session" /: "start")
               (ReqBodyJson (Aeson.object
                 [ "platform" Aeson..= chatPlatformKey context.message.platform
                 , "chat_id" Aeson..= maybe ("" :: Text) show context.message.chatId
@@ -769,7 +769,7 @@ fmLiveCompetitionRankTool =
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "live") NoReqBody jsonResponse
               ( "source" =: fromMaybe "" source
                 <> "group_id" =: contextChatId context
                 <> "date" =: fromMaybe "" competitionDate
@@ -782,7 +782,7 @@ fmLiveCompetitionRankTool =
               | status /= "ok" -> pure (toolText ("实时排行榜查询失败：" <> fallback message "公开网站当前没有返回可用数据。"))
               | otherwise -> do
                   let sourceKey = if kind == "group" then groupId else kind
-                      imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source=" <> sourceKey
+                      imageUrl = "http://fm-domain:8077/reports/live-competition.png?source=" <> sourceKey
                         <> "&date=" <> actualDate <> "&combined=1"
                   sent <- Chat.replyTo context.message (ReplyBody.imageDirective imageUrl)
                   case rights sent of
@@ -818,7 +818,7 @@ fmLiveCompetitionTextTool =
         context <- askToolContext
         withCapability context "contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "live" /: "text") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "live" /: "text") NoReqBody jsonResponse
               ( "source" =: fromMaybe "" source
                 <> "group_id" =: contextChatId context
                 <> "date" =: fromMaybe "" competitionDate
@@ -889,7 +889,7 @@ fmAiContestTextTool =
         context <- askToolContext
         withCapability context "ai_contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "ai-contest" /: "text") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "ai-contest" /: "text") NoReqBody jsonResponse
               ("date" =: fromMaybe "" competitionDate <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
@@ -907,7 +907,7 @@ fmAiContestPublishTool =
         context <- askToolContext
         withCapability context "ai_contest" do
           response <- HTTP.runReq $
-            req POST (http "172.20.0.4" /: "ai-contest" /: "text")
+            req POST (http "fm-domain" /: "ai-contest" /: "text")
               (ReqBodyJson (Aeson.object
                 [ "body" Aeson..= body
                 , "title" Aeson..= fromMaybe "" title
@@ -926,7 +926,7 @@ fmAiContestLeaderboardTool =
         context <- askToolContext
         withCapability context "ai_contest" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
               ("date" =: fromMaybe "" competitionDate <> port 8077)
           pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
@@ -942,13 +942,13 @@ fmAiContestLeaderboardImageTool =
             Just date | not (Text.null date) -> pure date
             _ -> do
               response <- HTTP.runReq $
-                req GET (http "172.20.0.4" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
+                req GET (http "fm-domain" /: "ai-contest" /: "leaderboard") NoReqBody jsonResponse
                   (port 8077)
               pure $ fromMaybe "" $ AesonTypes.parseMaybe
                 (Aeson.withObject "FM AI leaderboard" (Aeson..: "date"))
                 (responseBody response :: Aeson.Value)
           let cacheKey = fromMaybe "refresh" (messageIdText <$> context.message.messageId)
-              url = "http://172.20.0.4:8077/reports/ai-leaderboard.png?date="
+              url = "http://fm-domain:8077/reports/ai-leaderboard.png?date="
                 <> resolvedDate <> "&v=" <> cacheKey
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
@@ -975,7 +975,7 @@ fmCompetitionScoreQueryTool =
         withCapability context "scores" do
           let limit = max 1 (min 100 (fromMaybe 20 requestedLimit))
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "scores") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "scores") NoReqBody jsonResponse
               ( "user_id" =: fromMaybe "" userId
                 <> "name" =: fromMaybe "" name
                 <> "source" =: fromMaybe "" source
@@ -996,7 +996,7 @@ fmCompetitionScoreSummaryTool =
         context <- askToolContext
         withCapability context "scores" do
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "competition" /: "summary") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "competition" /: "summary") NoReqBody jsonResponse
               ( "user_id" =: fromMaybe "" userId
                 <> "name" =: fromMaybe "" name
                 <> "source" =: fromMaybe "" source
@@ -1026,7 +1026,7 @@ fmScoreAnalysisTool =
               resolvedName = choose [fromMaybe "" name, fromMaybe "" context.message.senderUsername]
               days = fromMaybe 1 requestedDays
           response <- HTTP.runReq $
-            req GET (http "172.20.0.4" /: "analysis" /: "scores") NoReqBody jsonResponse
+            req GET (http "fm-domain" /: "analysis" /: "scores") NoReqBody jsonResponse
               ( "user_id" =: resolvedUserId
                 <> "name" =: resolvedName
                 <> "scope" =: fromMaybe "all" scope
@@ -1050,7 +1050,7 @@ fmCompetitionScoreImageTool =
       \userId name source -> do
         context <- askToolContext
         withCapability context "scores" do
-          let url = "http://172.20.0.4:8077/reports/competition-score.png?user_id="
+          let url = "http://fm-domain:8077/reports/competition-score.png?user_id="
                 <> fromMaybe "" userId <> "&name=" <> fromMaybe "" name <> "&source=" <> fromMaybe "" source
                 -- cache-buster：URL 每次必须不同。2026-10-12 实测，URL 一样时
                 -- 修好之后所有者仍收到旧的空图（别人的 URL 没请求过所以正常）。
@@ -1130,7 +1130,7 @@ fmChartTool =
                       | otherwise -> other
                 url
                   | not (Text.null contestText) =
-                      "http://172.20.0.4:8077/reports/score-chart.png?contest=" <> urlEncodeText contestText
+                      "http://fm-domain:8077/reports/score-chart.png?contest=" <> urlEncodeText contestText
                         <> "&group_id=" <> urlEncodeText chatIdText
                         <> "&days=" <> Text.pack (show days)
                         <> "&mode=" <> modeText
@@ -1138,7 +1138,7 @@ fmChartTool =
                         <> cacheBust
                   | otherwise =
                       -- 没点名赛文：老的个人成绩历史图（555/AI赛文那套）
-                      "http://172.20.0.4:8077/reports/score-chart.png?name="
+                      "http://fm-domain:8077/reports/score-chart.png?name="
                         <> userText
                         <> "&days=" <> Text.pack (show (max 1 (min 3650 days)))
                         <> cacheBust
@@ -1170,7 +1170,7 @@ fmBotGuardAccountsTool =
       )
       \action accountId label -> do
         response <- HTTP.runReq $
-          req POST (http "172.20.0.4" /: "bot-guard" /: "accounts")
+          req POST (http "fm-domain" /: "bot-guard" /: "accounts")
             (ReqBodyJson (Aeson.object
               [ "action" Aeson..= action
               , "account_id" Aeson..= fromMaybe "" accountId
@@ -1216,7 +1216,7 @@ fmDomainStatsTool =
   withDescription "Read record counts for FM's migrated library, contest, score, recall, and group data."
     $ tool "fm_domain_stats" noArguments do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "stats") NoReqBody jsonResponse (port 8077)
+        req GET (http "fm-domain" /: "stats") NoReqBody jsonResponse (port 8077)
       pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
 
 fmAdminStatusTool :: HTTP.HTTP :> es => Tool (Eff es)
@@ -1265,13 +1265,13 @@ fmSelfReviewTool =
                 -- 所以不能先算出路径名再拼（会类型不匹配）。
                 request
                   | wanted == "messages" =
-                      req GET (http "172.20.0.4" /: "bot" /: "messages") NoReqBody jsonResponse
+                      req GET (http "fm-domain" /: "bot" /: "messages") NoReqBody jsonResponse
                         ( if Text.null chatArg
                             then "limit" =: lim <> port 8077
                             else "limit" =: lim <> "chat_id" =: chatArg <> port 8077
                         )
                   | otherwise =
-                      req GET (http "172.20.0.4" /: "bot" /: "runs") NoReqBody jsonResponse
+                      req GET (http "fm-domain" /: "bot" /: "runs") NoReqBody jsonResponse
                         ("limit" =: lim <> port 8077)
             response <- HTTP.runReq request
             pure . toolText . jsonText $ (responseBody response :: Aeson.Value)
@@ -1411,7 +1411,7 @@ withCapability context capability action =
   case context.message of
     IncomingMessage{platform = PlatformQQ, chatId = Just groupId} -> do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "group-capability") NoReqBody jsonResponse
+        req GET (http "fm-domain" /: "group-capability") NoReqBody jsonResponse
           ("group_id" =: (show groupId :: Text) <> "capability" =: capability <> port 8077)
       let enabled = fromMaybe True $ AesonTypes.parseMaybe
             (Aeson.withObject "FM group capability" (Aeson..: "enabled"))

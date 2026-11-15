@@ -305,7 +305,7 @@ libraryStopHandler =
 postNovelStop :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
 postNovelStop payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "novel" /: "stop")
+    req POST (http "fm-domain" /: "novel" /: "stop")
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -315,7 +315,7 @@ aiContestQuickHandler
 aiContestQuickHandler =
   stopOn (matching isAiContestQuick) \message _ -> do
     response <- HTTP.runReq $
-      req GET (http "172.20.0.4" /: "ai-contest" /: "text") NoReqBody jsonResponse (port 8077)
+      req GET (http "fm-domain" /: "ai-contest" /: "text") NoReqBody jsonResponse (port 8077)
     case parseAiContest (responseBody response :: Aeson.Value) of
       Nothing -> sendStandalone message "今天的 AI 赛文还没生成，直接告诉 FM 想要什么风格，我现在写。"
       Just (competitionDate, title, body, difficulty) ->
@@ -340,7 +340,7 @@ liveCompetitionQuickHandler =
               _ -> ""
             cacheKey = maybe "0" (Text.pack . show) message.messageId
             imageUrl =
-              "http://172.20.0.4:8077/contest/rank-table.png?contest=100000&group_id="
+              "http://fm-domain:8077/contest/rank-table.png?contest=100000&group_id="
                 <> urlEncodeText groupValue
                 <> "&limit=12&_=" <> cacheKey
         sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective imageUrl)
@@ -385,7 +385,7 @@ contestTopQuickHandler =
     -- 555 有专门的当日 AI 榜渲染器；其它赛文用同风格的通用排行表。
     -- 2026-11-15 所有者：555 也要用统一表格风格（不要老的 AI 榜样式）。
     let chartUrl =
-          "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
+          "http://fm-domain:8077/contest/rank-table.png?contest=" <> urlEncodeText contestKey
             <> "&group_id=" <> urlEncodeText groupValue
             <> "&days=" <> Text.pack (show days)
             <> "&limit=12"
@@ -393,7 +393,7 @@ contestTopQuickHandler =
     sent <- Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective chartUrl)
     when (null (rights sent)) do
       response <- HTTP.runReq $
-        req GET (http "172.20.0.4" /: "contest" /: "top") NoReqBody jsonResponse
+        req GET (http "fm-domain" /: "contest" /: "top") NoReqBody jsonResponse
           ( "contest" =: (contestKey :: Text)
               <> "group_id" =: (groupValue :: Text)
               <> "days" =: (Text.pack (show days) :: Text)
@@ -435,7 +435,7 @@ contestChartQuickHandler =
                     ChatGroup -> fromMaybe "" (show <$> message.chatId)
                     _ -> ""
             url =
-              "http://172.20.0.4:8077/reports/score-chart.png?contest=" <> urlEncodeText contestKey
+              "http://fm-domain:8077/reports/score-chart.png?contest=" <> urlEncodeText contestKey
                 <> "&group_id=" <> urlEncodeText groupValue
                 <> "&days=" <> Text.pack (show days)
                 <> "&mode=trend&user=" <> urlEncodeText userText
@@ -571,7 +571,7 @@ messageArchiveHandler =
             (Aeson.withObject "FM event response" (Aeson..:? "competition_date")) response
           cacheKey = fromMaybe "refresh" (messageIdText <$> message.messageId)
           leaderboardUrl =
-            "http://172.20.0.4:8077/reports/ai-leaderboard.png?date="
+            "http://fm-domain:8077/reports/ai-leaderboard.png?date="
               <> competitionDate <> "&v=" <> cacheKey
       sent <- Chat.replyTo (standaloneMessage message)
         (ReplyBody.imageDirective leaderboardUrl)
@@ -619,7 +619,7 @@ libraryScoreContinueHandler =
 postNovelScore :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
 postNovelScore payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "novel" /: "score")
+    req POST (http "fm-domain" /: "novel" /: "score")
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -697,7 +697,7 @@ runDirectLibraryCommand message = \case
     sendStandalone message reason
   DirectLibraryStats -> do
     response <- HTTP.runReq $
-      req GET (http "172.20.0.4" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
+      req GET (http "fm-domain" /: "library" /: "stats") NoReqBody jsonResponse (port 8077)
     sendStandalone message (renderLibraryStats (responseBody response :: Aeson.Value))
   DirectLibraryContinue -> do
     response <- postLibraryAction "session" "continue-same" (directLibraryPayload message [])
@@ -764,7 +764,7 @@ directLibraryPayload message fields =
 postLibraryAction :: HTTP.HTTP :> es => Text -> Text -> Aeson.Value -> Eff es Aeson.Value
 postLibraryAction section action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "library" /: section /: action)
+    req POST (http "fm-domain" /: "library" /: section /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -847,7 +847,7 @@ allCompetitionRankQuickHandler =
               ]
             picks = officialContests <> groupContests
             urls =
-              [ "http://172.20.0.4:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
+              [ "http://fm-domain:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
                   <> "&group_id=" <> urlEncodeText groupId
                   <> "&limit=5&_=" <> cacheBase <> contest <> groupId
               | (contest, groupId) <- picks
@@ -1150,7 +1150,7 @@ setRepeatEnabled groupId enabled = do
 repeatEnabled :: HTTP.HTTP :> es => Text -> Eff es Bool
 repeatEnabled groupId = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "repeat-follow" /: "state") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "repeat-follow" /: "state") NoReqBody jsonResponse
       ("group_id" =: groupId <> port 8077)
   pure . fromMaybe True . AesonTypes.parseMaybe (Aeson.withObject "FM repeat state" (Aeson..: "enabled")) $
     (responseBody response :: Aeson.Value)
@@ -1158,7 +1158,7 @@ repeatEnabled groupId = do
 groupCapabilityEnabled :: HTTP.HTTP :> es => Text -> Text -> Eff es Bool
 groupCapabilityEnabled groupId capability = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "group-capability") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "group-capability") NoReqBody jsonResponse
       ("group_id" =: groupId <> "capability" =: capability <> port 8077)
   pure . fromMaybe True . AesonTypes.parseMaybe (Aeson.withObject "FM group capability" (Aeson..: "enabled")) $
     (responseBody response :: Aeson.Value)
@@ -1166,14 +1166,14 @@ groupCapabilityEnabled groupId capability = do
 postJson :: HTTP.HTTP :> es => Text -> Text -> Aeson.Value -> Eff es Aeson.Value
 postJson section action payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: section /: action)
+    req POST (http "fm-domain" /: section /: action)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
 postLibraryStop :: HTTP.HTTP :> es => Aeson.Value -> Eff es Aeson.Value
 postLibraryStop payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "library" /: "session" /: "stop")
+    req POST (http "fm-domain" /: "library" /: "session" /: "stop")
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -1193,7 +1193,7 @@ messagePayload message =
 postEvent :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
 postEvent eventName payload = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "events" /: eventName)
+    req POST (http "fm-domain" /: "events" /: eventName)
       (ReqBodyJson payload) jsonResponse (port 8077)
   pure (responseBody response :: Aeson.Value)
 
@@ -1207,7 +1207,7 @@ jsonFlag field =
 setGroupOnline :: HTTP.HTTP :> es => Text -> Bool -> Eff es ()
 setGroupOnline groupId online = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "group-state")
+    req POST (http "fm-domain" /: "group-state")
       (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
       jsonResponse
       (port 8077)
@@ -1216,7 +1216,7 @@ setGroupOnline groupId online = do
 groupOnline :: HTTP.HTTP :> es => Text -> Eff es Bool
 groupOnline groupId = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "group-state") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "group-state") NoReqBody jsonResponse
       ("group_id" =: groupId <> port 8077)
   pure . fromMaybe True . AesonTypes.parseMaybe parseOnline $ (responseBody response :: Aeson.Value)
   where

@@ -130,14 +130,14 @@ humanlikeScope message
 fetchHumanlikeState :: HTTP.HTTP :> es => Text -> Eff es HumanlikeState
 fetchHumanlikeState scope = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "humanlike") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "humanlike") NoReqBody jsonResponse
       ("scope" =: scope <> port 8077)
   pure (fromMaybe disabledHumanlike (AesonTypes.parseMaybe parseState (responseBody response :: Aeson.Value)))
 
 setHumanlikeState :: HTTP.HTTP :> es => Text -> Bool -> Eff es HumanlikeState
 setHumanlikeState scope value = do
   response <- HTTP.runReq $
-    req POST (http "172.20.0.4" /: "humanlike")
+    req POST (http "fm-domain" /: "humanlike")
       (ReqBodyJson (Aeson.object ["scope" Aeson..= scope, "enabled" Aeson..= value]))
       jsonResponse
       (port 8077)

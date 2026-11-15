@@ -65,7 +65,7 @@ sendUnifiedRankImage
   -> Eff es ()
 sendUnifiedRankImage source message = do
   response <- HTTP.runReq $
-    req GET (http "172.20.0.4" /: "competition" /: "live") NoReqBody jsonResponse
+    req GET (http "fm-domain" /: "competition" /: "live") NoReqBody jsonResponse
       ( "source" =: source
         <> "group_id" =: maybe ("" :: Text) show message.chatId
         <> "soft" =: True
@@ -73,7 +73,7 @@ sendUnifiedRankImage source message = do
       )
   case AesonTypes.parseMaybe parseRankStatus (responseBody response :: Aeson.Value) of
     Just ("ok", actualDate, _) -> do
-      let imageUrl = "http://172.20.0.4:8077/reports/live-competition.png?source="
+      let imageUrl = "http://fm-domain:8077/reports/live-competition.png?source="
             <> case source of
               "锦标赛" -> "champ"
               "极速杯" -> "comp"
