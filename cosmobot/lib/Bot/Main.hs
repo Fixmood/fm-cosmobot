@@ -169,12 +169,12 @@ routes cfg threads =
   helpHandlers baseRoutes <> baseRoutes
   where
     baseRoutes =
-      askHandlers cfg.tool (AgentTools.defaultToolsWith AgentTools.acpTools) cfg.handlers.ask threads
+      humaHandlers
+        <> askHandlers cfg.tool (AgentTools.defaultToolsWith AgentTools.acpTools) cfg.handlers.ask threads
           <> fmHandlers
         <> shutUpHandlers cfg.handlers.shutup
         <> adminHandlers cfg.handlers.admin
         <> scratchpadHandlers
-        <> humaHandlers
         <> pokeHandlers
         <> statusHandlers
         <> typingHandlers
