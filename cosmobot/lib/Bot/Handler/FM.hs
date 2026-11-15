@@ -1191,11 +1191,11 @@ messagePayload message =
     ]
 
 postEvent :: HTTP.HTTP :> es => Text -> Aeson.Value -> Eff es Aeson.Value
-postEvent eventName payload = do
-  response <- HTTP.runReq $
-    req POST (http "fm-domain" /: "events" /: eventName)
-      (ReqBodyJson payload) jsonResponse (port 8077)
-  pure (responseBody response :: Aeson.Value)
+postEvent _eventName _payload =
+  -- 2026-11-15 紧急隔离：事件归档到 fm-domain 在当前环境必超时，且失败会把消息流打死
+  -- （= 收得到消息但永不处理）。为保证回复优先，这里暂时不做外部归档，原样返回空。
+  -- 待 domain 网络问题定位后恢复为带 catch 的真实投递。
+  pure Aeson.Null
 
 jsonFlag :: Text -> Aeson.Value -> Bool
 jsonFlag field =
@@ -1205,13 +1205,16 @@ jsonFlag field =
       pure (fromMaybe False value)))
 
 setGroupOnline :: HTTP.HTTP :> es => Text -> Bool -> Eff es ()
-setGroupOnline groupId online = do
-  response <- HTTP.runReq $
-    req POST (http "fm-domain" /: "group-state")
-      (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
-      jsonResponse
-      (port 8077)
-  void . pure $ (responseBody response :: Aeson.Value)
+setGroupOnline groupId online =
+  -- 2026-11-15：这条在每条群消息上都会走，domain 抖动时必须吞掉，否则消息流被打死。
+  (do
+     response <- HTTP.runReq $
+       req POST (http "fm-domain" /: "group-state")
+         (ReqBodyJson (Aeson.object ["group_id" Aeson..= groupId, "online" Aeson..= online]))
+         jsonResponse
+         (port 8077)
+     void . pure $ (responseBody response :: Aeson.Value))
+    `catchSync` \_err -> pure ()
 
 groupOnline :: HTTP.HTTP :> es => Text -> Eff es Bool
 groupOnline groupId = do

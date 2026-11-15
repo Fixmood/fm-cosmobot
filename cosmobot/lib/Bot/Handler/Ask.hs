@@ -230,6 +230,7 @@ conversationRoute
   -> RouteHandler es
 conversationRoute toolCfg tools cfg threads =
   Route Nothing (const True) \message -> do
+    logInfo [i|FM conversation route entered|]
     policy <- classifyPolicy cfg threads message
     routeAction policy (decide policy)
   where
@@ -325,6 +326,8 @@ classifyPolicy cfg threads msg = do
           pure (RecentUserThreadReply parentKey transcript ageSeconds)
         Nothing -> pure baseReplyTarget
       else pure baseReplyTarget
+  logInfo [i|FM trigger check: platform=#{logPlatform} chat=#{logChat} sender=#{logSender} customTrigger=#{isJust customTrigger} calledByName=#{calledByName} mentionsBot=#{msg.digest.mentionsBot} allowedGroup=#{isAllowedGroup msg} allowedPrivate=#{isAllowedPrivate msg} triggered=#{triggered} hasPrompt=#{hasPrompt}|]
+
   pure Policy{msg, calledByName, triggered, hasPrompt, hasImages, hasFiles, replyTarget}
 
 recentUserThreadWindowSeconds :: Int

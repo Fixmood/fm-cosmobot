@@ -169,7 +169,8 @@ routes cfg threads =
   helpHandlers baseRoutes <> baseRoutes
   where
     baseRoutes =
-      fmHandlers
+      askHandlers cfg.tool (AgentTools.defaultToolsWith AgentTools.acpTools) cfg.handlers.ask threads
+          <> fmHandlers
         <> shutUpHandlers cfg.handlers.shutup
         <> adminHandlers cfg.handlers.admin
         <> scratchpadHandlers
@@ -180,26 +181,42 @@ routes cfg threads =
         <> safebooruHandlers
         <> saucenaoHandlers cfg.saucenao
         <> resourceHandlers
-        <> askHandlers cfg.tool (AgentTools.defaultToolsWith AgentTools.acpTools) cfg.handlers.ask threads
 
-withRouteDebugLogging :: KatipE :> es => Int -> Route es -> Route es
+withRouteDebugLogging :: (KatipE :> es, Timeout :> es) => Int -> Route es -> Route es
 withRouteDebugLogging index route =
   route
     { decide = \message -> do
-        decision <- route.decide message
-        case decision of
-          Skip ->
-            pure ()
-          ContinueWith{} ->
-            logMatch ("continue" :: Text) message
-          StopWith{} ->
-            logMatch ("stop" :: Text) message
-        pure decision
+        logDebug [i|Route enter: index=#{index}|]
+        decided <- timeout routeDecideTimeoutMicros (route.decide message)
+        case decided of
+          Nothing -> do
+            logInfo [i|FM route timeout: index=#{index} stage=decide|]
+            pure Skip
+          Just decision -> do
+            case decision of
+              Skip ->
+                logDebug [i|Route skipped: index=#{index}|]
+              ContinueWith{} ->
+                logMatch ("continue" :: Text) message
+              StopWith{} ->
+                logMatch ("stop" :: Text) message
+            pure (boundDecision decision)
     }
   where
+    boundDecision = \case
+      Skip -> Skip
+      ContinueWith action -> ContinueWith (boundAction action)
+      StopWith action -> StopWith (boundAction action)
+    boundAction action = do
+      finished <- timeout routeActionTimeoutMicros action
+      case finished of
+        Nothing -> logInfo [i|FM route action timeout: index=#{index}|]
+        Just () -> pure ()
     logMatch decision message =
       logDebug
         [i|Route matched: index=#{index} label=#{routeLabel route} decision=#{decision} #{incomingMessageLogLine message}|]
+    routeDecideTimeoutMicros = 2_000_000
+    routeActionTimeoutMicros = 25_000_000
 
 routeLabel :: Route es -> Text
 routeLabel route =

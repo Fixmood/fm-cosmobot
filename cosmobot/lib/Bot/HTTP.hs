@@ -61,9 +61,12 @@ httpsEndpointUrl endpoint path = do
 
 newTlsManager :: IO Client.Manager
 newTlsManager =
+  -- 2026-11-15：原先所有共享 HTTP 都走 172.20.0.1:7890 代理。京东云主机迁移后，
+  -- 该代理对内网地址（fm-domain / fm-snowluma）与部分外部地址会长时间挂起，
+  -- 导致 bot 的每条消息链路被拖死（回复极慢、甚至完全没有回复）。
+  -- 服务器直连外网可用（deepseek/百度均实测可达），因此统一改为直连。
   ClientTLS.newTlsManagerWith
-    (Client.managerSetProxy (Client.useProxy (Client.Proxy (ByteString.pack "172.20.0.1") 7890))
-      (ClientTLS.tlsManagerSettings))
+    ClientTLS.tlsManagerSettings
       { Client.managerConnCount = sharedManagerConnectionCount
       }
 

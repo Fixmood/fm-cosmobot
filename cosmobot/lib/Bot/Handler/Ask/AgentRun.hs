@@ -221,12 +221,23 @@ runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message in
 -- A lookup failure yields the disabled default on purpose: the mode changes how
 -- FM talks, so an unreadable switch must fall back to the existing behaviour
 -- instead of guessing, and it must not break the reply path.
-humanlikeContext :: (HTTP.HTTP :> es, KatipE :> es) => IncomingMessage -> Eff es Humanlike.HumanlikeState
+humanlikeContext :: (HTTP.HTTP :> es, KatipE :> es, Timeout :> es) => IncomingMessage -> Eff es Humanlike.HumanlikeState
 humanlikeContext message =
-  Humanlike.humanlikeScopeState message
+  -- 2026-11-15：这个查询走 HTTP，domain 抖动时会一直挂着（回复线程就死在这里）。
+  -- 超时后按「拟人未开启」继续跑，保证回复链路不被一条远程查询拖死。
+  (do
+     looked <- timeout humanlikeLookupTimeoutMicros (Humanlike.humanlikeScopeState message)
+     case looked of
+       Just state -> pure state
+       Nothing -> do
+         logWarning "humanlike switch lookup timed out; falling back to disabled"
+         pure Humanlike.disabledHumanlike)
     `catchSync` \err -> do
       logWarning [i|humanlike switch lookup failed: #{show err :: String}|]
       pure Humanlike.disabledHumanlike
+
+humanlikeLookupTimeoutMicros :: Int
+humanlikeLookupTimeoutMicros = 5_000_000
 
 -- | In humanlike mode, a request for a sticker must not leave the drawing tools
 -- within reach.
