@@ -17,6 +17,7 @@ const APP = {
   lastLatency: 0,
   bootAt: Date.now(),
   navFilter: '',
+  navPinned: false,
   env: { ok: null, latency: 0, at: 0 },
 };
 
@@ -948,7 +949,8 @@ function renderTable(container, config) {
       return main + '<tr class="dt-detail" data-detail="' + index + '" hidden><td colspan="' + colCount + '">' +
         '<div class="dt-detail-body">' + (cfg.detail(row, index) || jsonView(row)) + '</div></td></tr>';
     }).join('');
-    container.innerHTML = '<div class="table-wrap' + (cfg.flush ? ' flush' : '') + '"><table class="table"><thead><tr>' + head.join('') +
+    const stickyFirst = visible.length >= 8;
+    container.innerHTML = '<div class="table-wrap' + (cfg.flush ? ' flush' : '') + (stickyFirst ? ' sticky-first' : '') + '"><table class="table"><thead><tr>' + head.join('') +
       '</tr></thead><tbody>' + body + '</tbody></table></div>';
 
     container.querySelectorAll('.th-sort').forEach((node) => {
@@ -2021,10 +2023,32 @@ function openShortcuts() {
   });
 }
 
+/* 图表在容器宽度变化（侧栏折叠/窗口 resize）后必须重新 resize（任务检查项 5） */
+function resizeChartsSoon() {
+  clearTimeout(APP.__resizeTimer || 0);
+  APP.__resizeTimer = setTimeout(() => {
+    CHARTS.forEach((chart) => { try { chart.resize(); } catch (err) { /* ignore */ } });
+  }, 320);
+}
+
+/* 视口自适应导航：>1024 展开；901–1024 自动收起为图标栏；≤900 交给抽屉。
+   用户手动折叠/展开后不再自动覆盖（APP.navPinned） */
+function syncResponsiveNav() {
+  if (APP.navPinned) return;
+  const width = window.innerWidth;
+  const root = document.documentElement;
+  if (width > 1024) root.setAttribute('data-nav', 'expanded');
+  else if (width > 900) root.setAttribute('data-nav', 'collapsed');
+  else root.setAttribute('data-nav', 'expanded');
+  resizeChartsSoon();
+}
+
 function toggleNavCollapse() {
+  APP.navPinned = true;
   const collapsed = document.documentElement.getAttribute('data-nav') === 'collapsed';
   document.documentElement.setAttribute('data-nav', collapsed ? 'expanded' : 'collapsed');
   safeLocalSet('fm-console-nav', collapsed ? 'expanded' : 'collapsed');
+  resizeChartsSoon();
 }
 
 function openNavDrawer() {
@@ -2182,7 +2206,7 @@ function bindGlobalUi() {
   }
 
   document.addEventListener('click', (event) => {
-    if (event.target.closest('[data-nav]') && window.innerWidth <= 900) closeNavDrawer();
+    if (event.target.closest('.nav-item[data-nav]') && window.innerWidth <= 900) closeNavDrawer();
     if (event.target.closest('[data-retry]')) route();
     const tabBtn = event.target.closest('[data-tab]');
     if (tabBtn && !event.target.closest('[data-tab-keep]')) {
@@ -2197,6 +2221,7 @@ function bindGlobalUi() {
   });
 
   document.addEventListener('keydown', onGlobalKey);
+  window.addEventListener('resize', debounce(syncResponsiveNav, 180));
   window.addEventListener('hashchange', () => route());
   window.addEventListener('online', () => { updateNetBadge(true, 0); toast('网络已恢复', 'ok', { timeout: 2000 }); });
   window.addEventListener('offline', () => { updateNetBadge(false); toast('网络已断开，数据可能不是最新', 'bad', { timeout: 5000 }); });
@@ -2354,6 +2379,7 @@ function agoCell(value) {
 async function boot() {
   Theme.init();
   bindGlobalUi();
+  syncResponsiveNav();
   Palette.init();
   startFooterClock();
   updateAutoRefreshButton();
@@ -2373,7 +2399,7 @@ async function boot() {
   window.FM.app = {
     APP: APP, VIEWS: VIEWS, NAV: NAV, route: route, go: go, theme: Theme,
     isAdmin: isAdmin, isReadonly: isReadonly, applyAdminGating: applyAdminGating,
-    toastReadonly: toastReadonly,
+    toastReadonly: toastReadonly, syncResponsiveNav: syncResponsiveNav, resizeCharts: resizeChartsSoon,
   };
 }
 

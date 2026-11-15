@@ -1,0 +1,244 @@
+/* ══════════════════════════════════════════════════════════════════════════
+ * FM Console · UI 尺寸适配层（v4.3）
+ * 在 design-system.css / console.css 之后加载，统一处理 9 档视口的：
+ *   字号比例 / 内容区宽度 / KPI 栅格 / 图表高度 / 抽屉与命令面板尺寸 /
+ *   表格内部横滚与 sticky 首列 / 移动端触摸目标。
+ * 断点：≥1800 超大屏 · 1366–1799 大屏 · 1025–1365 笔记本 ·
+ *       901–1024 小笔记本（导航自动收起）· 721–900 平板 · ≤720 手机
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* ── 1. 超大屏：整体放大一档，避免 2560 上「字太小、留白过多」 ─────────── */
+@media (min-width: 1800px) {
+  :root {
+    --fs-2xs: 11.5px;
+    --fs-xs: 12.5px;
+    --fs-sm: 13.5px;
+    --fs-base: 15px;
+    --fs-md: 16px;
+    --fs-lg: 18px;
+    --fs-xl: 22px;
+    --fs-2xl: 28px;
+    --fs-3xl: 35px;
+    --fs-4xl: 44px;
+    --content-max: 1760px;
+    --sidebar-w: 280px;
+    --topbar-h: 66px;
+  }
+  .main { padding: 24px 32px 48px; }
+  .footer { padding: 14px 32px 20px; }
+  .topbar { padding: 0 26px; }
+  .nav-item { height: 36px; font-size: 14px; }
+  .nav-label { padding: 10px 8px 5px; }
+  .brand-text b { font-size: 16px; }
+  .card-head { padding: 16px 20px 0; }
+  .card-body { padding: 16px 20px 20px; }
+  .table thead th { padding: 10px 14px; }
+  .table tbody td { padding: 11px 14px; }
+  .kpi { padding: 18px 20px 16px; }
+  .kpi-value { font-size: 32px; }
+  .kpi-top { font-size: 12.5px; }
+  .page-title { font-size: 28px; }
+  .hero { padding: 24px 26px; }
+  .drawer-panel { width: min(760px, 92vw); }
+  .palette-box { width: min(800px, 92vw); }
+}
+
+@media (min-width: 2200px) {
+  :root { --content-max: 1800px; --fs-base: 15.5px; --fs-2xl: 30px; --fs-3xl: 38px; }
+  .kpi-value { font-size: 34px; }
+}
+
+/* 内容区始终居中且不超过上限（大屏不拉扯、不空旷） */
+.main,
+.footer {
+  width: 100%;
+  max-width: var(--content-max);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* ── 2. KPI / 卡片栅格：大屏 4–6 列、中屏 2–3 列、小屏 1–2 列 ─────────── */
+.kpis { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+@media (max-width: 1365px) {
+  .kpis { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+}
+@media (max-width: 1280px) {
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* 仪表盘 6 张 KPI：≥1800 六列；1280–1799 三列；≤900 两列 */
+.kpis.cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+@media (max-width: 1439px) {
+  .kpis.cols-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .kpis.cols-6 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1600px) {
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .grid-4 { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ── 3. 图表高度按断点：超大 340 / 大 300 / 笔记本 280 / 平板 270 / 手机 240 ── */
+.chart { height: 320px; }
+.chart-sm { height: 220px; }
+.chart-xs { height: 160px; }
+.chart-lg { height: 380px; }
+.chart-xl { height: 440px; }
+@media (min-width: 1800px) {
+  .chart { height: 360px; }
+  .chart-sm { height: 250px; }
+  .chart-xs { height: 190px; }
+  .chart-lg { height: 420px; }
+  .chart-xl { height: 480px; }
+}
+@media (max-width: 1365px) {
+  .chart { height: 300px; }
+  .chart-sm { height: 210px; }
+  .chart-lg { height: 340px; }
+  .chart-xl { height: 400px; }
+}
+@media (max-width: 1024px) {
+  .chart { height: 280px; }
+  .chart-lg { height: 300px; }
+  .chart-xl { height: 340px; }
+}
+@media (max-width: 720px) {
+  .chart { height: 240px; }
+  .chart-sm { height: 190px; }
+  .chart-xs { height: 140px; }
+  .chart-lg { height: 260px; }
+  .chart-xl { height: 300px; }
+}
+
+/* ── 4. 抽屉 / 命令面板 / 模态：统一宽度与内部滚动 ─────────────────────── */
+.drawer-panel { width: min(720px, 92vw); }
+.drawer.wide .drawer-panel { width: min(720px, 92vw); }
+.drawer-body { overscroll-behavior: contain; }
+.palette-box { width: min(760px, 92vw); max-height: 70vh; }
+.palette-overlay { padding-top: 10vh; }
+.modal { width: min(560px, 94vw); max-height: 90vh; }
+
+@media (max-width: 900px) {
+  .drawer-panel { width: min(720px, 92vw); }
+  .drawer.wide .drawer-panel { width: min(720px, 92vw); }
+}
+@media (max-width: 768px) {
+  /* 小屏抽屉全屏（宽度 100%），内容可滚、footer 固定在底部 */
+  .drawer-panel,
+  .drawer.wide .drawer-panel { width: 100%; max-width: 100%; }
+  .drawer-head { padding: 14px 14px 12px; }
+  .drawer-body { padding: 14px; }
+  .drawer-foot { padding: 10px 14px; }
+  .palette-box { width: min(760px, 92vw); max-height: 70vh; }
+  .palette-overlay { padding: 6vh 8px 8px; }
+  .modal { width: 100%; max-height: 92vh; margin: 0 8px; }
+  .modal-head { padding: 14px 14px 0; }
+  .modal-body { padding: 12px 14px; }
+  .modal-foot { padding: 12px 14px; }
+}
+
+/* ── 5. 表格：只在自己的容器里横滚 + 宽表 sticky 首列 ─────────────────── */
+.table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+.table { min-width: 100%; }
+.table-wrap.sticky-first .table thead th:first-child,
+.table-wrap.sticky-first .table tbody td:first-child {
+  position: sticky;
+  left: 0;
+  background: var(--surface-2);
+  box-shadow: 1px 0 0 var(--line-1);
+}
+.table-wrap.sticky-first .table thead th:first-child { z-index: 3; }
+.table-wrap.sticky-first .table tbody td:first-child { z-index: 2; }
+.table-wrap.sticky-first .table tbody tr:hover td:first-child { background: var(--surface-3); }
+.table-wrap.sticky-first .table tbody tr.open td:first-child { background: var(--surface-2); }
+
+/* ── 6. 移动端（≤768）：触摸目标 ≥36px、字体不低于 12px、控件换行不乱 ─── */
+@media (max-width: 768px) {
+  #main button { min-height: 36px; }
+  #main .seg button { min-height: 36px; padding: 0 12px; }
+  #main .v3-cap-bulk { display: none; }
+  #main .btn,
+  #main .btn-sm,
+  #main .btn-lg { min-height: 36px; }
+  #main .btn-sm { padding: 0 12px; font-size: 13px; }
+  #main .icon-btn { width: 36px; height: 36px; }
+  #main .tab { height: 36px; padding: 0 12px; }
+  #main .input,
+  #main .select,
+  #main select { min-height: 36px; }
+  #main input[type="checkbox"],
+  #main input[type="radio"] { width: 18px; height: 18px; }
+  #main .input-sm,
+  #main .select-sm { min-height: 36px; font-size: 13px; }
+  #main .switch { min-height: 36px; }
+  #main .filters { gap: 8px; }
+  #main .filters .input,
+  #main .filters .select { flex: 1 1 auto; min-width: 120px; }
+  #main .page-actions .btn { flex: 0 1 auto; }
+  .pager-btns { flex-wrap: wrap; }
+  .pager-btns .input { width: 64px; }
+
+  .topbar { min-height: 58px; }
+  .topbar .icon-btn { width: 38px; height: 38px; }
+  .topbar .user-chip,
+  .topbar .palette-trigger,
+  .topbar .env-pill { min-height: 36px; }
+  .crumbs { min-width: 0; }
+
+  /* 字号下限：正文 13px、表格 12.5px、表头 12px */
+  body { font-size: 13px; }
+  .table { font-size: 12.5px; }
+  .table thead th { font-size: 12px; }
+  .kpi-value { font-size: 24px; }
+  .page-sub { font-size: 13px; }
+  .card-note,
+  .notice { font-size: 12.5px; }
+  .muted-2.text-xs,
+  .text-xs { font-size: 12px; }
+}
+
+@media (max-width: 480px) {
+  .hero { padding: 14px; }
+  .hero-title { font-size: 22px; }
+  .page-title { font-size: 18px; }
+  .page-head { gap: 10px; }
+  .kpi { padding: 12px 12px 11px; }
+  .card-head { padding: 12px 12px 0; }
+  .card-body { padding: 12px 12px 14px; }
+}
+
+/* ── 7. 骨架屏与移动端栅格对齐（手机 2 列骨架，不出现 1 列大块） ───────── */
+@media (max-width: 720px) {
+  .sk-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sk-card { height: 76px; }
+  .sk-title { width: 60%; height: 26px; }
+}
+
+/* ── 8. 901–1024 小笔记本：侧栏默认收起（JS 会设置 data-nav=collapsed） ── */
+@media (min-width: 901px) and (max-width: 1024px) {
+  :root { --sidebar-w: 76px; }
+  html[data-nav="expanded"] { --sidebar-w: 208px; }
+  .main { padding: 18px 18px 32px; }
+  .topbar { padding: 0 14px; gap: 8px; }
+  .palette-trigger .palette-trigger-label { display: none; }
+  .env-pill-latency { display: none; }
+}
+
+/* ── 9. 横向滚动条更细，避免在表格内抢高度 ─────────────────────────────── */
+.table-wrap::-webkit-scrollbar { height: 8px; }
+
+/* ── 10. 打印/超长内容兜底：避免任何单元素撑破页面 ─────────────────────── */
+img, svg, canvas, video, pre, code { max-width: 100%; }
+pre { overflow-wrap: anywhere; }

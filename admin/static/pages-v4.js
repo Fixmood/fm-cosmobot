@@ -232,10 +232,10 @@
           '<section class="card"><div class="card-head"><h3>' + icon('analytics') + '消息趋势 <span class="section-sub">近 14 天 · 人类 / 机器人</span></h3>' +
             '<div class="card-head-actions"><a class="btn btn-sm btn-ghost" href="#/analytics-msg">' + icon('arrow-right') + '分析</a>' +
             '<button class="icon-btn sm" type="button" data-chart-export="#dash-trend" data-chart-name="消息趋势" title="导出 PNG">' + icon('download') + '</button></div></div>' +
-            '<div class="card-body"><div id="dash-trend" class="chart" style="height:290px"></div></div></section>' +
+            '<div class="card-body"><div id="dash-trend" class="chart chart-lg"></div></div></section>' +
           '<section class="card"><div class="card-head"><h3>' + icon('wrench') + '工具调用 <span class="section-sub">近 7 天</span></h3>' +
             '<div class="card-head-actions"><button class="icon-btn sm" type="button" data-chart-export="#dash-tools" data-chart-name="工具调用" title="导出 PNG">' + icon('download') + '</button></div></div>' +
-            '<div class="card-body"><div id="dash-tools" class="chart" style="height:150px"></div><div id="dash-tools-legend" class="donut-legend mt-8"></div></div></section>' +
+            '<div class="card-body"><div id="dash-tools" class="chart chart-xs"></div><div id="dash-tools-legend" class="donut-legend mt-8"></div></div></section>' +
         '</div>' +
         '<section class="card" style="margin-bottom:14px"><div class="card-head"><h3>' + icon('calendar') + '24 × 7 活跃热力图 <span class="section-sub">按星期 × 小时的群消息密度</span></h3>' +
           '<div class="card-head-actions"><a class="btn btn-sm btn-ghost" href="#/analytics-msg">' + icon('arrow-right') + '明细</a></div></div>' +
@@ -551,7 +551,7 @@
         '<div class="grid grid-wide" style="margin-bottom:14px">' +
           '<section class="card"><div class="card-head"><h3>' + icon('trending') + '每日消息趋势</h3><div class="card-head-actions">' +
             '<button class="icon-btn sm" type="button" data-chart-export="#am-trend" data-chart-name="每日消息趋势">' + icon('download') + '</button></div></div>' +
-            '<div class="card-body"><div id="am-trend" class="chart" style="height:280px"></div></div></section>' +
+            '<div class="card-body"><div id="am-trend" class="chart chart-lg"></div></div></section>' +
           '<section class="card"><div class="card-head"><h3>' + icon('gauge') + 'Token 用量 <span class="section-sub">审计日志</span></h3></div>' +
             '<div class="card-body" id="am-tokens"><div class="load-inline">' + icon('loader', 'spin') + ' 加载中…</div></div></section>' +
         '</div>' +
@@ -671,7 +671,7 @@
         '<div class="grid grid-wide" style="margin-bottom:14px">' +
           '<section class="card"><div class="card-head"><h3>' + icon('chart') + '群消息量 Top 12</h3><div class="card-head-actions">' +
             '<button class="icon-btn sm" type="button" data-chart-export="#ag-bar" data-chart-name="群消息量">' + icon('download') + '</button></div></div>' +
-            '<div class="card-body"><div id="ag-bar" class="chart" style="height:360px"></div></div></section>' +
+            '<div class="card-body"><div id="ag-bar" class="chart chart-lg"></div></div></section>' +
           '<section class="card"><div class="card-head"><h3>' + icon('gauge') + '群体对比</h3></div><div class="card-body" id="ag-side"><div class="load-inline">' + icon('loader', 'spin') + ' 加载中…</div></div></section>' +
         '</div>' +
         '<section class="card"><div class="card-head"><h3>' + icon('list') + '群明细 <span class="section-sub">可排序 · 行内展开</span></h3>' +
@@ -803,7 +803,7 @@
         '<div class="grid grid-wide" style="margin-bottom:14px">' +
           '<section class="card"><div class="card-head"><h3>' + icon('chart') + 'Top 20 发言者</h3><div class="card-head-actions">' +
             '<button class="icon-btn sm" type="button" data-chart-export="#as-bar" data-chart-name="Top 发言者">' + icon('download') + '</button></div></div>' +
-            '<div class="card-body"><div id="as-bar" class="chart" style="height:420px"></div></div></section>' +
+            '<div class="card-body"><div id="as-bar" class="chart chart-xl"></div></div></section>' +
           '<section class="card"><div class="card-head"><h3>' + icon('pin') + '群分布</h3></div><div class="card-body" id="as-side"><div class="load-inline">' + icon('loader', 'spin') + ' 加载中…</div></div></section>' +
         '</div>' +
         '<section class="card"><div class="card-head"><h3>' + icon('list') + '发言者明细</h3><div class="card-head-actions">' +
@@ -918,7 +918,7 @@
           chartCard('al-hist', '耗时直方图', '每次运行的完成耗时', '') +
           '<section class="card"><div class="card-head"><h3>' + icon('trending') + '每日 p50 / p90</h3><div class="card-head-actions">' +
             '<button class="icon-btn sm" type="button" data-chart-export="#al-daily" data-chart-name="每日延迟">' + icon('download') + '</button></div></div>' +
-            '<div class="card-body"><div id="al-daily" class="chart" style="height:230px"></div></div></section>' +
+            '<div class="card-body"><div id="al-daily" class="chart chart-sm"></div></div></section>' +
         '</div>' +
         '<div class="grid grid-wide">' +
           '<section class="card"><div class="card-head"><h3>' + icon('flame') + '最慢的运行 Top 10</h3></div><div class="card-body" id="al-slowest"><div class="load-inline">' + icon('loader', 'spin') + ' 加载中…</div></div></section>' +
