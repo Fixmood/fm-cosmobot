@@ -1646,6 +1646,8 @@ SELFTEST_HTTP_ROUTES: list[tuple[str, str, bool]] = [
     # ── v4.1 QQ 登录面板（snowluma 状态 / 扫码截图）──
     ("v4:qq/status", "/api/v2/qq/status", False),
     ("v4:qq/screen", "/api/v2/qq/screen", False),
+    # ── v4.2 回复前缀开关（/runtime/reply-prefix.txt）──
+    ("v4:prefix", "/api/v2/prefix", True),
 ]
 
 # 写接口清单（自检不自动执行，避免副作用；这里登记给「自检」页做验收清单）
@@ -1669,6 +1671,8 @@ SELFTEST_WRITE_ENDPOINTS: list[dict] = [
     {"method": "GET", "path": "/api/v2/logs/stream", "note": "SSE 实时日志流"},
     {"method": "POST", "path": "/api/v2/qq/refresh", "note": "重新抓取 snowluma 桌面/二维码（需管理员）"},
     {"method": "POST", "path": "/api/v2/qq/restart", "note": "重启 snowluma|bot（需管理员；snowluma 真重启需 confirm=true，否则 409）"},
+    {"method": "POST", "path": "/api/v2/prefix", "note": "回复前缀 set|off|reset（写 /runtime/reply-prefix.txt；需重启 bot 生效）"},
+    {"method": "POST", "path": "/api/v2/prefix/apply", "note": "重启 fm-cosmobot 让前缀生效（管理员；可 dry_run=true 预览）"},
 ]
 
 # selftest 安全断言用：只读会话对下列写接口必须 403（不产生副作用）。
@@ -1691,6 +1695,8 @@ SELFTEST_READONLY_DENY_PROBES: list[tuple[str, str, str]] = [
     ("POST", "/api/v2/deploy/act", '{"action":"list","target":"bot"}'),
     ("DELETE", "/api/v2/sessions/selftest-probe", "{}"),
     ("POST", "/api/v2/qq/restart", '{"target":"bot","dry_run":true}'),
+    ("POST", "/api/v2/prefix", '{"action":"off"}'),
+    ("POST", "/api/v2/prefix/apply", '{"dry_run":true}'),
 ]
 
 
@@ -2597,6 +2603,30 @@ class Api(BaseHTTPRequestHandler):
                 record_audit("restart", "qq",
                              "%s%s" % (payload.get("target") or "-",
                                        ":dry-run" if data.get("dry_run") else ""), actor)
+            # ══ v4.2: 回复前缀开关（/runtime/reply-prefix.txt）══════════════
+            elif route == "prefix":
+                if self.command == "POST":
+                    payload = self.read_json()
+                    if not isinstance(payload, dict):
+                        raise v2.ApiError("请求体必须是 JSON 对象")
+                    data = v4.prefix_write(payload.get("action"), payload.get("text"))
+                    record_audit("set", "reply-prefix",
+                                 "%s:%s" % (data.get("action"), data.get("prefix")), actor)
+                elif self.command == "GET":
+                    data = v4.prefix_state()
+                else:
+                    method_not_allowed("GET, POST")
+                    return
+            elif route == "prefix/apply":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    payload = {}
+                data = v4.prefix_apply(payload.get("dry_run"))
+                record_audit("apply", "reply-prefix",
+                             "restart-bot" + (":dry-run" if data.get("dry_run") else ""), actor)
             # ══ v4: D. 健康历史 / 缓存状态 ═════════════════════════════════
             elif route == "health/history":
                 data = v4.health_history(arg("days", "7"))
@@ -2901,7 +2931,66 @@ class Api(BaseHTTPRequestHandler):
                 "detail": detail,
             })
 
-            # QQ 登录面板：只读 token POST /api/v2/qq/restart 必须 403（重启属高危写操作）
+            # QQ 登录面板：            # 回复前缀：只读 token POST /api/v2/prefix 必须 403
+            started = time.monotonic()
+            status, payload, error_text = self._http_probe(
+                port, "/api/v2/prefix", read_only_cookie, method="POST",
+                body=b'{"action":"off"}', timeout=20.0)
+            ok = status == 403
+            checks.append({
+                "name": "security:prefix-readonly-403",
+                "kind": "security", "method": "POST", "path": "/api/v2/prefix",
+                "http_status": status,
+                "ms": round((time.monotonic() - started) * 1000, 1),
+                "ok": ok, "level": "ok" if ok else "fail", "required": True,
+                "error": "" if ok else ("只读 token 写前缀未返回 403（HTTP %s / %s）"
+                                        % (status, payload[:160].decode("utf-8", "replace"))),
+                "detail": {"expected": 403, "actual": status},
+            })
+
+            # 回复前缀：非法 action 必须 400 且不写文件（临时管理员会话；非法动作无副作用）
+            prefix_admin_id = secrets.token_hex(16)
+            with LOCK:
+                SESSIONS[prefix_admin_id] = {"username": "selftest-prefix-admin",
+                                             "login_time": time.time(), "is_admin": True,
+                                             "token_id": None}
+            before_sha = after_sha = None
+            status2 = None
+            payload2 = b""
+            error_text2 = ""
+            try:
+                import api_v4 as prefix_v4
+                before_sha = (prefix_v4.prefix_state() or {}).get("file_sha256")
+                status2, payload2, error_text2 = self._http_probe(
+                    port, "/api/v2/prefix", "fm_session=" + prefix_admin_id, method="POST",
+                    body=b'{"action":"selftest-invalid-action"}', timeout=20.0)
+                after_sha = (prefix_v4.prefix_state() or {}).get("file_sha256")
+            finally:
+                with LOCK:
+                    SESSIONS.pop(prefix_admin_id, None)
+            parsed_ok = False
+            message = error_text2
+            try:
+                parsed2 = json.loads(payload2.decode("utf-8", "replace"))
+                message = str(parsed2.get("error") or "")
+                parsed_ok = parsed2.get("ok") is False and "action" in message
+            except (ValueError, UnicodeDecodeError):
+                parsed_ok = False
+            ok2 = status2 == 400 and parsed_ok and before_sha == after_sha
+            checks.append({
+                "name": "v4:prefix-invalid-action-400",
+                "kind": "security", "method": "POST", "path": "/api/v2/prefix",
+                "http_status": status2,
+                "ms": 0.0,
+                "ok": ok2, "level": "ok" if ok2 else "fail", "required": True,
+                "error": "" if ok2 else ("非法 action 未返回 400 或写了文件：status=%s sha_same=%s %s"
+                                        % (status2, before_sha == after_sha, message[:160])),
+                "detail": {"expected": 400, "actual": status2,
+                           "file_sha_unchanged": before_sha == after_sha,
+                           "error_preview": message[:200]},
+            })
+
+            # 只读 token POST /api/v2/qq/restart 必须 403（重启属高危写操作）
             started = time.monotonic()
             status, payload, error_text = self._http_probe(
                 port, "/api/v2/qq/restart", read_only_cookie, method="POST",

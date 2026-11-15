@@ -56,6 +56,7 @@ CACHE_TTLS: dict[str, float] = {
     "ops/logs": 12.0,
     "ops/cron": 15.0,
     "ops/qq_status": 10.0,
+    "prefix": 3.0,
 }
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -1409,6 +1410,197 @@ def qq_restart(target: object = "", dry_run: object = False, confirm: object = F
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 4c. 回复前缀开关（bot 的 reply_prefix 工具 → /runtime/reply-prefix.txt）
+#     语义（对齐 bot 源码 Bot/Chat/Bridge/FM.hs）：
+#       * 文件不存在 → 用默认前缀 "😻 FM："
+#       * 文件内容 strip 后为 "<none>" 或空 → 不带前缀（关闭）
+#       * 否则内容就是前缀文本
+#     bot 只在启动时读这个文件（IORef），所以后台写文件后需要重启 bot 才生效；
+#     bot 自己的 reply_prefix 工具改前缀会立即生效（那是进程内 IORef）。
+# ═══════════════════════════════════════════════════════════════════════
+PREFIX_FILE = os.path.join(RUNTIME, "reply-prefix.txt")
+DEFAULT_REPLY_PREFIX = "😻 FM："
+PREFIX_NONE_MARKER = "<none>"
+PREFIX_MAX_LEN = 40
+PREFIX_BACKUP_KEEP = 10
+
+
+def _prefix_backup(previous: str) -> str:
+    """写文件前备份当前内容到 /runtime/reply-prefix.txt.bak-admin-<时间>，并只保留最近 N 份。"""
+    if previous is None:
+        return ""
+    # 带毫秒后缀：同一秒内多次写入也不会互相覆盖备份
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    millis = int(time.time() * 1000) % 1000
+    path = os.path.join(RUNTIME, "reply-prefix.txt.bak-admin-%s-%03d" % (stamp, millis))
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(previous)
+        os.chmod(path, 0o644)
+    except OSError:
+        return ""
+    try:
+        backups = sorted(
+            (os.path.join(RUNTIME, name) for name in os.listdir(RUNTIME)
+             if name.startswith("reply-prefix.txt.bak-admin-")),
+            key=lambda item: os.path.getmtime(item), reverse=True)
+        for old in backups[PREFIX_BACKUP_KEEP:]:
+            try:
+                os.unlink(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return path
+
+
+def prefix_state() -> dict:
+    """GET /api/v2/prefix：读取前缀状态（只读，不写文件）。"""
+    path = PREFIX_FILE
+    raw = ""
+    exists = os.path.isfile(path)
+    mtime = None
+    size = None
+    sha = None
+    read_error = ""
+    if exists:
+        try:
+            with open(path, "rb") as handle:
+                payload = handle.read(64 * 1024)
+            raw = payload.decode("utf-8", "replace")
+            stat = os.stat(path)
+            mtime = stat.st_mtime
+            size = stat.st_size
+            sha = hashlib.sha256(payload).hexdigest()
+        except OSError as exc:
+            read_error = str(exc)[:200]
+    cleaned = raw.strip()
+    if not exists:
+        prefix, enabled, source = DEFAULT_REPLY_PREFIX, True, "file-missing(default)"
+    elif cleaned == PREFIX_NONE_MARKER or cleaned == "":
+        prefix, enabled, source = PREFIX_NONE_MARKER, False, (
+            "none-marker" if cleaned == PREFIX_NONE_MARKER else "empty-file")
+    else:
+        prefix, enabled, source = cleaned, True, "file"
+    return {
+        "prefix": prefix,
+        "enabled": enabled,
+        "raw": raw,
+        "file": path,
+        "file_exists": exists,
+        "file_mtime": mtime,
+        "file_mtime_text": _local_text(mtime) if mtime else "",
+        "file_size": size,
+        "file_sha256": sha,
+        "default_prefix": DEFAULT_REPLY_PREFIX,
+        "none_marker": PREFIX_NONE_MARKER,
+        "source": source,
+        "error": read_error,
+        "note": "enabled=false 表示不带前缀；file 不存在时 bot 使用 default_prefix。"
+                "改文件后需要重启 bot（POST /api/v2/prefix/apply）才生效。",
+    }
+
+
+def _validate_prefix_text(text: object) -> str:
+    value = str(text or "")
+    if value != value.strip():
+        value = value.strip()
+    if not value:
+        raise v2.ApiError("action=set 需要非空 text（关闭前缀请用 action=off）", 400)
+    if value == PREFIX_NONE_MARKER:
+        raise v2.ApiError("text 不能是 %s（关闭前缀请用 action=off）" % PREFIX_NONE_MARKER, 400)
+    if len(value) > PREFIX_MAX_LEN:
+        raise v2.ApiError("前缀太长：%d 字符（最多 %d）" % (len(value), PREFIX_MAX_LEN), 400)
+    if any(char in value for char in "\r\n\t\x00") or any(ord(char) < 32 for char in value):
+        raise v2.ApiError("前缀不能包含换行或控制字符", 400)
+    return value
+
+
+def prefix_write(action: object, text: object = None) -> dict:
+    """POST /api/v2/prefix：action=set|off|reset → 写 /runtime/reply-prefix.txt。
+
+    返回 applied=false / restart_required=true：bot 进程内前缀只在启动时读文件，
+    后台改文件必须重启 bot 才生效（POST /api/v2/prefix/apply）。
+    """
+    action_text = str(action or "").strip().lower()
+    before = prefix_state()
+    if action_text in ("set", "on", "enable"):
+        content = _validate_prefix_text(text)
+        effective_action = "set"
+    elif action_text in ("off", "none", "disable"):
+        content = PREFIX_NONE_MARKER
+        effective_action = "off"
+    elif action_text in ("reset", "default"):
+        content = DEFAULT_REPLY_PREFIX
+        effective_action = "reset"
+    else:
+        raise v2.ApiError("action 只允许 set | off | reset（收到：%s）" % (action_text or "(空)"), 400)
+    backup = _prefix_backup(before.get("raw") if before.get("file_exists") else None)
+    temporary = PREFIX_FILE + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, PREFIX_FILE)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise v2.ApiError("写 %s 失败：%s" % (PREFIX_FILE, str(exc)[:300]), 500)
+    after = prefix_state()
+    return {
+        "action": effective_action,
+        "prefix": after.get("prefix"),
+        "enabled": after.get("enabled"),
+        "raw": after.get("raw"),
+        "written": content,
+        "applied": False,
+        "restart_required": True,
+        "file": PREFIX_FILE,
+        "file_mtime": after.get("file_mtime"),
+        "file_mtime_text": after.get("file_mtime_text"),
+        "file_sha256": after.get("file_sha256"),
+        "backup": backup,
+        "previous": {"prefix": before.get("prefix"), "enabled": before.get("enabled"),
+                     "raw": before.get("raw")},
+        "note": "已写入 /runtime/reply-prefix.txt；bot 进程内前缀需重启才生效 → "
+                "POST /api/v2/prefix/apply（可先 dry_run=true 预览）。",
+    }
+
+
+def prefix_apply(dry_run: object = False) -> dict:
+    """POST /api/v2/prefix/apply：重启 fm-cosmobot 让新前缀生效（复用 qq_restart 通道）。
+
+    dry_run=true 只走宿主机代理的 dry-run（校验参数/返回计划，不重启）。
+    """
+    _ensure_qq_ops_allowed()
+    dry = _flag(dry_run)
+    current = prefix_state()
+    params = {"target": "bot", "dry_run": "1" if dry else "0"}
+    out = v2.ops_request("qq_restart", params, timeout=45.0 if dry else 240.0)
+    payload = out.get("result") if isinstance(out.get("result"), dict) else {}
+    data = dict(payload or {})
+    data.update({
+        "dry_run": dry,
+        "applied": (not dry) and bool(data.get("restarted")) and bool(data.get("healthy")),
+        "prefix": current.get("prefix"),
+        "enabled": current.get("enabled"),
+        "prefix_file": current.get("file"),
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "duration_ms": out.get("duration_ms"),
+        "source": "host-ops-agent:docker restart fm-cosmobot",
+    })
+    if dry:
+        data["note"] = ("dry-run：只校验重启计划，没有重启 bot。"
+                        "真正执行请 POST /api/v2/prefix/apply 不带 dry_run。")
+    else:
+        data.setdefault("note", "bot 已重启并恢复健康，新前缀已生效。")
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 5. D. 健康历史（宿主机 ops-agent 每 5 分钟追加 /data/health.jsonl）
 # ═══════════════════════════════════════════════════════════════════════
 def health_history(days: object = 7) -> dict:
@@ -1726,7 +1918,10 @@ V4_ROUTES: dict[str, str] = {
     "ops/cron-set": "ops_cron_set(line)  # POST，未实现→501",
     "ops/rollback": "ops_rollback_safe(image, confirm)  # POST，真实回滚",
     "ops/config-backup": "ops_config_backup()  # POST",
-    # C2. QQ 登录面板（snowluma / OneBot）
+    # C3. 回复前缀开关（/runtime/reply-prefix.txt）
+    "prefix": "prefix_state()  # GET；POST 见 app.py（set/off/reset）",
+    "prefix/apply": "prefix_apply(dry_run)  # POST，重启 bot 使前缀生效",
+    # C2. QQ 登录面板（snowluna / OneBot）
     "qq/status": "qq_status(force)  # 10s 缓存；/api/v2/qq/status",
     "qq/screen": "qq_screen_png(force)  # PNG；60s 内直接返回，否则抓图",
     "qq/refresh": "qq_refresh()  # POST，强制抓图",
