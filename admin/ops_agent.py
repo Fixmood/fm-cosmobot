@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import fcntl
 import hashlib
 import json
@@ -73,6 +74,22 @@ CONTAINER_NAME = os.environ.get("FM_OPS_CONTAINER", "fm-cosmobot")
 IMAGE_REPO = "fm-cosmobot"
 DOMAIN_DB = os.environ.get("FM_OPS_DOMAIN_DB", "/opt/fm-domain/data/fm-domain.sqlite3")
 CONFIG_PATH = os.environ.get("FM_OPS_CONFIG", "/opt/fm-cosmobot/runtime/config.toml")
+# ── QQ 登录链路（snowluma 桌面 QQ → OneBot WS 3001 → bot）──
+SNOWLUMA_CONTAINER = os.environ.get("FM_OPS_SNOWLUMA", "fm-snowluma")
+QQ_DATA_DIR = BASE / "qq"
+QQ_SCREEN_PATH = QQ_DATA_DIR / "latest.png"
+QQ_SCREEN_REMOTE = "/tmp/fm-qq-screen.png"
+QQ_LOG_TAIL = int(os.environ.get("FM_OPS_QQ_LOG_TAIL", "60000") or 60000)
+QQ_LOG_FACTS_TTL = float(os.environ.get("FM_OPS_QQ_LOG_TTL", "10") or 10)
+# 日志抓取保留的字节数（从尾部保留）：run_docker 默认只留前 400KB，日志必须留尾部
+QQ_LOG_BYTES = int(os.environ.get("FM_OPS_QQ_LOG_BYTES", "4000000") or 4000000)
+QQ_LOG_SINCE = os.environ.get("FM_OPS_QQ_LOG_SINCE", "6h")
+ONEBOT_WS_PORT = int(os.environ.get("FM_OPS_ONEBOT_PORT", "3001") or 3001)
+ONEBOT_HTTP_PORT = int(os.environ.get("FM_OPS_ONEBOT_HTTP_PORT", "3000") or 3000)
+SNOWLUMA_WEBUI_PORT = int(os.environ.get("FM_OPS_SNOWLUMA_WEBUI_PORT", "5099") or 5099)
+SNOWLUMA_RESTART_WAIT = float(os.environ.get("FM_OPS_SNOWLUMA_RESTART_WAIT", "20") or 20)
+SNOWLUMA_SCREEN_SIZE = os.environ.get("FM_OPS_SNOWLUMA_SCREEN", "1920x1080")
+
 # v2：运维监控页一次看这三个容器
 STATS_CONTAINERS = tuple(
     name.strip() for name in os.environ.get("FM_OPS_STATS_CONTAINERS",
@@ -94,13 +111,15 @@ ROLLBACK_HEALTH_TIMEOUT = float(os.environ.get("FM_OPS_ROLLBACK_HEALTH_TIMEOUT",
 # FM_OPS_LINGER>0 时按「空闲 N 秒退出」的旧行为；FM_OPS_MAX_UPTIME 到点主动退出换新进程。
 LINGER_SECONDS = float(os.environ.get("FM_OPS_LINGER", "-1") or -1)
 MAX_UPTIME_SECONDS = float(os.environ.get("FM_OPS_MAX_UPTIME", "43200") or 43200)
-VERSION = "2.1.6"
+VERSION = "2.2.3"
 # 进程启动时间（写进 state 的 started_at，供后台展示/判断重启）
 STARTED_AT = time.time()
 
 ALLOWED_OPS = ("images", "inspect", "restart", "images_detail", "logs",
                "metrics", "cron", "rollback", "backup_domain",
-               "stats", "cron_list", "cron_set", "config_backup")
+               "stats", "cron_list", "cron_set", "config_backup",
+               # v2.2.0 QQ 登录面板：snowluma 状态 / 扫码界面截图 / 重启
+               "qq_status", "qq_screen", "qq_restart")
 SAFE_ID = re.compile(r"^[0-9A-Za-z._-]+$")
 SAFE_PARAM_KEY = re.compile(r"^[0-9A-Za-z_.-]{1,40}$")
 SAFE_IMAGE = re.compile(r"^fm-cosmobot:runtime-[A-Za-z0-9._-]{1,90}$")
@@ -1333,6 +1352,407 @@ def _backup_domain(params: dict) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# v2.2.0：QQ 登录面板（snowluma 状态 / 扫码界面截图 / 重启）
+#   链路：手机QQ扫码 → snowluma 容器桌面 QQ → snowluma OneBot WS 0.0.0.0:3001 → fm-cosmobot 连接
+# ══════════════════════════════════════════════════════════════════════════
+_QQ_BOT_CONN_SCRIPT = r"""
+import socket
+def _addr(text):
+    ip, port = text.split(":")
+    return socket.inet_ntoa(bytes.fromhex(ip)[::-1]), int(port, 16)
+hits = []
+for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4 or parts[3] != "01":
+            continue
+        try:
+            local_ip, local_port = _addr(parts[1])
+            remote_ip, remote_port = _addr(parts[2])
+        except Exception:
+            continue
+        if remote_port == __ONEBOT_PORT__:
+            hits.append("%s:%s->%s:%s" % (local_ip, local_port, remote_ip, remote_port))
+print("\n".join(hits))
+""".replace("__ONEBOT_PORT__", str(ONEBOT_WS_PORT))
+
+
+def _rfc3339_local(value: object) -> str:
+    """docker logs --timestamps 的 UTC 时间（2026-11-15T05:12:49.44Z）→ 宿主机本地时间文本。"""
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", text)
+    if not match:
+        return text[:32]
+    try:
+        epoch = calendar.timegm(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return text[:32]
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def _container_brief(name: str) -> dict:
+    """容器状态摘要（inspect，不启动任何东西）。"""
+    try:
+        item = _inspect_container(name)
+    except Exception as exc:  # noqa: BLE001
+        return {"name": name, "state": "missing", "running": False, "error": str(exc)[:200]}
+    state = item.get("State") if isinstance(item.get("State"), dict) else {}
+    config = item.get("Config") if isinstance(item.get("Config"), dict) else {}
+    health_block = state.get("Health") if isinstance(state.get("Health"), dict) else {}
+    return {
+        "name": str(item.get("Name") or "").lstrip("/") or name,
+        "state": str(state.get("Status") or "unknown"),
+        "running": bool(state.get("Running")),
+        "health": str(health_block.get("Status") or ""),
+        "started_at": str(state.get("StartedAt") or ""),
+        "started_at_text": _rfc3339_local(state.get("StartedAt")),
+        "restart_count": int(state.get("RestartCount") or 0),
+        "image": str(config.get("Image") or ""),
+    }
+
+
+def _docker_exec_output(container: str, argv: list[str], timeout: int = 30) -> dict:
+    """固定 argv 的 docker exec（不经过 shell）。"""
+    return run_docker(["exec", container] + [str(item) for item in argv], timeout=timeout)
+
+
+def _onebot_listeners() -> dict:
+    """snowluma 容器内 OneBot 端口监听情况（ONE bot WS 3001 + HTTP 3000）。"""
+    output = _docker_exec_output(SNOWLUMA_CONTAINER, ["ss", "-tln"], timeout=20)
+    lines = (output.get("stdout") or "").splitlines()
+    ports: dict[str, str] = {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "LISTEN":
+            local = parts[3]
+            if ":" in local:
+                ports[local.rsplit(":", 1)[1]] = local
+    return {
+        "ok": bool(output.get("ok")),
+        "listening": str(ONEBOT_WS_PORT) in ports,
+        "port": ONEBOT_WS_PORT,
+        "http": str(ONEBOT_HTTP_PORT) in ports,
+        "http_port": ONEBOT_HTTP_PORT,
+        "ws_bind": ports.get(str(ONEBOT_WS_PORT), ""),
+        "ports": sorted(ports.keys()),
+        "error": ((output.get("stderr") or output.get("stdout") or "")[:300]
+                  if not output.get("ok") else ""),
+    }
+
+
+def _onebot_peers() -> list[str]:
+    """谁连着 OneBot 3001（snowluma 侧 ss -tn 的 ESTAB 对端，正常应看到 bot 的 IP:port）。"""
+    output = _docker_exec_output(SNOWLUMA_CONTAINER, ["ss", "-tn"], timeout=20)
+    peers: list[str] = []
+    for line in (output.get("stdout") or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "ESTAB":
+            local, peer = parts[3], parts[4]
+            if local.endswith(":" + str(ONEBOT_WS_PORT)):
+                peers.append(peer)
+    return peers
+
+
+def _bot_onebot_connections() -> list[str]:
+    """bot 容器 /proc/net/tcp 里连到 3001 的 ESTABLISHED 连接（用容器自带 python3 解析）。"""
+    output = _docker_exec_output(CONTAINER_NAME, ["python3", "-c", _QQ_BOT_CONN_SCRIPT], timeout=25)
+    if not output.get("ok"):
+        return []
+    return [line.strip() for line in (output.get("stdout") or "").splitlines() if line.strip()]
+
+
+def _png_dimensions(path: Path) -> tuple[int | None, int | None]:
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(33)
+    except OSError:
+        return None, None
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+        return None, None
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
+def _qq_screen_meta() -> dict:
+    """现有截图文件的信息（不抓图）。"""
+    path = QQ_SCREEN_PATH
+    if not path.is_file():
+        return {"available": False, "path": str(path)}
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return {"available": False, "path": str(path), "error": str(exc)[:200]}
+    width, height = _png_dimensions(path)
+    return {
+        "available": True,
+        "path": str(path),
+        "bytes": stat.st_size,
+        "mtime": stat.st_mtime,
+        "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+        "age_seconds": round(max(0.0, time.time() - stat.st_mtime), 1),
+        "width": width,
+        "height": height,
+    }
+
+
+_QQ_LOGIN_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*\s+.*\[Hook\]\s+login detected:\s+PID=(\d+)\s+UIN=(\d+)")
+_QQ_GROUPS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S*\s+.*\[OneBot\]\s+groups loaded:\s+UIN=(\d+)\s+count=(\d+)")
+_QQ_OFFLINE_HINTS = ("logout", "kicked", "kickout", "offline", "登录失效", "下线", "重新登录", "token expired")
+
+
+def _docker_logs_text(container: str, tail: int = QQ_LOG_TAIL, since: str = "") -> str:
+    """抓 docker logs 文本，**保留最后 QQ_LOG_BYTES 字节**。
+
+    注意：不能复用 run_docker（它只保留前 LOG_BYTES_MAX=400KB），否则默认拿不到最近的
+    登录/群信息（实测 6 万行日志的 login 行在第 3.3 万行之后，直接被截掉）。
+    """
+    argv = [DOCKER, "logs", "--timestamps"]
+    if since:
+        argv += ["--since", str(since)]
+    else:
+        argv += ["--tail", str(int(tail))]
+    argv.append(container)
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=120, cwd="/")
+    except subprocess.TimeoutExpired:
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    if len(text.encode("utf-8", "replace")) > QQ_LOG_BYTES:
+        # 按字符截尾（近似字节数，够用）
+        text = text[-QQ_LOG_BYTES:]
+    return text
+
+
+def _qq_log_lines(tail: int = QQ_LOG_TAIL) -> list[str]:
+    """snowluma 日志（带 docker 时间戳）：默认取最近 6h、仅保留尾部 4MB，再解析。"""
+    text = _docker_logs_text(SNOWLUMA_CONTAINER, tail=tail, since=QQ_LOG_SINCE)
+    if not text.strip():
+        text = _docker_logs_text(SNOWLUMA_CONTAINER, tail=tail, since="")
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def _qq_log_facts_cached() -> dict:
+    """日志解析结果缓存 30s（6 万行每次解析 ~0.2s；status 10s 缓存 + 这里 30s 足够）。"""
+    facts = _cmd_cached("qq:logfacts", QQ_LOG_FACTS_TTL, lambda: _qq_log_facts(_qq_log_lines()))
+    return dict(facts or {})
+
+
+def _qq_log_facts(lines: list[str]) -> dict:
+    """从 snowluma 日志里提取：最近登录时间 / UIN / 群数量 / 掉线类告警。"""
+    login_at = ""
+    uin = ""
+    groups: int | None = None
+    groups_at = ""
+    offline_hits: list[str] = []
+    for line in lines:
+        match = _QQ_LOGIN_RE.search(line)
+        if match:
+            login_at = _rfc3339_local(match.group(1))
+            uin = match.group(3)
+            continue
+        match = _QQ_GROUPS_RE.search(line)
+        if match:
+            groups = int(match.group(3))
+            groups_at = _rfc3339_local(match.group(1))
+            continue
+        if "[Event]" in line:
+            # 群聊事件日志里可能出现用户聊天内容（例如「QQ又掉线了」），不是系统状态
+            continue
+        lowered = line.lower()
+        if any(hint in lowered for hint in _QQ_OFFLINE_HINTS):
+            offline_hits.append(line[:300])
+    return {"last_login_at": login_at, "uin": uin, "groups": groups,
+            "groups_loaded_at": groups_at, "offline_hints": offline_hits[-3:],
+            "log_lines": len(lines)}
+
+
+def op_qq_status(params: dict) -> dict:
+    """GET /api/v2/qq/status：snowluma + OneBot 3001/3000 + bot 连接 + 群数/最近登录。"""
+    checked = time.time()
+    snow = _container_brief(SNOWLUMA_CONTAINER)
+    bot = _container_brief(CONTAINER_NAME)
+    onebot = _onebot_listeners()
+    peers = _onebot_peers() if onebot.get("ok") else []
+    connections = _bot_onebot_connections()
+    facts = _qq_log_facts_cached()
+    connected = bool(connections) or bool(peers)
+    # 判定：OneBot 3001 在监听 + 有连接（bot 或其它客户端）== 已登录；
+    # groups / last_login_at 只是展示信息（日志轮转时可能拿不到，不影响判定）。
+    logged_in = bool(onebot.get("listening")) and connected
+    return {
+        "snowluma": snow,
+        "onebot": {**onebot, "peers": peers, "peer_count": len(peers)},
+        "bot": {**bot, "connected_to_onebot": connected,
+                "connections": connections, "connection_count": len(connections)},
+        "groups": facts.get("groups"),
+        "groups_loaded_at": facts.get("groups_loaded_at") or "",
+        "last_login_at": facts.get("last_login_at") or "",
+        "uin": facts.get("uin") or "",
+        "logged_in": logged_in,
+        "offline_hints": facts.get("offline_hints") or [],
+        "log_lines_scanned": facts.get("log_lines"),
+        "log_tail": QQ_LOG_TAIL,
+        "log_facts_ttl": QQ_LOG_FACTS_TTL,
+        "screen": _qq_screen_meta(),
+        "webui": {"port": SNOWLUMA_WEBUI_PORT,
+                  "url": "http://127.0.0.1:%d" % SNOWLUMA_WEBUI_PORT},
+        "checked_at": checked,
+        "checked_at_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(checked)),
+        "source": "host-ops-agent:docker inspect/exec/logs",
+    }
+
+
+def op_qq_screen(params: dict) -> dict:
+    """GET /api/v2/qq/screen：snowluma 桌面截图（ffmpeg x11grab → docker cp → data/qq/latest.png）。"""
+    started = time.time()
+    QQ_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    capture = _docker_exec_output(
+        SNOWLUMA_CONTAINER,
+        ["sh", "-c", "DISPLAY=:1 ffmpeg -loglevel error -f x11grab -video_size %s -i :1 "
+                     "-frames:v 1 -y %s" % (SNOWLUMA_SCREEN_SIZE, QQ_SCREEN_REMOTE)],
+        timeout=40,
+    )
+    if not capture.get("ok"):
+        raise RuntimeError("snowluma 截图失败（ffmpeg x11grab）："
+                           + ((capture.get("stderr") or capture.get("stdout") or "")[:400]))
+    temp_path = QQ_DATA_DIR / ("latest.%d.png" % int(started * 1000))
+    copy = run_docker(["cp", SNOWLUMA_CONTAINER + ":" + QQ_SCREEN_REMOTE, str(temp_path)], timeout=40)
+    run_docker(["exec", SNOWLUMA_CONTAINER, "rm", "-f", QQ_SCREEN_REMOTE], timeout=15)
+    if not copy.get("ok"):
+        raise RuntimeError("docker cp 截图失败：" + ((copy.get("stderr") or copy.get("stdout") or "")[:400]))
+    try:
+        os.replace(temp_path, QQ_SCREEN_PATH)
+    except OSError as exc:
+        raise RuntimeError("截图落盘失败：" + str(exc)[:300])
+    width, height = _png_dimensions(QQ_SCREEN_PATH)
+    try:
+        digest = hashlib.md5(QQ_SCREEN_PATH.read_bytes()).hexdigest()
+        stat = QQ_SCREEN_PATH.stat()
+    except OSError as exc:
+        raise RuntimeError("读取截图失败：" + str(exc)[:300])
+    return {
+        "path": str(QQ_SCREEN_PATH),
+        "bytes": stat.st_size,
+        "md5": digest,
+        "width": width,
+        "height": height,
+        "mtime": stat.st_mtime,
+        "mtime_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+        "captured_at": time.time(),
+        "duration_ms": int((time.time() - started) * 1000),
+        "container": SNOWLUMA_CONTAINER,
+        "source": "docker exec snowluma:ffmpeg x11grab",
+    }
+
+
+def _wait_onebot_listening(timeout: float) -> tuple[bool, dict, int]:
+    deadline = time.time() + max(5.0, float(timeout))
+    attempts = 0
+    last: dict = {}
+    while time.time() < deadline:
+        attempts += 1
+        last = _onebot_listeners()
+        if last.get("listening"):
+            return True, last, attempts
+        time.sleep(2.0)
+    return False, last, attempts
+
+
+def _wait_bot_connected(timeout: float) -> tuple[bool, list[str], int]:
+    deadline = time.time() + max(5.0, float(timeout))
+    attempts = 0
+    last: list[str] = []
+    while time.time() < deadline:
+        attempts += 1
+        last = _bot_onebot_connections()
+        if last:
+            return True, last, attempts
+        time.sleep(2.0)
+    return False, last, attempts
+
+
+def op_qq_restart(params: dict) -> dict:
+    """POST /api/v2/qq/restart：重启 snowluma 或 bot（白名单 target；支持 dry_run）。
+
+    snowluma 真重启会退出 QQ 登录态、需要手机 QQ 重新扫码，所以支持 dry_run 只做校验。
+    """
+    target = str(params.get("target") or "").strip().lower()
+    if target not in ("snowluma", "bot"):
+        raise PermissionError("qq_restart 只允许 target=snowluma|bot，收到：" + (target or "(空)"))
+    dry_run = str(params.get("dry_run") or "").strip().lower() in {"1", "true", "yes", "on"}
+    confirm = str(params.get("confirm") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if target == "snowluma" and not dry_run and not confirm:
+        # 事故教训：snowluma 重启会丢掉已扫码的 QQ 登录态，必须显式 confirm 才允许执行。
+        raise CodedError(409, "拒绝重启 snowluma：它会退出 QQ 登录态并要求手机QQ重新扫码。"
+                              "确需重启请带 confirm=true；只想校验请用 dry_run=true。")
+    container = SNOWLUMA_CONTAINER if target == "snowluma" else CONTAINER_NAME
+    before = _container_brief(container)
+    if dry_run:
+        plan = (["docker restart -t 10 " + container] if target == "snowluma"
+                else ["docker restart -t 5 " + container,
+                      "等待容器 healthy（≤120s）", "等待 bot 重新连上 OneBot 3001（≤90s）"])
+        return {
+            "target": target, "container": container, "dry_run": True, "restarted": False,
+            "before": before,
+            "onebot_before": _onebot_listeners() if target == "snowluma" else {},
+            "plan": plan,
+            "confirm_required": target == "snowluma",
+            "note": "dry-run：只做参数与前置状态校验，没有重启任何容器。"
+                    + ("（注意：snowluma 真重启会退出 QQ 登录态，需要手机 QQ 重新扫码；"
+                       "请只在确认要重新登录时执行。）" if target == "snowluma" else ""),
+            "checked_at": time.time(),
+        }
+    started = time.time()
+    wait_seconds = "10" if target == "snowluma" else "5"
+    output = run_docker(["restart", "-t", wait_seconds, container], timeout=180)
+    if not output.get("ok"):
+        raise RuntimeError("docker restart %s 失败：%s"
+                           % (container, (output.get("stderr") or output.get("stdout") or "")[:400]))
+    result = {
+        "target": target,
+        "container": container,
+        "dry_run": False,
+        "restarted": True,
+        "step": "docker restart -t %s %s" % (wait_seconds, container),
+        "docker_output": (output.get("stdout") or "").strip()[:200],
+        "restarted_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
+        "before": before,
+    }
+    if target == "snowluma":
+        ok, onebot, attempts = _wait_onebot_listening(SNOWLUMA_RESTART_WAIT)
+        result.update({
+            "onebot": onebot, "onebot_listening": ok, "onebot_attempts": attempts,
+            "healthy_after_s": round(time.time() - started, 1),
+            "note": "snowluma 已重启：" + ("OneBot %d 已恢复监听；" % ONEBOT_WS_PORT if ok
+                                          else "%ss 内未恢复监听，请看容器日志；" % SNOWLUMA_RESTART_WAIT)
+                    + "QQ 掉登录后需要手机 QQ 重新扫码（后台 QQ 登录页可看二维码）。",
+        })
+    else:
+        healthy, state, history, reason = _wait_container_healthy(CONTAINER_NAME, 120)
+        connected, connections, attempts = _wait_bot_connected(90)
+        result.update({
+            "healthy": healthy, "health": state, "health_history": history[-8:],
+            "health_reason": reason,
+            "connected_to_onebot": connected, "connections": connections,
+            "connect_attempts": attempts,
+            "healthy_after_s": round(time.time() - started, 1),
+            "note": "bot 已重启：" + ("已重新连上 OneBot %d。" % ONEBOT_WS_PORT if connected
+                                    else "但 90s 内未观察到到 %d 的连接（可能稍后重连，看 bot 日志）。"
+                                         % ONEBOT_WS_PORT),
+        })
+    result["duration_ms"] = int((time.time() - started) * 1000)
+    return result
+
+
 def execute(request: dict) -> dict:
     """执行一个白名单请求，返回 result 字段内容（失败抛异常）。"""
     op = str(request.get("op") or "").strip().lower()
@@ -1367,6 +1787,13 @@ def execute(request: dict) -> dict:
         return op_cron_set(params)
     if op == "config_backup":
         return op_config_backup(params)
+    # ── v2.2.0 QQ 登录面板 ──
+    if op == "qq_status":
+        return op_qq_status(params)
+    if op == "qq_screen":
+        return op_qq_screen(params)
+    if op == "qq_restart":
+        return op_qq_restart(params)
     raise PermissionError("op 不在白名单：" + op)
 
 
@@ -1410,7 +1837,7 @@ def _clean_params(raw: object) -> dict:
     return clean
 
 
-HEAVY_OPS = ("images", "images_detail", "rollback", "restart", "backup_domain")
+HEAVY_OPS = ("images", "images_detail", "rollback", "restart", "backup_domain", "qq_restart")
 _HEAVY_STOP = threading.Event()
 
 
@@ -1440,7 +1867,13 @@ def _read_queue_entries() -> list[tuple[Path, Any]]:
 def _is_heavy(parsed: Any) -> bool:
     if not isinstance(parsed, dict):
         return False
-    return str(parsed.get("op") or "").strip().lower() in HEAVY_OPS
+    op = str(parsed.get("op") or "").strip().lower()
+    if op == "qq_restart":
+        # dry-run 只做参数/状态校验，不重启容器 → 走快 op，避免排重 op 队列
+        params = parsed.get("params") if isinstance(parsed.get("params"), dict) else {}
+        dry = str(params.get("dry_run") or "").strip().lower() in {"1", "true", "yes", "on"}
+        return not dry
+    return op in HEAVY_OPS
 
 
 def _process_request_file(path: Path, scan_id: int, parsed: Any = None) -> dict:

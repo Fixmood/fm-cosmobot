@@ -1643,6 +1643,9 @@ SELFTEST_HTTP_ROUTES: list[tuple[str, str, bool]] = [
     ("v4:ops/cron", "/api/v2/ops/cron", False),
     ("v4:health/history", "/api/v2/health/history?days=7", False),
     ("v4:cache/stats", "/api/v2/cache/stats", False),
+    # ── v4.1 QQ 登录面板（snowluma 状态 / 扫码截图）──
+    ("v4:qq/status", "/api/v2/qq/status", False),
+    ("v4:qq/screen", "/api/v2/qq/screen", False),
 ]
 
 # 写接口清单（自检不自动执行，避免副作用；这里登记给「自检」页做验收清单）
@@ -1664,6 +1667,8 @@ SELFTEST_WRITE_ENDPOINTS: list[dict] = [
     {"method": "POST", "path": "/api/v2/backup/create", "note": "创建 bot/domain 备份（校验+审计）"},
     {"method": "POST", "path": "/api/v2/tokens/revoke", "note": "撤销 token（踢会话+审计）"},
     {"method": "GET", "path": "/api/v2/logs/stream", "note": "SSE 实时日志流"},
+    {"method": "POST", "path": "/api/v2/qq/refresh", "note": "重新抓取 snowluma 桌面/二维码（需管理员）"},
+    {"method": "POST", "path": "/api/v2/qq/restart", "note": "重启 snowluma|bot（需管理员；snowluma 真重启需 confirm=true，否则 409）"},
 ]
 
 # selftest 安全断言用：只读会话对下列写接口必须 403（不产生副作用）。
@@ -1685,6 +1690,7 @@ SELFTEST_READONLY_DENY_PROBES: list[tuple[str, str, str]] = [
     ("POST", "/api/v2/persona", '{"scope":"group_default","text":"x"}'),
     ("POST", "/api/v2/deploy/act", '{"action":"list","target":"bot"}'),
     ("DELETE", "/api/v2/sessions/selftest-probe", "{}"),
+    ("POST", "/api/v2/qq/restart", '{"target":"bot","dry_run":true}'),
 ]
 
 
@@ -2545,6 +2551,52 @@ class Api(BaseHTTPRequestHandler):
                     return
                 data = v4.ops_config_backup()
                 record_audit("backup", "config.toml", str(data.get("file") or ""), actor)
+            # ══ v4.1: QQ 登录面板（snowluma / OneBot 3001）═════════════════
+            elif route == "qq/status":
+                # 10s 缓存 + ?force=1；宿主机代理采集一次 ~0.3s（含 6 万行日志解析）
+                data = v4.qq_status(arg("force"))
+            elif route == "qq/screen":
+                if self.command != "GET":
+                    method_not_allowed("GET")
+                    return
+                # 直接返回 PNG（不走 {"ok":true,"data":...} 包装）：
+                # 60s 内复用现有图；?force=1 或过期则触发宿主机代理抓图。
+                png, meta = v4.qq_screen_png(arg("force"))
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-QQ-Screen-Mtime", str(int(meta.get("mtime") or 0)))
+                self.send_header("X-QQ-Screen-Mtime-Text", str(meta.get("mtime_text") or ""))
+                self.send_header("X-QQ-Screen-Bytes", str(meta.get("bytes") or len(png)))
+                self.send_header("X-QQ-Screen-Md5", str(meta.get("md5") or ""))
+                self.send_header("X-QQ-Screen-Fresh", "1" if meta.get("fresh") else "0")
+                self.send_header("X-QQ-Screen-Stale", "1" if meta.get("stale") else "0")
+                self.send_header("X-QQ-Screen-Triggered", "1" if meta.get("triggered") else "0")
+                self.send_header("Content-Length", str(len(png)))
+                self.end_headers()
+                try:
+                    self.wfile.write(png)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
+            elif route == "qq/refresh":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                data = v4.qq_refresh()
+                record_audit("refresh", "qq.screen", str(data.get("mtime_text") or ""), actor)
+            elif route == "qq/restart":
+                if self.command != "POST":
+                    method_not_allowed("POST")
+                    return
+                payload = self.read_json()
+                if not isinstance(payload, dict):
+                    raise v2.ApiError("请求体必须是 JSON 对象")
+                data = v4.qq_restart(payload.get("target"), payload.get("dry_run"),
+                                     payload.get("confirm"))
+                record_audit("restart", "qq",
+                             "%s%s" % (payload.get("target") or "-",
+                                       ":dry-run" if data.get("dry_run") else ""), actor)
             # ══ v4: D. 健康历史 / 缓存状态 ═════════════════════════════════
             elif route == "health/history":
                 data = v4.health_history(arg("days", "7"))
@@ -2698,14 +2750,18 @@ class Api(BaseHTTPRequestHandler):
 
     def _probe_check(self, port: int, cookie: str, name: str, path: str,
                      required: bool = True, method: str = "GET",
-                     body: bytes | None = None) -> dict:
-        """跑一个探针并组装标准 check 结构。"""
+                     body: bytes | None = None, expect: str = "json") -> dict:
+        """跑一个探针并组装标准 check 结构。expect="png" 时校验 PNG magic（QQ 截图接口）。"""
         started = time.monotonic()
         status, payload, error_text = self._http_probe(port, path, cookie, method=method, body=body)
         elapsed = round((time.monotonic() - started) * 1000, 1)
         ok = bool(status and 200 <= status < 300)
         parsed: object = None
-        if ok and payload:
+        if ok and expect == "png":
+            if not payload or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                ok = False
+                error_text = "响应不是 PNG（%d 字节）" % len(payload)
+        elif ok and payload:
             try:
                 parsed = json.loads(payload.decode("utf-8", "replace"))
             except (ValueError, UnicodeDecodeError):
@@ -2742,7 +2798,8 @@ class Api(BaseHTTPRequestHandler):
         checks: list[dict] = []
         probes: list[dict] = []
         for name, path, required in SELFTEST_HTTP_ROUTES:
-            probes.append({"name": name, "path": path, "required": required})
+            expect = "png" if path.startswith("/api/v2/qq/screen") else "json"
+            probes.append({"name": name, "path": path, "required": required, "expect": expect})
         # 文库正文要动态取一个真实 id 才能探（id 是哈希，别硬编码；命中缓存，几乎不花时间）
         try:
             import api_v4 as v4
@@ -2766,7 +2823,8 @@ class Api(BaseHTTPRequestHandler):
         workers = max(4, min(10, len(probes)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(self._probe_check, port, cookie, item["name"],
-                                   item["path"], item["required"]) for item in probes]
+                                   item["path"], item["required"], "GET", None,
+                                   item.get("expect", "json")) for item in probes]
             for future in futures:
                 try:
                     checks.append(future.result())
@@ -2841,6 +2899,23 @@ class Api(BaseHTTPRequestHandler):
                 "error": "" if ok else ("HTTP %s / masked=%s / 明文命中=%s / %s"
                                         % (status, masked, len(leaked), error_text[:160])),
                 "detail": detail,
+            })
+
+            # QQ 登录面板：只读 token POST /api/v2/qq/restart 必须 403（重启属高危写操作）
+            started = time.monotonic()
+            status, payload, error_text = self._http_probe(
+                port, "/api/v2/qq/restart", read_only_cookie, method="POST",
+                body=b'{"target":"bot","dry_run":true}', timeout=20.0)
+            ok = status == 403
+            checks.append({
+                "name": "security:qq-restart-readonly-403",
+                "kind": "security", "method": "POST", "path": "/api/v2/qq/restart",
+                "http_status": status,
+                "ms": round((time.monotonic() - started) * 1000, 1),
+                "ok": ok, "level": "ok" if ok else "fail", "required": True,
+                "error": "" if ok else ("只读 token 重启接口未返回 403（HTTP %s / %s）"
+                                        % (status, payload[:160].decode("utf-8", "replace"))),
+                "detail": {"expected": 403, "actual": status},
             })
 
             # QA P2-2：未登录访问 /login.html 必须拿到登录页（以前落到 require_auth 返回 401 JSON）

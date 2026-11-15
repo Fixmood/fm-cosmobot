@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import math
 import os
@@ -54,6 +55,7 @@ CACHE_TTLS: dict[str, float] = {
     "ops/metrics": 15.0,
     "ops/logs": 12.0,
     "ops/cron": 15.0,
+    "ops/qq_status": 10.0,
 }
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
@@ -1202,6 +1204,211 @@ def ops_config_backup() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 4b. QQ 登录面板（snowluma 桌面 QQ → OneBot WS 3001 → bot）
+#     背景：2026-11-15 FM 因 QQ 掉登录静默离线，用户要求在后台看状态/二维码/重启。
+# ═══════════════════════════════════════════════════════════════════════
+QQ_DATA_DIR = os.path.join(DATA_BASE, "qq")
+QQ_SCREEN_PATH = os.path.join(QQ_DATA_DIR, "latest.png")
+QQ_SCREEN_FRESH_SECONDS = 60.0
+QQ_OPS = ("qq_status", "qq_screen", "qq_restart")
+
+
+def _ensure_qq_ops_allowed() -> None:
+    """把 QQ 面板用到的 3 个 op 补进 api_v2.OPS_ALLOWED。
+
+    本任务文件所有权只允许改 api_v4.py / app.py / ops_agent.py，所以这里运行时补齐
+    api_v2 的白名单（tuple，补齐一次即可），不改 api_v2 源码。
+    """
+    missing = [name for name in QQ_OPS if name not in v2.OPS_ALLOWED]
+    if missing:
+        v2.OPS_ALLOWED = tuple(v2.OPS_ALLOWED) + tuple(missing)
+
+
+def _qq_screen_stat() -> dict:
+    """后台侧看到的截图文件状态（不触发抓图）。"""
+    path = QQ_SCREEN_PATH
+    if not os.path.isfile(path):
+        return {"available": False, "path": path,
+                "note": "还没有截图：调用 GET /api/v2/qq/screen 或 POST /api/v2/qq/refresh 触发抓取"}
+    try:
+        stat = os.stat(path)
+    except OSError as exc:
+        return {"available": False, "path": path, "error": str(exc)[:200]}
+    width = height = None
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(33)
+        if len(head) >= 24 and head[:8] == b"\x89PNG\r\n\x1a\n":
+            width = int.from_bytes(head[16:20], "big")
+            height = int.from_bytes(head[20:24], "big")
+    except OSError:
+        pass
+    age = max(0.0, time.time() - stat.st_mtime)
+    return {
+        "available": True,
+        "path": path,
+        "bytes": stat.st_size,
+        "mtime": stat.st_mtime,
+        "mtime_text": _local_text(stat.st_mtime),
+        "age_seconds": round(age, 1),
+        "fresh": age <= QQ_SCREEN_FRESH_SECONDS,
+        "width": width,
+        "height": height,
+    }
+
+
+def _read_qq_png() -> bytes:
+    try:
+        with open(QQ_SCREEN_PATH, "rb") as handle:
+            payload = handle.read(8 * 1024 * 1024)
+    except OSError as exc:
+        raise v2.ApiError("读取 QQ 截图失败：" + str(exc)[:200], 503)
+    if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise v2.ApiError("QQ 截图文件不是合法 PNG", 503)
+    return payload
+
+
+def _qq_warnings(status: dict) -> list[str]:
+    """把状态翻译成给人看的提醒（前端可直接展示）。"""
+    warnings: list[str] = []
+    snow = status.get("snowluma") or {}
+    onebot = status.get("onebot") or {}
+    bot = status.get("bot") or {}
+    if str(snow.get("state") or "") != "running":
+        warnings.append("snowluma 容器未运行（state=%s）" % (snow.get("state") or "?"))
+    elif not onebot.get("listening"):
+        warnings.append("OneBot %s 未监听：QQ 很可能掉登录了，需要在「QQ 登录」页扫码"
+                        % onebot.get("port", 3001))
+    if str(bot.get("state") or "") != "running":
+        warnings.append("bot 容器未运行（state=%s）" % (bot.get("state") or "?"))
+    elif not bot.get("connected_to_onebot"):
+        warnings.append("bot 未连上 OneBot %s（消息收发会中断）" % onebot.get("port", 3001))
+    if not status.get("logged_in") and status.get("groups") is None:
+        warnings.append("日志里没有读到群数量（可能还没登录成功）")
+    elif status.get("logged_in") and status.get("groups") is None:
+        warnings.append("已登录但日志里没解析到群数量（日志轮转所致，不影响收发）")
+    hints = status.get("offline_hints") or []
+    if hints:
+        warnings.append("日志里出现掉线类告警：" + str(hints[-1])[:160])
+    screen = status.get("screen") or {}
+    if screen.get("available") and float(screen.get("age_seconds") or 0) > QQ_SCREEN_FRESH_SECONDS:
+        warnings.append("二维码/屏幕截图已 %.0fs 未更新，可点「刷新二维码」" % float(screen.get("age_seconds") or 0))
+    return warnings
+
+
+def qq_status(force: object = False) -> dict:
+    """GET /api/v2/qq/status：snowluma 状态 + OneBot 监听 + bot 连接 + 群数/最近登录。
+
+    宿主机代理采集一次 ~0.3s，但会 docker logs 6 万行，所以后台缓存 10s（?force=1 强制）。
+    """
+    _ensure_qq_ops_allowed()
+    ttl = CACHE_TTLS["ops/qq_status"]
+
+    def build() -> dict:
+        out = v2.ops_request("qq_status", {}, timeout=45.0)
+        payload = out.get("result") if isinstance(out.get("result"), dict) else {}
+        data = dict(payload or {})
+        data["agent"] = {"request_id": out.get("request_id"), "elapsed_ms": out.get("elapsed_ms"),
+                         "duration_ms": out.get("duration_ms"),
+                         "source": "host-ops-agent:docker inspect/exec/logs"}
+        return data
+
+    result = _ops_cached("qq_status", (), ttl, build, wait=True, force=_flag(force))
+    data = dict(result["value"] or {})
+    data.update({"cached": result["cached"], "cache_age_seconds": result["age_seconds"],
+                 "cache_ttl": ttl})
+    # 后台侧再算一次 logged_in（OneBot 在监听 + bot 已连接），避免代理日志解析失败时误报未登录
+    onebot = data.get("onebot") if isinstance(data.get("onebot"), dict) else {}
+    bot = data.get("bot") if isinstance(data.get("bot"), dict) else {}
+    data["logged_in"] = bool(onebot.get("listening")) and bool(bot.get("connected_to_onebot"))
+    data["screen_file"] = _qq_screen_stat()
+    data["warnings"] = _qq_warnings(data)
+    return data
+
+
+def qq_screen_png(force: object = False) -> tuple[bytes, dict]:
+    """GET /api/v2/qq/screen 用：60s 内直接返回现有 PNG，否则抓一次再返回。
+
+    抓图失败但有旧图时返回旧图并标 stale（前端可提示"图可能不是最新"）；连旧图都没有 → 503。
+    """
+    _ensure_qq_ops_allowed()
+    force_flag = _flag(force)
+    stat = _qq_screen_stat()
+    if stat.get("available") and stat.get("fresh") and not force_flag:
+        meta = dict(stat)
+        meta.update({"triggered": False, "cached": True, "stale": False})
+        payload = _read_qq_png()
+        meta["md5"] = hashlib.md5(payload).hexdigest()
+        return payload, meta
+    error = ""
+    request_meta: dict = {}
+    try:
+        out = v2.ops_request("qq_screen", {}, timeout=90.0)
+        request_meta = {"request_id": out.get("request_id"), "elapsed_ms": out.get("elapsed_ms"),
+                        "duration_ms": out.get("duration_ms")}
+    except v2.ApiError as exc:
+        error = exc.message
+    stat = _qq_screen_stat()
+    if stat.get("available"):
+        meta = dict(stat)
+        meta.update({"triggered": True, "cached": False, "request_meta": request_meta,
+                     "stale": bool(error), "warning": error})
+        payload = _read_qq_png()
+        meta["md5"] = hashlib.md5(payload).hexdigest()
+        return payload, meta
+    raise v2.ApiError("QQ 截图不可用：" + (error or "snowluma 未运行或截图失败"), 503)
+
+
+def qq_refresh() -> dict:
+    """POST /api/v2/qq/refresh：强制重新抓一张 snowluma 桌面（扫码页=二维码）。"""
+    _ensure_qq_ops_allowed()
+    out = v2.ops_request("qq_screen", {}, timeout=90.0)
+    stat = _qq_screen_stat()
+    if not stat.get("available"):
+        raise v2.ApiError("刷新失败：宿主机代理没有生成截图文件", 503)
+    payload = _read_qq_png()
+    return {
+        "ok": True,
+        "bytes": stat.get("bytes"),
+        "mtime": stat.get("mtime"),
+        "mtime_text": stat.get("mtime_text"),
+        "age_seconds": stat.get("age_seconds"),
+        "md5": hashlib.md5(payload).hexdigest(),
+        "width": stat.get("width"),
+        "height": stat.get("height"),
+        "path": stat.get("path"),
+        "request_id": out.get("request_id"),
+        "elapsed_ms": out.get("elapsed_ms"),
+        "duration_ms": out.get("duration_ms"),
+        "agent": out.get("result") if isinstance(out.get("result"), dict) else {},
+        "note": "已重新抓取 snowluma 当前桌面（未登录时就是扫码二维码）",
+    }
+
+
+def qq_restart(target: object = "", dry_run: object = False, confirm: object = False) -> dict:
+    """POST /api/v2/qq/restart：重启 snowluma 或 bot。
+
+    安全：snowluma 真重启会丢失 QQ 登录态（需手机QQ重新扫码），宿主机代理要求 confirm=1；
+    dry_run=1 只做校验/返回计划，不重启任何容器。
+    """
+    _ensure_qq_ops_allowed()
+    target_text = str(target or "").strip().lower()
+    if target_text not in ("snowluma", "bot"):
+        raise v2.ApiError("target 只允许 snowluma | bot（收到：%s）" % (target_text or "(空)"), 400)
+    dry = _flag(dry_run)
+    params: dict[str, object] = {"target": target_text, "dry_run": "1" if dry else "0"}
+    if _flag(confirm):
+        params["confirm"] = "1"
+    out = v2.ops_request("qq_restart", params, timeout=45.0 if dry else 240.0)
+    payload = out.get("result") if isinstance(out.get("result"), dict) else {}
+    data = dict(payload or {})
+    data.update({"request_id": out.get("request_id"), "elapsed_ms": out.get("elapsed_ms"),
+                 "duration_ms": out.get("duration_ms"),
+                 "source": "host-ops-agent:docker restart"})
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 5. D. 健康历史（宿主机 ops-agent 每 5 分钟追加 /data/health.jsonl）
 # ═══════════════════════════════════════════════════════════════════════
 def health_history(days: object = 7) -> dict:
@@ -1481,6 +1688,19 @@ def selftest_v4_checks() -> list[dict]:
 
     run("v4:backup-dir", check_backup_dir, required=False)
 
+    def check_qq_screen_file() -> dict:
+        """QQ 登录面板：截图文件是否存在/是合法 PNG（不触发抓图；optional）。"""
+        stat = _qq_screen_stat()
+        if not stat.get("available"):
+            raise RuntimeError("还没有 QQ 截图：" + str(stat.get("path")))
+        if not stat.get("width") or not stat.get("height"):
+            raise RuntimeError("QQ 截图不是合法 PNG：" + str(stat.get("path")))
+        return {"path": stat.get("path"), "bytes": stat.get("bytes"),
+                "width": stat.get("width"), "height": stat.get("height"),
+                "age_seconds": stat.get("age_seconds"), "fresh": stat.get("fresh")}
+
+    run("v4:qq-screen-file", check_qq_screen_file, required=False)
+
     return checks
 
 
@@ -1506,6 +1726,11 @@ V4_ROUTES: dict[str, str] = {
     "ops/cron-set": "ops_cron_set(line)  # POST，未实现→501",
     "ops/rollback": "ops_rollback_safe(image, confirm)  # POST，真实回滚",
     "ops/config-backup": "ops_config_backup()  # POST",
+    # C2. QQ 登录面板（snowluma / OneBot）
+    "qq/status": "qq_status(force)  # 10s 缓存；/api/v2/qq/status",
+    "qq/screen": "qq_screen_png(force)  # PNG；60s 内直接返回，否则抓图",
+    "qq/refresh": "qq_refresh()  # POST，强制抓图",
+    "qq/restart": "qq_restart(target, dry_run, confirm)  # POST；snowluma 真重启需 confirm",
     # D. 系统
     "health/history": "health_history(days)",
     "cache/stats": "cache_stats(rate_limit)",
