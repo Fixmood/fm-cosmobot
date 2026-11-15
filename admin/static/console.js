@@ -1365,6 +1365,7 @@ const NAV = [
       { id: 'tools', name: '工具与审计', icon: 'wrench', keys: 'tool 工具 审计 调用' },
       { id: 'models', name: '模型与配置', icon: 'cpu', keys: 'model 模型 配置 参数' },
       { id: 'mswitch', name: '模型切换', icon: 'zap', keys: 'switch 切换 模型 provider effort' },
+      { id: 'prefix', name: '回复前缀', icon: 'message', keys: 'prefix 前缀 回复前缀 默认 😻 FM 不带前缀' },
       { id: 'capabilities', name: '群能力矩阵', icon: 'shield', keys: 'capability 能力 矩阵 开关' },
     ],
   },
@@ -2291,7 +2292,7 @@ function onGlobalKey(event) {
     const targets = {
       d: '#/dashboard', a: '#/analytics-msg', g: '#/groups', c: '#/content',
       o: '#/ops', s: '#/settings', l: '#/logs', m: '#/members', t: '#/tools',
-      u: '#/analytics-senders', h: '#/humanlike', b: '#/browse', q: '#/qq',
+      u: '#/analytics-senders', h: '#/humanlike', b: '#/browse', q: '#/qq', p: '#/prefix',
     };
     if (key === 'g') {
       pendingGoto = Date.now();
