@@ -26,6 +26,7 @@ data AskHandlerConfig = AskHandlerConfig
   , recentChatContextMinutes :: !Int
   , recentChatContextMaxChars :: !Int
   , recentChatContextDisabledGroups :: ![Integer]
+  , fastMode         :: !Bool
   , botIds           :: ![(ChatPlatform, Text)]
   }
   deriving (Show)
@@ -43,6 +44,7 @@ instance FromValue AskHandlerConfig where
     recentChatContextMinutes <- fromMaybe 30 <$> optKey "recent_chat_context_minutes"
     recentChatContextMaxChars <- fromMaybe 2000 <$> optKey "recent_chat_context_max_chars"
     recentChatContextDisabledGroups <- fromMaybe [] <$> optKey "recent_chat_context_disabled_groups"
+    fastMode <- fromMaybe False <$> optKey "fast_mode"
     when (contextCompactionThresholdKTokens <= 0) do
       fail "handler.ask.context_compaction_threshold_ktokens must be positive"
     when (recentChatContextLimit < 0 || recentChatContextLimit > 100) do
@@ -63,5 +65,6 @@ instance FromValue AskHandlerConfig where
       , recentChatContextMinutes = recentChatContextMinutes
       , recentChatContextMaxChars = recentChatContextMaxChars
       , recentChatContextDisabledGroups = recentChatContextDisabledGroups
+      , fastMode = fastMode
       , botIds = []
       }

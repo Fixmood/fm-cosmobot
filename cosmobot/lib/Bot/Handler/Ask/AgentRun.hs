@@ -119,13 +119,31 @@ runAskAgentThread
   -> MessageInput
   -> Transcript
   -> Eff es (Text, Transcript)
-runAskAgentThread toolCfg tools cfg threads resource parentMessageKey message input transcript = do
+runAskAgentThread toolCfg toolsRaw cfgRaw threads resource parentMessageKey message input transcript = do
+  -- 极速模式（2026-11-15）：工具从 104 个精简到核心集合，并把最近上下文档位减半。
+  -- 关闭时行为与之前完全一致（默认关闭）。开关在 config.toml 的 [handler.ask] fast_mode。
+  let fast = cfgRaw.fastMode
+      fastTools =
+        [ "reply_prefix", "send_reply", "mention_user", "send_file", "sticker_send", "sticker_list"
+        , "member_lookup", "member_info", "group_members", "sender_info", "now", "schedule"
+        , "chat_log", "chat_search", "recall_recent_self_messages", "self_messages", "typing_stats"
+        , "fm_chart", "fm_contest_chart", "fm_contest_search"
+        , "fm_competition_score_query", "fm_competition_score_summary", "fm_competition_score_image"
+        , "fm_live_competition_rank", "fm_live_competition_text"
+        , "fm_ai_contest_leaderboard", "fm_ai_contest_leaderboard_image", "fm_ai_contest_text"
+        , "fm_score_query", "fm_score_analysis"
+        , "fm_library_stats", "fm_library_start", "fm_library_stop", "fm_library_continue", "fm_library_search"
+        , "fm_group_status", "fm_self_note", "fm_self_notes", "fm_member_style"
+        , "web_search", "web_fetch"
+        ]
+      tools = if fast then filter (\t -> AgentTool.toolName t `elem` fastTools) toolsRaw else toolsRaw
+      cfg = if fast then cfgRaw{recentChatContextMaxChars = min cfgRaw.recentChatContextMaxChars 8000} else cfgRaw
   startedAt <- liftIO getCurrentTime
   let observer = AgentAudit.agentAuditObserver
       outputMessage = FMBridge.fmStandaloneMessage message
   humanlike <- humanlikeContext message
   systemPrompt <- askSystemPrompt cfg humanlike.enabled message
-  humanlikePersona <- Humanlike.loadHumanlikePersonaText message
+  humanlikePersona <- if humanlike.enabled then Humanlike.loadHumanlikePersonaText message else pure ""
   autoMemory <- if humanlike.enabled then autoMemoryPrompt message startedAt else pure ""
   humanlikeRecord <- HumanlikeArchive.loadHumanlikeRecordText message
   -- 这个人的回复风格：直接注入，不靠模型自己想起来调 fm_member_style。

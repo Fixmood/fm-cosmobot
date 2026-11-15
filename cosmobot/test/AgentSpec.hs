@@ -5655,6 +5655,7 @@ askHandlerConfig =
     , recentChatContextMinutes = 30
     , recentChatContextMaxChars = 2000
     , recentChatContextDisabledGroups = []
+    , fastMode = False
     , botIds = [(PlatformQQ, "2044933066")]
     }
 
