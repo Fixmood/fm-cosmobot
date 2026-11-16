@@ -19,7 +19,6 @@ import qualified Data.Text as Text
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Client
 import qualified Network.HTTP.Client.TLS as ClientTLS
-import qualified Data.ByteString.Char8 as ByteString
 import Network.HTTP.Req (HttpConfig (..), Option, Req, Url, useHttpsURI, (/:))
 import qualified Network.HTTP.Req as Req
 import qualified Network.TLS as TLS
@@ -59,15 +58,30 @@ httpsEndpointUrl endpoint path = do
     Just (url, options) ->
       pure (foldl' (/:) url path, options)
 
+-- 2026-11-16：内网直连、外网走代理的分流（容器→宿主 7890 已被 ufw 放行）。
+internalHosts :: [ByteString.ByteString]
+internalHosts =
+  map
+    ByteString.pack
+    [ "fm-domain", "fm-snowluma", "fm-admin", "localhost", "127.0.0.1", "::1" ]
+
+isInternalHost :: ByteString.ByteString -> Bool
+isInternalHost host =
+  host `elem` internalHosts
+    || ByteString.pack "172.20." `ByteString.isPrefixOf` host
+    || ByteString.null host
+
 newTlsManager :: IO Client.Manager
 newTlsManager =
-  -- 2026-11-15：原先所有共享 HTTP 都走 172.20.0.1:7890 代理。京东云主机迁移后，
-  -- 该代理对内网地址（fm-domain / fm-snowluma）与部分外部地址会长时间挂起，
-  -- 导致 bot 的每条消息链路被拖死（回复极慢、甚至完全没有回复）。
-  -- 服务器直连外网可用（deepseek/百度均实测可达），因此统一改为直连。
+  -- 内网直连；其它（github/google/外网 API）走 172.20.0.1:7890 代理
   ClientTLS.newTlsManagerWith
     ClientTLS.tlsManagerSettings
       { Client.managerConnCount = sharedManagerConnectionCount
+      , Client.managerModifyRequest = \request ->
+          pure $
+            if isInternalHost (Client.host request)
+              then request{Client.proxy = Nothing}
+              else request{Client.proxy = Just (Client.Proxy (ByteString.pack "172.20.0.1") 7890)}
       }
 
 -- DeepSeek is reachable directly from the server, while the configured
