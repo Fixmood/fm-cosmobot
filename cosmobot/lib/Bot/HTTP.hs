@@ -73,25 +73,32 @@ isInternalHost host =
 
 newTlsManager :: IO Client.Manager
 newTlsManager =
-  -- 内网直连；其它（github/google/外网 API）走 172.20.0.1:7890 代理
-  ClientTLS.newTlsManagerWith
-    ClientTLS.tlsManagerSettings
-      { Client.managerConnCount = sharedManagerConnectionCount
-      , Client.managerModifyRequest = \request ->
-          pure $
-            if isInternalHost (Client.host request)
-              then request{Client.proxy = Nothing}
-              else request{Client.proxy = Just (Client.Proxy (ByteString.pack "172.20.0.1") 7890)}
-      }
+  -- 内网直连；其它（github/google/外网 API）走 172.20.0.1:7890 代理。
+  -- 响应头上限从默认 4096 提高到 64KB：x.com 之类站点首页的响应头远超标，
+  -- 默认设置会直接抛 OverlongHeaders（2026-11-16 实测）。
+  ClientTLS.newTlsManagerWith $
+    Client.managerSetMaxNumberHeaders 1000
+      . Client.managerSetMaxHeaderLength 65536
+      $ ClientTLS.tlsManagerSettings
+        { Client.managerConnCount = sharedManagerConnectionCount
+        , Client.managerModifyRequest = \request ->
+            pure $
+              if isInternalHost (Client.host request)
+                then request{Client.proxy = Nothing}
+                else request{Client.proxy = Just (Client.Proxy (ByteString.pack "172.20.0.1") 7890)}
+        }
 
 -- DeepSeek is reachable directly from the server, while the configured
 -- proxy is currently unreliable for its streaming endpoint. Keep Matrix and
 -- other shared HTTP traffic on the existing proxy manager.
 newDirectTlsManager :: IO Client.Manager
 newDirectTlsManager =
-  ClientTLS.newTlsManagerWith ClientTLS.tlsManagerSettings
-    { Client.managerConnCount = sharedManagerConnectionCount
-    }
+  ClientTLS.newTlsManagerWith $
+    Client.managerSetMaxNumberHeaders 1000
+      . Client.managerSetMaxHeaderLength 65536
+      $ ClientTLS.tlsManagerSettings
+        { Client.managerConnCount = sharedManagerConnectionCount
+        }
 
 isDirectLLMRequest :: Client.Request -> Bool
 isDirectLLMRequest request =
