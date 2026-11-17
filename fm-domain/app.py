@@ -7460,58 +7460,72 @@ class Api(BaseHTTPRequestHandler):
 
 
 def _clean_huma_article(raw_text):
-    """从引用内容里取出正文（去掉赛文标题/段号元信息）。2026-11-17 所有者要求。
+    """从引用内容里取出正文（2026-11-17 所有者要求，多轮修）。
 
-    不用正则：容器里正则表现不稳定，这里用字符串扫描，行为可预测。
-    注意：赛文消息的正文和尾部元信息常常在**同一行**（没有换行），
-    所以不能只按行判断，必须在行内找截断点。
+    支持两种引用格式：
+      A) 【发文】：[FM/AI赛文。虐]《标题》[字数270]【难度】：虐 42.80 正文… ----第555段-sha1(…)…
+      B) 【发文】：【水/极易】标题-作者-第55章…(1)【难度】：水 0.24 正文… ----第vi段-sha1(…)…
+    统一做法：先按「字数」截，再按「难度」+数值截，最后截掉尾部段号/sha1/QQ群等元信息。
+    只用字符串扫描（正则在该容器里表现不稳定）。
     """
-    text = (raw_text or "").strip()
-    # 1) 去掉开头 [FM/AI赛文...]《标题》[字数N]
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    # 1) 有「字数N」就先截到数字之后
     idx = text.find("字数")
-    if idx != -1:
+    if idx != -1 and idx < 160:
         j = idx + 2
+        while j < len(text) and not text[j].isdigit():
+            j += 1
         while j < len(text) and text[j].isdigit():
             j += 1
-        while j < len(text) and text[j] in " \t\n\r]】":
-            if text[j] in "]】":
-                j += 1
-                break
+        while j < len(text) and (text[j].isspace() or text[j] == "]"):
             j += 1
         text = text[j:]
-    # 2) 行内找尾部元信息的最早起点
-    def _first_cut(line):
-        cut = len(line)
-        for marker in ("-----", "FM赛文", "———"):
-            pos = line.find(marker)
-            if pos != -1:
-                cut = min(cut, pos)
-        # 「第 N 段」
-        probe = line
-        pos = 0
-        while True:
-            pos = probe.find("第", pos)
-            if pos == -1:
-                break
-            k = pos + 1
-            while k < len(probe) and (probe[k].isdigit() or probe[k] in " \t"):
-                k += 1
-            if k > pos + 1 and k < len(probe) and probe[k] == "段":
-                cut = min(cut, pos)
-                break
-            pos += 1
-        return cut
 
-    kept = []
-    for line in text.splitlines():
-        cut = _first_cut(line)
-        piece = line[:cut].rstrip(" \t-—").strip()
-        if piece:
-            kept.append(piece)
-        if cut < len(line):
+    # 2) 找【难度】标记（可能出现 [难度] / 难度】 / 难度：），截到难度数值之后
+    heads = ["【难度】", "[难度]", "难度】", "难度：", "难度:"]
+    marker_pos = -1
+    marker_len = 0
+    for head in heads:
+        pos = text.find(head)
+        if pos != -1 and pos < 200:
+            marker_pos, marker_len = pos, len(head)
             break
-    body = "\n".join(kept).strip()
-    return body or (raw_text or "").strip()
+    if marker_pos != -1:
+        j = marker_pos + marker_len
+        while j < len(text) and not text[j].isdigit():
+            j += 1
+        while j < len(text) and (text[j].isdigit() or text[j] in ". "):
+            j += 1
+        text = text[j:]
+
+    # 3) 尾部元信息：截到最早的截止标记
+    cut = len(text)
+    for marker in ("----", "sha1(", "FM赛文", "虎殇", "QQ群", "本段", "第5 5段"):
+        pos = text.find(marker)
+        if pos != -1:
+            cut = min(cut, pos)
+    probe = 0
+    while True:
+        probe = text.find("第", probe)
+        if probe == -1:
+            break
+        k = probe + 1
+        while k < len(text) and (text[k].isdigit() or text[k] in " \t"):
+            k += 1
+        if k > probe + 1 and k < len(text) and text[k] == "段":
+            cut = min(cut, probe)
+            break
+        probe += 1
+    text = text[:cut]
+
+    # 4) 去掉开头残留的标签/引号/破折号/空白
+    stripped = text.strip()
+    for prefix in ("【发文】：", "【发文】:", "[发文]：", "【正文】："):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    return stripped.strip().lstrip('"“”‘’「」『』 -—')
 
 
 def main():
