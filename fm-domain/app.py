@@ -7705,6 +7705,39 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         source_label = "成绩库（今日）" if days <= 0 else f"成绩库（最近 {days} 天）"
 
     rows = rows_data[:limit]
+    if key == "555":
+        # 2026-11-17：555 的成绩存在 ai_contest_scores（不是 contest_scores），
+        # 之前 555 榜读错了表，所以群里新打的 555 成绩不上榜。
+        rows = []
+        seen555 = set()
+        for row in db.execute(
+            "SELECT user_id,user_name,speed,code_length,retype,word_rate,source_json "
+            "FROM ai_contest_scores WHERE competition_date=? ORDER BY speed DESC",
+            (today,),
+        ).fetchall():
+            # 每人当天只保留最快一条（2026-11-17：群友打多次时榜上出现了重复行）
+            uid555 = str(row["user_id"] or "")
+            if uid555:
+                if uid555 in seen555:
+                    continue
+                seen555.add(uid555)
+            try:
+                payload555 = json.loads(row["source_json"] or "{}")
+            except (TypeError, ValueError):
+                payload555 = {}
+            word_rate555 = float(row["word_rate"] or 0)
+            rows.append({
+                "user_name": str(row["user_name"] or row["user_id"] or "?"),
+                "best": float(row["speed"] or 0),
+                "key": float(payload555.get("keystroke") or payload555.get("key") or 0),
+                "accuracy": float(payload555.get("acc") or payload555.get("accuracy") or 0),
+                "code_length": float(row["code_length"] or 0),
+                "word_rate": word_rate555 * 100 if 0 < word_rate555 <= 1 else word_rate555,
+                "correction": float(row["retype"] or 0),
+                "n": 1,
+            })
+        rows = sorted(rows, key=lambda item: -float(item["best"] or 0))[:limit]
+        source_label = "成绩库（今日）"
     if official:
         rows.sort(key=lambda item: -float(item["best"] or 0))
 
