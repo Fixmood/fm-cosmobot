@@ -7831,7 +7831,7 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     image = Image.new("RGB", (width, height), (20, 24, 31))
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
-    draw.text((48, 34), title, font=font(44), fill=(248, 250, 253), stroke_width=1, stroke_fill=(248, 250, 253))
+    draw.text((48, 34), title, font=font(44), fill=(248, 250, 253))
     draw.text((48, 98), subtitle, font=font(24), fill=(198, 209, 224))
 
     if show_retype:
@@ -7866,9 +7866,9 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         if name != raw_name:
             name += "…"
         speed = float(item.get("best") or 0)
-        draw.text((58, top + 17), str(index), font=font(24), fill=rank_color, stroke_width=1, stroke_fill=rank_color)
-        draw.text((120, top + 17), name, font=font(23), fill=(244, 247, 252), stroke_width=1, stroke_fill=(244, 247, 252))
-        draw.text((500, top + 17), f"{speed:.2f}", font=font(23), fill=speed_color(speed), stroke_width=1, stroke_fill=speed_color(speed))
+        draw.text((58, top + 17), str(index), font=font(24), fill=rank_color)
+        draw.text((120, top + 17), name, font=font(23), fill=(244, 247, 252))
+        draw.text((500, top + 17), f"{speed:.2f}", font=font(23), fill=speed_color(speed))
         key_val = float(item.get("key") or 0)
         draw.text((620, top + 17), f"{key_val:.2f}" if key_val > 0 else "—", font=font(23), fill=key_color(key_val))
         code_len = float(item.get("code_length") or 0)
