@@ -7460,19 +7460,17 @@ class Api(BaseHTTPRequestHandler):
 
 
 def _clean_huma_article(raw_text):
-    """从引用内容里取出正文（2026-11-17 所有者要求，多轮修）。
+    """从引用内容里取出正文（2026-11-17 所有者要求，逐轮修到稳）。
 
-    支持两种引用格式：
-      A) 【发文】：[FM/AI赛文。虐]《标题》[字数270]【难度】：虐 42.80 正文… ----第555段-sha1(…)…
-      B) 【发文】：【水/极易】标题-作者-第55章…(1)【难度】：水 0.24 正文… ----第vi段-sha1(…)…
-    统一做法：先按「字数」截，再按「难度」+数值截，最后截掉尾部段号/sha1/QQ群等元信息。
-    只用字符串扫描（正则在该容器里表现不稳定）。
+    群里的赛文/发文引用有多种前缀：可能有 [字数NN]，也可能只有 【难度】：名 0.24；
+    括号写法也不统一（【难度】/[难度]/难度】/中间带空格）。这里一律用
+    「定位 字数 / 难度 这两个关键词」+ 字符串扫描来截，不依赖具体括号样式。
     """
     text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
 
-    # 1) 有「字数N」就先截到数字之后
+    # 1) 有「字数N」→ 截到数字后面
     idx = text.find("字数")
-    if idx != -1 and idx < 160:
+    if idx != -1 and idx < 300:
         j = idx + 2
         while j < len(text) and not text[j].isdigit():
             j += 1
@@ -7482,24 +7480,28 @@ def _clean_huma_article(raw_text):
             j += 1
         text = text[j:]
 
-    # 2) 找【难度】标记（可能出现 [难度] / 难度】 / 难度：），截到难度数值之后
-    heads = ["【难度】", "[难度]", "难度】", "难度：", "难度:"]
-    marker_pos = -1
-    marker_len = 0
-    for head in heads:
-        pos = text.find(head)
-        if pos != -1 and pos < 200:
-            marker_pos, marker_len = pos, len(head)
-            break
-    if marker_pos != -1:
-        j = marker_pos + marker_len
+    # 2) 有「难度」→ 截到难度数值后面（不管括号怎么写）
+    idx = text.find("难度")
+    if idx != -1 and idx < 300:
+        j = idx + 2
         while j < len(text) and not text[j].isdigit():
             j += 1
         while j < len(text) and (text[j].isdigit() or text[j] in ". "):
             j += 1
         text = text[j:]
 
-    # 3) 尾部元信息：截到最早的截止标记
+    # 3) 还以【发文】之类开头的话，去掉前缀到第一个全角冒号
+    text = text.strip()
+    for prefix in ("【发文】", "[发文]", "【正文】", "【文】"):
+        if text.startswith(prefix):
+            for colon in ("：", ":"):
+                pos = text.find(colon)
+                if pos != -1 and pos < 20:
+                    text = text[pos + 1:]
+                    break
+            break
+
+    # 4) 尾部元信息
     cut = len(text)
     for marker in ("----", "sha1(", "FM赛文", "虎殇", "QQ群", "本段", "第5 5段"):
         pos = text.find(marker)
@@ -7519,13 +7521,7 @@ def _clean_huma_article(raw_text):
         probe += 1
     text = text[:cut]
 
-    # 4) 去掉开头残留的标签/引号/破折号/空白
-    stripped = text.strip()
-    for prefix in ("【发文】：", "【发文】:", "[发文]：", "【正文】："):
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix):]
-            break
-    return stripped.strip().lstrip('"“”‘’「」『』 -—')
+    return text.strip().lstrip('"“”‘’「」『』 -—')
 
 
 def main():

@@ -67,7 +67,10 @@ def load_reverse_index() -> Dict[str, List[Tuple[str, int]]]:
     with _index_lock:
         if _index_cache.get("signature") == signature and _index_cache.get("reverse"):
             return _index_cache["reverse"]  # type: ignore[return-value]
-    reverse: Dict[str, List[Tuple[str, int]]] = collections.defaultdict(list)
+    # 2026-11-17 按「码表文件顺序」取码（等价于昙花赛码器的 --stable 口径）：
+    # 码表里先出现的那个码就是真实输入码，这样算出的码长/选重和输入法实际打的一致
+    # （实测同一段文字：文件顺序 89 键/码长 1.82，而「最短码优先」只要 83 键/1.69）。
+    reverse: Dict[str, List[Tuple[str, int]]] = {}
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if "\t" not in line:
@@ -77,12 +80,9 @@ def load_reverse_index() -> Dict[str, List[Tuple[str, int]]]:
             if not code:
                 continue
             for position, candidate in enumerate(c.strip() for c in candidates.split(" ")):
-                if candidate:
-                    reverse[candidate].append((code, position))
-    for key, codes in reverse.items():
-        # 2026-11-17 所有者要求：有最简码就显示最简码（简码优先），
-        # 因此按「码长」排序，而不是按「是否首选候选」排序。
-        codes.sort(key=lambda item: (len(item[0]), item[0]))
+                if not candidate or candidate in reverse:
+                    continue
+                reverse[candidate] = [(code, position)]
     result = dict(reverse)
     with _index_lock:
         _index_cache["signature"] = signature
@@ -94,6 +94,8 @@ def load_reverse_index() -> Dict[str, List[Tuple[str, int]]]:
 
 
 PUNCTUATION = set("，。、！？；：（）“”‘’《》〈〉【】—…·‘’〝〞,.;:!?()[]{}<>\"'`~@#$%^&*+-=_/\\|")
+
+PUNCT_COMMIT_CHARS = set("，。！？：、,.!?:（）“”’《》〈〉【】「」『』—…·")
 
 
 class Entry:
@@ -135,11 +137,7 @@ def display_code(entry: "Entry") -> str:
 def clean_article(text: str) -> str:
     """从引用内容里取出真正的正文（2026-11-17 所有者要求）。
 
-    群里引用一条赛文消息时，原文形如：
-        [FM/AI赛文·虐]《标题》[字数259] 天未晞，盐场尽头的风车……
-        ……任海风把新木的辛香吹进渠网深处。----- 第5 5段 2026-11-17-FM赛文
-    去掉开头 `[...]《...》[字数N]` 与结尾 `----- 第N段 …FM赛文` 之类的元信息，
-    只留下真正要标注的文章正文。
+    去掉开头 `[...]《...》[字数N]` 与结尾 `----- 第N段 …FM赛文` 的元信息。
     """
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     match = re.search(r"字数\s*\d+\s*[\]】]", cleaned)
@@ -166,37 +164,77 @@ def clean_article(text: str) -> str:
 
 
 def encode(text: str) -> Tuple[List[Entry], Dict[str, object]]:
-    """逐字编码（2026-11-17 所有者选定）。
+    """词优先编码（2026-11-17 所有者最终口径）。
 
-    每个非空白字符单独取码：有简码用最短码（简码优先），需要选重时记一次选重。
-    这样「字数 = 非空白字符数」「码长 = 总键数 / 字数」，和输入法里的统计口径一致。
+    · 词组优先最长匹配（4→2 字），命中词组就用该词的码（优先最短简码）；
+    · 没有词组匹配时按单字取码（简码优先）；
+    · 字数 = 非空白字符数（不是匹配后的条目数），码长 = 总键数 / 字数；
+    · 选重 = 该码的首选候选不是这个词/字，需要按 ; 或数字去选。
     """
     text = clean_article(text)
     reverse = load_reverse_index()
     entries: List[Entry] = []
-    for char in text:
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
         if char.isspace():
+            index += 1
             continue
-        candidates = reverse.get(char)
-        if not candidates:
+        # 标点一律按「标点上屏」处理（不查码表、不占空格），顿号/逗号/句号都一样
+        if char in PUNCT_COMMIT_CHARS:
             entries.append(Entry(char, None, 0))
+            index += 1
             continue
-        code, position = candidates[0]
-        entries.append(Entry(char, code, position != 0))
+        matched = None
+        for size in (4, 3, 2, 1):
+            if index + size > length:
+                continue
+            piece = text[index:index + size]
+            candidates = reverse.get(piece)
+            if not candidates:
+                continue
+            code, position = candidates[0]
+            after = text[index + size] if index + size < length else ""
+            next_punct = after if after in PUNCT_COMMIT_CHARS else ""
+            matched = Entry(piece, code, position, next_punct)
+            break
+        if matched is None:
+            entries.append(Entry(char, None, 0))
+            index += 1
+        else:
+            entries.append(matched)
+            index += len(matched.text)
 
-    chars = len(entries)
-    key_count = sum(entry.code_len for entry in entries if not entry.missing)
+    # 2026-11-17 所有者口径：
+    #   · 码长要算上「上屏空格」；
+    #   · 每打完一个字/词都要按空格上屏（白色单字、橙/蓝/紫词都一样）；
+    #   · 例外：带选重（; 或数字）的条目由选择键直接上屏，不再按空格；
+    #   · 选择键（; / 数字）本身也是击键，计入键数与键盘热力。
+    chars = sum(1 for ch in text if not ch.isspace())
     selected = sum(1 for entry in entries if entry.selected)
     missing = sum(1 for entry in entries if entry.missing)
-    length_dist = collections.Counter(
-        entry.code_len for entry in entries if not entry.missing and not entry.punctuation
-    )
+    commit_entries = [e for e in entries if not e.missing and not e.punctuation]
+    # 上屏方式：带选重 → 选择键上屏；后面紧跟标点 → 那个标点上屏；否则按空格上屏。
+    spaces = sum(1 for e in commit_entries if not e.selected and not e.next_punct)
+    selector_keys = sum(1 for e in commit_entries if e.selected)
+    punct_keys = sum(1 for e in commit_entries if not e.selected and e.next_punct)
+    letter_keys = sum(e.code_len for e in commit_entries)
+    key_count = letter_keys + selector_keys + punct_keys + spaces
+    length_dist = collections.Counter(e.code_len for e in commit_entries)
     key_counts = collections.Counter()
-    for entry in entries:
+    for entry in commit_entries:
         if entry.code:
             for ch in entry.code:
                 key_counts[ch] += 1
-    spaces = sum(1 for ch in text if ch.isspace())
+            if entry.selected:
+                suffix = selector_suffix(entry.position)
+                if suffix:
+                    key_counts[suffix] += 1
+    for entry in commit_entries:
+        if not entry.selected and entry.next_punct:
+            key_counts[entry.next_punct] += 1
+    key_counts["space"] += spaces
     stats = {
         "chars": chars,
         "keys": key_count,
@@ -255,8 +293,6 @@ COLOR_BY_LEN = {
 COLOR_MISSING = (226, 74, 74)  # 缺字 红
 COLOR_SELECTED = (255, 214, 102)
 
-PUNCT_COMMIT_CHARS = set("，。！？：、,.!?:（）“”’《》〈〉【】「」『』—…·")
-
 KEYBOARD_LAYOUT = [
     # (按键标签, 宽度, 是否字符键)  —— 字符键参与热力统计
     [("`", 1, 1), ("1", 1, 1), ("2", 1, 1), ("3", 1, 1), ("4", 1, 1), ("5", 1, 1),
@@ -271,7 +307,7 @@ KEYBOARD_LAYOUT = [
     [("Shift", 2.25, 0), ("z", 1, 1), ("x", 1, 1), ("c", 1, 1), ("v", 1, 1), ("b", 1, 1),
      ("n", 1, 1), ("m", 1, 1), (",", 1, 1), (".", 1, 1), ("/", 1, 1), ("Shift", 2.75, 0)],
     [("Ctrl", 1.25, 0), ("Win", 1.25, 0), ("Alt", 1.25, 0), ("Space", 6.25, 2),
-     ("Alt", 1.25, 0), ("Win", 1.25, 0), ("Ctrl", 1.25, 0)],
+     ("Alt", 1.25, 0), ("Win", 1.25, 0), ("Menu", 1.25, 0), ("Ctrl", 1.25, 0)],
 ]
 
 WIDTH = 1400
@@ -335,10 +371,11 @@ def render_png(text: str) -> bytes:
     if line:
         lines.append(line)
 
-    key_size = 92
-    key_gap = 16
-    row_gap = 14
-    keyboard_h = 10 + 4 * (key_size + row_gap) + (46 + row_gap) + 16
+    key_size = 56
+    key_gap = 10
+    row_gap = 8
+    space_height = 28
+    keyboard_h = 10 + 4 * (key_size + row_gap) + (space_height + row_gap) + 16
     header_h = 210
     legend_h = 54
     body_h = len(lines) * pair_h + 24 + (34 if truncated else 0)
@@ -389,14 +426,14 @@ def render_png(text: str) -> bytes:
     total_keys = max(1, stats["keys"])
     kb_top = header_h + legend_h
     unit_total = 15.0
-    kb_width = WIDTH - MARGIN * 2
+    kb_width = min(WIDTH - MARGIN * 2, 860)
     unit = (kb_width - key_gap * 14) / unit_total
     rows = KEYBOARD_LAYOUT
     for row_index, row in enumerate(rows):
         y = kb_top + 10 + row_index * (key_size + row_gap)
         row_units = sum(w for _, w, _ in row)
         row_width = unit * row_units + key_gap * (row_units - 1)
-        x = MARGIN + max(0.0, (kb_width - row_width) / 2)
+        x = (WIDTH - row_width) / 2
         for label, width_units, kind in row:
             width = unit * width_units + key_gap * (width_units - 1)
             height = key_size if row_index < 4 else 46
@@ -421,18 +458,20 @@ def render_png(text: str) -> bytes:
             if kind == 2:
                 # 空格键：一行显示「Space  x%  n次」
                 shown = f"Space  {percent}  {count_text} 次"
-                tw, th = _text_size(draw, shown, tiny_font)
-                draw.text((x + (width - tw) / 2, y + (height - th) / 2 - 2), shown, font=tiny_font, fill=TEXT)
+                space_font = _font(14)
+                tw, th = _text_size(draw, shown, space_font)
+                draw.text((x + (width - tw) / 2, y + (height - th) / 2 - 1), shown, font=space_font, fill=TEXT)
             else:
                 shown = label.upper() if len(label) == 1 else label
-                font = stats_font if len(shown) <= 2 else tiny_font
-                tw, th = _text_size(draw, shown, font)
-                draw.text((x + (width - tw) / 2, y + 8), shown, font=font, fill=label_color)
+                key_font = _font(15 if len(shown) <= 2 else 11)
+                tw, th = _text_size(draw, shown, key_font)
+                draw.text((x + (width - tw) / 2, y + 2), shown, font=key_font, fill=label_color)
                 if percent is not None:
-                    pw, _ = _text_size(draw, percent, tiny_font)
-                    draw.text((x + (width - pw) / 2, y + 40), percent, font=tiny_font, fill=TEXT)
-                    cw2, _ = _text_size(draw, count_text or "0", tiny_font)
-                    draw.text((x + (width - cw2) / 2, y + 62), count_text or "0", font=tiny_font, fill=DIM)
+                    micro_font = _font(11)
+                    pw, _ = _text_size(draw, percent, micro_font)
+                    draw.text((x + (width - pw) / 2, y + 20), percent, font=micro_font, fill=TEXT)
+                    cw2, _ = _text_size(draw, count_text or "0", micro_font)
+                    draw.text((x + (width - cw2) / 2, y + 34), count_text or "0", font=micro_font, fill=DIM)
             x += width + key_gap
 
     # 正文逐字带码（只有词着色）
@@ -458,13 +497,6 @@ def render_png(text: str) -> bytes:
             draw.text((x + (block - cw) / 2, y), entry.text, font=char_font, fill=color)
             if code_text:
                 draw.text((x + (block - kw) / 2, y + char_h + 2), code_text, font=code_font, fill=color)
-            if entry.selected:
-                draw.line(
-                    [(x + (block - kw) / 2, y + char_h + code_h + 6),
-                     (x + (block + kw) / 2, y + char_h + code_h + 6)],
-                    fill=COLOR_SELECTED,
-                    width=2,
-                )
             x += block + pair_gap
         y += pair_h
 
