@@ -7589,6 +7589,24 @@ def _clean_huma_article(raw_text):
                 rest = rest[drop:]
             text = rest.lstrip()
 
+    # 2.6) 书籍/章节标题行：小刚-主动出击你就能心想事#2Δ2.33-淼0.06
+    #      （正文从下一行开始；标题行常带 #序号 / Δ难度 之类标记）
+    newline = text.find("\n")
+    if 0 <= newline <= 100:
+        first_line = text[:newline].strip()
+        looks_like_chapter = (
+            "#" in first_line
+            or "Δ" in first_line
+            or "∆" in first_line
+            or (
+                "-" in first_line
+                and first_line[-1:].isdigit()
+                and any(ch.isdigit() for ch in first_line)
+            )
+        )
+        if looks_like_chapter:
+            text = text[newline + 1:]
+
     # 3) 还以【发文】之类开头的话，去掉前缀到第一个全角冒号
     text = text.strip()
     for prefix in ("【发文】", "[发文]", "【正文】", "【文】"):
