@@ -346,10 +346,15 @@ humaAnnotateRoute =
             if Text.null body
               then plainReply message "引用的那条消息里没有文字内容。"
               else do
+                -- 缓存破坏：同一个 URL 在 QQ/网关侧可能被缓存成旧图，
+                -- 每次请求带一个版本号+时间戳，保证拿到的永远是刚渲染的那张。
+                stamp <- liftIO (getCurrentTime <&> round . utcTimeToPOSIXSeconds)
                 let clipped = Text.take humaAnnotateMaxChars body
                     encoded = TextEncoding.decodeUtf8 (urlEncode True (TextEncoding.encodeUtf8 clipped))
                     imageUrl =
-                      "http://fm-domain:8077/huma/annotate.png?text=" <> encoded
+                      "http://fm-domain:8077/huma/annotate.png?v=20261117b&t="
+                        <> Text.pack (show (stamp :: Integer))
+                        <> "&text=" <> encoded
                 void $ Chat.replyTo message (ReplyBody.imageDirective imageUrl)
                 when (Text.length body > humaAnnotateMaxChars) $
                   plainReply message [i|原文超过 #{humaAnnotateMaxChars} 字，这张只标注了前面 #{humaAnnotateMaxChars} 字。|]
