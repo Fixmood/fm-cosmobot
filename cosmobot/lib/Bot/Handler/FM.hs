@@ -821,6 +821,21 @@ allCompetitionRankQuickHandler =
     if not enabled
       then sendStandalone message "当前群没有开启赛文排行榜功能。"
       else do
+        -- 2026-11-17 所有者：群赛文榜的标题用群名，不要用群号。
+        namesResponse <- HTTP.runReq $
+          req GET (http "fm-domain" /: "groups" /: "names") NoReqBody bsResponse (port 8077)
+        let groupNameLines = Text.lines (TextEncoding.decodeUtf8 (responseBody namesResponse))
+            lookupGroupName gid =
+              case
+                [ Text.strip name
+                | line <- groupNameLines
+                , let (key, rest) = Text.breakOn "\t" line
+                , Text.strip key == gid
+                , let name = Text.drop 1 rest
+                , not (Text.null (Text.strip name))
+                ] of
+                (name : _) -> name
+                [] -> ""
         -- 2026-11-15 所有者选 B：全部 = 官网能查的**全部**（含没成绩的），
         -- 顺序：虎杯 → 锦标赛 → 极速杯 → 极速联赛 → 555 → 六个可查群的群赛文。
         -- 没成绩的赛文图会自己写「今天还没有这个赛文的成绩」，不编造数据。
@@ -846,7 +861,11 @@ allCompetitionRankQuickHandler =
             picks = officialContests <> groupContests
             labels =
               [ "虎杯排行榜", "锦标赛排行榜", "极速杯排行榜", "极速联赛排行榜", "555排行榜" ]
-                <> [ "群赛文排行榜（" <> gid <> "）" | (_, gid) <- groupContests ]
+                <> [ label
+                   | (_, gid) <- groupContests
+                   , let groupName = lookupGroupName gid
+                   , let label = if Text.null groupName then "群赛文排行榜" else groupName <> "群赛文排行榜"
+                   ]
             urls =
               [ "http://fm-domain:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
                   <> "&group_id=" <> urlEncodeText groupId

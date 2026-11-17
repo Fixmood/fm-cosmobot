@@ -6689,6 +6689,27 @@ class Api(BaseHTTPRequestHandler):
             if request.path == "/groups":
                 rows = db.execute("SELECT g.group_id,g.display_name,g.status,g.features_json,g.updated_at,COALESCE(r.paused,0) AS paused FROM groups g LEFT JOIN group_runtime r ON r.group_id=g.group_id ORDER BY g.display_name,g.group_id").fetchall()
                 return self.json([dict(row) for row in rows])
+            if request.path == "/groups/names":
+                names = {}
+                for table, id_col, name_col in (
+                    ("groups", "group_id", "display_name"),
+                    ("group_digests", "group_id", "group_name"),
+                    ("recent_messages", "group_id", "group_name"),
+                ):
+                    try:
+                        rows = db.execute(
+                            f"SELECT {id_col} AS gid, {name_col} AS name FROM {table} "
+                            f"WHERE {name_col} IS NOT NULL AND {name_col} != ''"
+                        ).fetchall()
+                        for row in rows:
+                            gid = str(row["gid"] or "").strip()
+                            name = str(row["name"] or "").strip()
+                            if gid and name and gid not in names:
+                                names[gid] = name
+                    except Exception:
+                        continue
+                body = "\n".join(f"{gid}\t{name}" for gid, name in names.items())
+                return self.bytes(body.encode("utf-8"), "text/plain; charset=utf-8")
             if request.path == "/group-state":
                 group_id = query.get("group_id", [""])[0].strip()
                 row = db.execute("SELECT paused,updated_at FROM group_runtime WHERE group_id=?", (group_id,)).fetchone()
