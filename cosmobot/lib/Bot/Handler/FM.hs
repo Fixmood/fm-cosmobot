@@ -567,12 +567,10 @@ messageArchiveHandler =
   continueOn (matching isArchivableMessage) \message _ -> do
     response <- postEvent "message" (messagePayload message)
     when (message.platform == PlatformQQ && jsonFlag "ai_contest_archived" response) do
-      let competitionDate = fromMaybe "" . join $ AesonTypes.parseMaybe
-            (Aeson.withObject "FM event response" (Aeson..:? "competition_date")) response
-          cacheKey = fromMaybe "refresh" (messageIdText <$> message.messageId)
+      let cacheKey = fromMaybe "refresh" (messageIdText <$> message.messageId)
+          -- 2026-11-17 所有者：555 的自动记录榜要和其它排行榜同风格（统一表格渲染器）。
           leaderboardUrl =
-            "http://fm-domain:8077/reports/ai-leaderboard.png?date="
-              <> competitionDate <> "&v=" <> cacheKey
+            "http://fm-domain:8077/contest/rank-table.png?contest=555&v=" <> cacheKey
       sent <- Chat.replyTo (standaloneMessage message)
         (ReplyBody.imageDirective leaderboardUrl)
       when (null (rights sent)) $

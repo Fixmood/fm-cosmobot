@@ -948,8 +948,8 @@ fmAiContestLeaderboardImageTool =
                 (Aeson.withObject "FM AI leaderboard" (Aeson..: "date"))
                 (responseBody response :: Aeson.Value)
           let cacheKey = fromMaybe "refresh" (messageIdText <$> context.message.messageId)
-              url = "http://fm-domain:8077/reports/ai-leaderboard.png?date="
-                <> resolvedDate <> "&v=" <> cacheKey
+              -- 统一表格渲染器（与其它排行榜同风格）
+              url = "http://fm-domain:8077/contest/rank-table.png?contest=555&v=" <> cacheKey
           sent <- Chat.replyTo context.message (ReplyBody.imageDirective url)
           case rights sent of
             _:_ -> pure (toolText "Leaderboard image sent successfully.")
