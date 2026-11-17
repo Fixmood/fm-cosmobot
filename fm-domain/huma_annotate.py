@@ -70,7 +70,7 @@ def load_reverse_index() -> Dict[str, List[Tuple[str, int]]]:
     # 2026-11-17 按「码表文件顺序」取码（等价于昙花赛码器的 --stable 口径）：
     # 码表里先出现的那个码就是真实输入码，这样算出的码长/选重和输入法实际打的一致
     # （实测同一段文字：文件顺序 89 键/码长 1.82，而「最短码优先」只要 83 键/1.69）。
-    reverse: Dict[str, List[Tuple[str, int]]] = {}
+    reverse: Dict[str, List[Tuple[str, int]]] = collections.defaultdict(list)
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if "\t" not in line:
@@ -80,9 +80,12 @@ def load_reverse_index() -> Dict[str, List[Tuple[str, int]]]:
             if not code:
                 continue
             for position, candidate in enumerate(c.strip() for c in candidates.split(" ")):
-                if not candidate or candidate in reverse:
-                    continue
-                reverse[candidate] = [(code, position)]
+                if candidate:
+                    reverse[candidate].append((code, position))
+    # 2026-11-17 所有者最终口径：显示**最简码**（有简码就用简码），
+    # 因此按码长排序；需要选重时由码后的 ; / 数字表示。
+    for key, codes in reverse.items():
+        codes.sort(key=lambda item: (len(item[0]), item[0]))
     result = dict(reverse)
     with _index_lock:
         _index_cache["signature"] = signature
