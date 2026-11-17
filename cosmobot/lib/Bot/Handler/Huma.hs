@@ -16,6 +16,7 @@ import Bot.Prelude
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.ChatLog as ChatLog
 import qualified Bot.Core.ReplyBody as ReplyBody
+import qualified Bot.Effect.HTTP as HTTP
 import qualified Bot.Effect.Media as Media
 import qualified Bot.Util.Process as ProcessUtil
 import qualified Data.Aeson as Aeson
@@ -32,6 +33,7 @@ import qualified Effectful.Process.Typed as TypedProcess
 import qualified Effectful.Timeout as Timeout
 import Effectful.Timeout (Timeout)
 import System.Exit (ExitCode (..))
+import qualified Network.HTTP.Client as Client
 import Network.HTTP.Types.URI (urlEncode)
 
 -- | The prefix the owner types. A constant so the matcher, the help text and
@@ -77,6 +79,7 @@ plainReply message = void . Chat.replyTo message{messageId = Nothing}
 -- which is what the owner asked for.
 humaHandlers
   :: ( Chat.Chat :> es
+  , HTTP.HTTP :> es
   , ChatLog.ChatLog :> es
   , KatipE :> es
      , FileSystem :> es
@@ -327,6 +330,7 @@ humaAnnotateMaxChars = 800
 
 humaAnnotateRoute
   :: ( Chat.Chat :> es
+     , HTTP.HTTP :> es
      , ChatLog.ChatLog :> es
      , KatipE :> es
      , IOE :> es
@@ -350,12 +354,30 @@ humaAnnotateRoute =
                 -- 每次请求带一个版本号+时间戳，保证拿到的永远是刚渲染的那张。
                 stamp <- liftIO (getCurrentTime <&> round . utcTimeToPOSIXSeconds)
                 let clipped = Text.take humaAnnotateMaxChars body
-                    encoded = TextEncoding.decodeUtf8 (urlEncode True (TextEncoding.encodeUtf8 clipped))
+                -- 2026-11-17 所有者：文字长时 URL 会超长，snowluma 拉图失败还会把 URL 当文本发出来。
+                -- 改成先把文本 POST 到域端换一个短 id，图片地址只带 id。
+                sharedManager <- HTTP.manager
+                baseRequest <- liftIO $ Client.parseRequest "http://fm-domain:8077/huma/annotate-text"
+                let postRequest =
+                      baseRequest
+                        { Client.method = "POST"
+                        , Client.requestBody =
+                            Client.RequestBodyLBS (Aeson.encode (Aeson.object ["text" Aeson..= clipped]))
+                        , Client.requestHeaders = [("Content-Type", "application/json")]
+                        }
+                submit <- liftIO $ Client.httpLbs postRequest sharedManager
+                let storedId =
+                      fromMaybe "" $
+                        (AesonTypes.parseMaybe
+                          (Aeson.withObject "huma annotate" (Aeson..: "id"))
+                          (fromMaybe Aeson.Null (Aeson.decode (Client.responseBody submit))) :: Maybe Text)
                     imageUrl =
-                      "http://fm-domain:8077/huma/annotate.png?v=20261117b&t="
+                      "http://fm-domain:8077/huma/annotate.png?v=20261117c&t="
                         <> Text.pack (show (stamp :: Integer))
-                        <> "&text=" <> encoded
-                void $ Chat.replyTo message (ReplyBody.imageDirective imageUrl)
+                        <> "&id=" <> storedId
+                if Text.null storedId
+                  then plainReply message "标注图生成失败，稍后再试。"
+                  else void $ Chat.replyTo message (ReplyBody.imageDirective imageUrl)
                 when (Text.length body > humaAnnotateMaxChars) $
                   plainReply message [i|原文超过 #{humaAnnotateMaxChars} 字，这张只标注了前面 #{humaAnnotateMaxChars} 字。|]
 

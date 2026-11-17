@@ -5,6 +5,7 @@ import huma_annotate
 import argparse
 import html
 import hashlib
+import collections
 import io
 import json
 import os
@@ -7054,8 +7055,30 @@ class Api(BaseHTTPRequestHandler):
                     return self.json(cached_contests_today_payload(db, room))
                 finally:
                     db.close()
+            if request.path == "/huma/annotate-text" and request.command == "POST":
+                try:
+                    length = int(request.headers.get("Content-Length") or 0)
+                    body_bytes = request.rfile.read(length) if length > 0 else b""
+                    payload = json.loads(body_bytes.decode("utf-8") or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                raw_text = str(payload.get("text") or "").strip()
+                if not raw_text:
+                    return self.json({"ok": False, "error": "text 不能为空"}, HTTPStatus.BAD_REQUEST)
+                raw_text = raw_text[:5000]
+                digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
+                now = time.time()
+                HUMA_ANNOTATE_CACHE[digest] = (now, raw_text)
+                while len(HUMA_ANNOTATE_CACHE) > 200:
+                    HUMA_ANNOTATE_CACHE.popitem(last=False)
+                return self.json({"ok": True, "id": digest})
             if request.path == "/huma/annotate.png":
                 raw = (query.get("text", [""])[0] or "").strip()
+                annotate_id = (query.get("id", [""])[0] or "").strip()
+                if not raw and annotate_id:
+                    stored = HUMA_ANNOTATE_CACHE.get(annotate_id)
+                    if stored and time.time() - stored[0] < 900:
+                        raw = stored[1]
                 if not raw:
                     return self.json({"ok": False, "error": "text 不能为空"}, HTTPStatus.BAD_REQUEST)
                 try:
@@ -7139,6 +7162,20 @@ class Api(BaseHTTPRequestHandler):
 
     def _do_post_impl(self):
         request = urlparse(self.path)
+        if request.path == "/huma/annotate-text":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}") if length > 0 else {}
+            except (TypeError, ValueError):
+                payload = {}
+            raw_text = str((payload or {}).get("text") or "").strip()[:5000]
+            if not raw_text:
+                return self.json({"ok": False, "error": "text 不能为空"}, HTTPStatus.BAD_REQUEST)
+            digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
+            HUMA_ANNOTATE_CACHE[digest] = (time.time(), raw_text)
+            while len(HUMA_ANNOTATE_CACHE) > 200:
+                HUMA_ANNOTATE_CACHE.popitem(last=False)
+            return self.json({"ok": True, "id": digest})
         if request.path not in {
             "/novel/start", "/novel/continue", "/novel/next", "/novel/jump",
             "/novel/progress", "/novel/stats",
@@ -7500,6 +7537,9 @@ class Api(BaseHTTPRequestHandler):
 
 
 
+HUMA_ANNOTATE_CACHE: "collections.OrderedDict[str, tuple[float, str]]" = collections.OrderedDict()
+
+
 def _clean_huma_article(raw_text):
     """从引用内容里取出正文（2026-11-17 所有者要求，逐轮修到稳）。
 
@@ -7530,6 +7570,24 @@ def _clean_huma_article(raw_text):
         while j < len(text) and (text[j].isdigit() or text[j] in ". "):
             j += 1
         text = text[j:]
+
+    # 2.5) 书籍引用：书名（校对版全本）（15500/1518877字，1.02%）-普4.09 正文…
+    head = text[:140]
+    if "字，" in head:
+        marker = head.find("字，")
+        close = text.find("）", marker)
+        if close != -1:
+            rest = text[close + 1:]
+            skip = 0
+            while skip < len(rest) and rest[skip] in " \t\n\r":
+                skip += 1
+            rest = rest[skip:]
+            if rest[:1] in ("-", "—"):
+                drop = 1
+                while drop < len(rest) and (rest[drop].isalnum() or rest[drop] in ". "):
+                    drop += 1
+                rest = rest[drop:]
+            text = rest.lstrip()
 
     # 3) 还以【发文】之类开头的话，去掉前缀到第一个全角冒号
     text = text.strip()
