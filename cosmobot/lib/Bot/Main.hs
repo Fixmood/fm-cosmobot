@@ -170,8 +170,8 @@ routes cfg threads =
   where
     baseRoutes =
       humaHandlers
-        <> askHandlers cfg.tool (AgentTools.defaultToolsWith AgentTools.acpTools) cfg.handlers.ask threads
           <> fmHandlers
+          <> askHandlers cfg.tool (AgentTools.defaultToolsWith AgentTools.acpTools) cfg.handlers.ask threads
         <> shutUpHandlers cfg.handlers.shutup
         <> adminHandlers cfg.handlers.admin
         <> scratchpadHandlers
