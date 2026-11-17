@@ -847,12 +847,13 @@ allCompetitionRankQuickHandler =
             urls =
               [ "http://fm-domain:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
                   <> "&group_id=" <> urlEncodeText groupId
-                  <> "&limit=5&_=" <> cacheBase <> contest <> groupId
+                  <> "&limit=50&_=" <> cacheBase <> contest <> groupId
               | (contest, groupId) <- picks
               ]
-        let body = Text.unlines (map ReplyBody.imageDirective urls)
-        sent <- Chat.replyTo (standaloneMessage message) body
-        when (null (rights sent)) $
+        -- 2026-11-17 所有者：每个榜各发一条消息（不要挤在一条里），顺序保持
+        -- 虎杯 → 锦标赛 → 极速杯 → 极速联赛 → 555 → 群赛文。
+        sentAll <- mapM (\url -> Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective url)) urls
+        when (all (null . rights) sentAll) $
           sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
