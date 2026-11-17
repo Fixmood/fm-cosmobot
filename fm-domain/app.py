@@ -4322,7 +4322,7 @@ def render_ai_leaderboard(db: sqlite3.Connection, competition_date: str) -> byte
     draw.text((48, 38), "FM AI赛文排行榜", font=font(40), fill=(244, 247, 252))
     draw.text((48, 98), f"{competition_date or '日期未知'}  |  《{title}》  |  第555段", font=font(22), fill=(159, 172, 193))
     columns = [(52, "排名"), (120, "成员"), (430, "速度"), (580, "击键"), (700, "码长"), (820, "打词率"), (950, "重打"), (1060, "键准")]
-    draw.rounded_rectangle((40, 154, 1200, 210), radius=8, fill=(35, 43, 55))
+    draw.rounded_rectangle((40, 156, 1200, 214), radius=8, fill=(37, 46, 60))
     for x, label in columns:
         draw.text((x, 168), label, font=font(20), fill=(184, 196, 214))
     if not rows:
@@ -7711,8 +7711,8 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
     no_retype_contests = {"HB", "100000"}
     show_retype = key not in no_retype_contests and any(float(r.get("correction") or 0) > 0 for r in rows)
 
-    GOLD, SILVER, BRONZE = (255, 207, 92), (196, 204, 216), (214, 150, 96)
-    ROW_TINTS = [(48, 42, 26), (37, 40, 48), (43, 36, 29)]
+    GOLD, SILVER, BRONZE = (255, 216, 77), (226, 236, 248), (201, 123, 62)
+    ROW_TINTS = [(54, 46, 22), (39, 45, 56), (50, 38, 28)]
     DIMMED = (128, 141, 160)
     CYAN = (91, 219, 194)
     RED = (246, 116, 130)
@@ -7797,15 +7797,42 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         where_text = f"  |  {label}" if key == "555" else "  |  全群"
     title_prefix = "本群" if scope == "group" else label
     subtitle = f"{today}{where_text}  |  {when}  |  {source_label}"
+    if key == "555":
+        # 2026-11-17 所有者：555 榜要标出今天赛文的名称
+        contest_title = ""
+        try:
+            text_row = db.execute(
+                "SELECT title FROM ai_contest_texts WHERE competition_date=?", (today,)
+            ).fetchone()
+            contest_title = str(text_row["title"] if text_row else "").strip()
+        except Exception:
+            contest_title = ""
+        if not contest_title:
+            try:
+                for score_row in db.execute(
+                    "SELECT source_json FROM ai_contest_scores WHERE competition_date=? "
+                    "ORDER BY speed DESC LIMIT 5",
+                    (today,),
+                ).fetchall():
+                    payload = json.loads(score_row["source_json"] or "{}")
+                    raw = str(payload.get("raw") or "")
+                    match = re.search(r"【([^】]{2,80})】", raw)
+                    if match and match.group(1).strip() not in {"首打认证", "词提开"}:
+                        contest_title = match.group(1).strip()
+                        break
+            except Exception:
+                pass
+        if contest_title:
+            subtitle = f"{today}  |  《{contest_title}》  |  第555段  |  {when}  |  {source_label}"
 
     width = 1240
-    row_height = 74
-    height = 230 + max(1, len(rows)) * row_height + 96
+    row_height = 78
+    height = 238 + max(1, len(rows)) * row_height + 96
     image = Image.new("RGB", (width, height), (20, 24, 31))
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, width, 12), fill=(78, 205, 181))
-    draw.text((48, 38), title, font=font(40), fill=(244, 247, 252))
-    draw.text((48, 98), subtitle, font=font(22), fill=(159, 172, 193))
+    draw.text((48, 34), title, font=font(44), fill=(248, 250, 253), stroke_width=1, stroke_fill=(248, 250, 253))
+    draw.text((48, 98), subtitle, font=font(24), fill=(198, 209, 224))
 
     if show_retype:
         columns = [(52, "排名"), (120, "成员"), (500, "速度"), (620, "击键"),
@@ -7817,20 +7844,20 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         col_acc = 960
     draw.rounded_rectangle((40, 154, 1200, 210), radius=8, fill=(35, 43, 55))
     for x, name in columns:
-        draw.text((x, 168), name, font=font(20), fill=(184, 196, 214))
+        draw.text((x, 166), name, font=font(22), fill=(200, 210, 226))
     if not rows:
         text = "今天官网还没有这个赛文的成绩。" if official else "今天还没有这个赛文的成绩。"
         draw.text((52, 240), text, font=font(24), fill=(200, 120, 120))
     for index, item in enumerate(rows, 1):
         top = 224 + (index - 1) * row_height
         fill = ROW_TINTS[index - 1] if index <= 3 else ((29, 36, 47) if index % 2 else (25, 31, 41))
-        draw.rounded_rectangle((40, top, 1200, top + 64), radius=7, fill=fill)
+        draw.rounded_rectangle((40, top, 1200, top + 68), radius=7, fill=fill)
         if index == 1:
-            draw.rounded_rectangle((40, top, 48, top + 64), radius=3, fill=GOLD)
+            draw.rounded_rectangle((40, top, 50, top + 68), radius=3, fill=GOLD)
         elif index == 2:
-            draw.rounded_rectangle((40, top, 48, top + 64), radius=3, fill=SILVER)
+            draw.rounded_rectangle((40, top, 50, top + 68), radius=3, fill=SILVER)
         elif index == 3:
-            draw.rounded_rectangle((40, top, 48, top + 64), radius=3, fill=BRONZE)
+            draw.rounded_rectangle((40, top, 50, top + 68), radius=3, fill=BRONZE)
         rank_color = [GOLD, SILVER, BRONZE][index - 1] if index <= 3 else (219, 226, 237)
         raw_name = str(item.get("user_name") or "unknown")
         name = raw_name
@@ -7839,26 +7866,26 @@ def render_contest_rank_table(db: sqlite3.Connection, query: dict) -> bytes:
         if name != raw_name:
             name += "…"
         speed = float(item.get("best") or 0)
-        draw.text((58, top + 18), str(index), font=font(22), fill=rank_color)
-        draw.text((120, top + 18), name, font=font(21), fill=(235, 239, 245))
-        draw.text((500, top + 18), f"{speed:.2f}", font=font(22), fill=speed_color(speed))
+        draw.text((58, top + 17), str(index), font=font(24), fill=rank_color, stroke_width=1, stroke_fill=rank_color)
+        draw.text((120, top + 17), name, font=font(23), fill=(244, 247, 252), stroke_width=1, stroke_fill=(244, 247, 252))
+        draw.text((500, top + 17), f"{speed:.2f}", font=font(23), fill=speed_color(speed), stroke_width=1, stroke_fill=speed_color(speed))
         key_val = float(item.get("key") or 0)
-        draw.text((620, top + 18), f"{key_val:.2f}" if key_val > 0 else "—", font=font(22), fill=key_color(key_val))
+        draw.text((620, top + 17), f"{key_val:.2f}" if key_val > 0 else "—", font=font(23), fill=key_color(key_val))
         code_len = float(item.get("code_length") or 0)
-        draw.text((730, top + 18), f"{code_len:.2f}" if code_len > 0 else "—", font=font(22), fill=(159, 172, 193))
+        draw.text((730, top + 17), f"{code_len:.2f}" if code_len > 0 else "—", font=font(23), fill=(186, 197, 214))
         wr = float(item.get("word_rate") or 0)
-        draw.text((830, top + 18), f"{wr:.2f}%" if wr > 0 else "—", font=font(22), fill=word_rate_color(wr))
+        draw.text((830, top + 17), f"{wr:.2f}%" if wr > 0 else "—", font=font(23), fill=word_rate_color(wr))
         if show_retype:
             corr = float(item.get("correction") or 0)
-            draw.text((960, top + 18), f"{corr:.0f}" if corr > 0 else "—", font=font(22), fill=correction_color(corr))
+            draw.text((960, top + 17), f"{corr:.0f}" if corr > 0 else "—", font=font(23), fill=correction_color(corr))
         acc = float(item.get("accuracy") or 0)
-        draw.text((col_acc, top + 18), f"{acc:.2f}%" if acc > 0 else "—", font=font(22), fill=accuracy_color(acc))
+        draw.text((col_acc, top + 17), f"{acc:.2f}%" if acc > 0 else "—", font=font(23), fill=accuracy_color(acc))
     footer = f"共 {len(rows)} 人 | 每人保留当日最高速度" if official else f"共 {len(rows)} 人 | 每人保留最高速度（成绩条数 {sum(int(r.get('n') or 0) for r in rows)}）"
-    draw.text((48, height - 62), footer, font=font(18), fill=DIMMED)
+    draw.text((48, height - 62), footer, font=font(19), fill=(150, 163, 182))
     legend = f"数据来源：{source_label} · 颜色：速度分档 · 键准 ≥98 绿、<90 红"
     if not show_retype:
         legend += " · 本赛文不能重打，未列重打" if key in no_retype_contests else " · 今日暂无重打数据，未列"
-    draw.text((48, height - 36), legend, font=font(15), fill=(96, 106, 122))
+    draw.text((48, height - 36), legend, font=font(16), fill=(124, 136, 154))
     output = io.BytesIO()
     image.save(output, "PNG", optimize=True)
     return output.getvalue()
