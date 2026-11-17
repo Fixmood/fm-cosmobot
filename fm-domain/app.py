@@ -6691,6 +6691,11 @@ class Api(BaseHTTPRequestHandler):
                 return self.json([dict(row) for row in rows])
             if request.path == "/groups/names":
                 names = {}
+                # 与排行榜标题同一套别名表（GROUP_NAMES_BY_ID），保证标题和群名一致
+                for alias_gid, alias_name in GROUP_NAMES_BY_ID.items():
+                    alias_name = str(alias_name or "").strip()
+                    if alias_name:
+                        names[str(alias_gid)] = alias_name
                 for table, id_col, name_col in (
                     ("groups", "group_id", "display_name"),
                     ("group_digests", "group_id", "group_name"),
@@ -6704,10 +6709,25 @@ class Api(BaseHTTPRequestHandler):
                         for row in rows:
                             gid = str(row["gid"] or "").strip()
                             name = str(row["name"] or "").strip()
-                            if gid and name and gid not in names:
+                            if gid and name and gid not in names and name not in ("本群", "本群赛文"):
                                 names[gid] = name
                     except Exception:
                         continue
+                # 群名兜底：群赛文在 contest_scores.contest_name 里就是群名（如「剑影赛文」）
+                try:
+                    for row in db.execute(
+                        "SELECT group_id, contest_name FROM contest_scores "
+                        "WHERE contest_name IS NOT NULL AND contest_name != '' "
+                        "ORDER BY score_date DESC, rowid DESC"
+                    ).fetchall():
+                        gid = str(row["group_id"] or "").strip()
+                        name = str(row["contest_name"] or "").strip()
+                        if name.endswith("赛文"):
+                            name = name[: -len("赛文")].strip()
+                        if gid and name and gid not in names:
+                            names[gid] = name
+                except Exception:
+                    pass
                 body = "\n".join(f"{gid}\t{name}" for gid, name in names.items())
                 return self.bytes(body.encode("utf-8"), "text/plain; charset=utf-8")
             if request.path == "/group-state":
