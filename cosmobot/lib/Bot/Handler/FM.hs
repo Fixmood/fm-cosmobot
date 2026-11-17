@@ -844,17 +844,40 @@ allCompetitionRankQuickHandler =
                   ]
               ]
             picks = officialContests <> groupContests
+            labels =
+              [ "虎杯排行榜", "锦标赛排行榜", "极速杯排行榜", "极速联赛排行榜", "555排行榜" ]
+                <> [ "群赛文排行榜（" <> gid <> "）" | (_, gid) <- groupContests ]
             urls =
               [ "http://fm-domain:8077/contest/rank-table.png?contest=" <> urlEncodeText contest
                   <> "&group_id=" <> urlEncodeText groupId
                   <> "&limit=50&_=" <> cacheBase <> contest <> groupId
               | (contest, groupId) <- picks
               ]
-        -- 2026-11-17 所有者：每个榜各发一条消息（不要挤在一条里），顺序保持
-        -- 虎杯 → 锦标赛 → 极速杯 → 极速联赛 → 555 → 群赛文。
-        sentAll <- mapM (\url -> Chat.replyTo (standaloneMessage message) (ReplyBody.imageDirective url)) urls
-        when (all (null . rights) sentAll) $
-          sendStandalone message "全部排行榜图片发送失败，稍后再试。"
+            -- 2026-11-17 所有者：全部排行榜合并成一条「合并转发」，
+            -- 每个榜先一行标题（例如「虎杯排行榜」），紧接着该榜的图。
+            textSegment title =
+              Aeson.object
+                [ "type" Aeson..= ("text" :: Text)
+                , "data" Aeson..= Aeson.object ["text" Aeson..= title]
+                ]
+            imageSegment url =
+              Aeson.object
+                [ "type" Aeson..= ("image" :: Text)
+                , "data" Aeson..= Aeson.object ["file" Aeson..= url]
+                ]
+            boardNode (label, url) =
+              Aeson.object
+                [ "type" Aeson..= ("node" :: Text)
+                , "data" Aeson..= Aeson.object
+                    [ "name" Aeson..= ("FM" :: Text)
+                    , "uin" Aeson..= ("3471095459" :: Text)
+                    , "content" Aeson..= [textSegment label, imageSegment url]
+                    ]
+                ]
+        sentForward <- Chat.sendMergedForward (standaloneMessage message) (map boardNode (zip labels urls))
+        case sentForward of
+          Right _ -> pure ()
+          Left _ -> sendStandalone message "全部排行榜图片发送失败，稍后再试。"
 
 isAllCompetitionRankQuick :: IncomingMessage -> Bool
 isAllCompetitionRankQuick message =
