@@ -14,6 +14,8 @@ import Bot.Core.Message
 import Bot.Core.Route
 import Bot.Prelude
 import qualified Bot.Effect.Chat as Chat
+import qualified Bot.Effect.ChatLog as ChatLog
+import qualified Bot.Core.ReplyBody as ReplyBody
 import qualified Bot.Effect.Media as Media
 import qualified Bot.Util.Process as ProcessUtil
 import qualified Data.Aeson as Aeson
@@ -21,6 +23,7 @@ import qualified Data.Aeson.Types as AesonTypes
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as TextEncoding
 import Data.Time (getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import qualified Effectful.FileSystem.IO.ByteString as FileSystemByteString
@@ -29,6 +32,7 @@ import qualified Effectful.Process.Typed as TypedProcess
 import qualified Effectful.Timeout as Timeout
 import Effectful.Timeout (Timeout)
 import System.Exit (ExitCode (..))
+import Network.HTTP.Types.URI (urlEncode)
 
 -- | The prefix the owner types. A constant so the matcher, the help text and
 -- the reply cannot drift apart.
@@ -73,6 +77,8 @@ plainReply message = void . Chat.replyTo message{messageId = Nothing}
 -- which is what the owner asked for.
 humaHandlers
   :: ( Chat.Chat :> es
+  , ChatLog.ChatLog :> es
+  , KatipE :> es
      , FileSystem :> es
      , Media.Media :> es
      , Timeout :> es
@@ -82,7 +88,7 @@ humaHandlers
      )
   => [RouteHandler es]
 humaHandlers =
-  [humaFixRoute, humaUploadWatch, humaUpdateTableRoute]
+  [humaFixRoute, humaAnnotateRoute, humaUploadWatch, humaUpdateTableRoute]
 
 -- ── 换码表：上传 -> 校验 -> 原子替换 ────────────────────────────────────
 --
@@ -311,3 +317,43 @@ humaFixFilter =
     if Text.null rest || Text.isPrefixOf " " rest || Text.isPrefixOf "　" rest
       then Just (Text.strip rest)
       else Nothing
+
+-- ── 引用一段文字 + 说「fix」→ 生成虎码标注图（2026-11-16 所有者需求）──────
+-- 语义：引用任意消息，然后单独发「fix」（不带星号）。
+-- 图由 fm-domain 的 /huma/annotate.png 渲染（键盘热力 + 逐字带码），这里只负责
+-- 把被引用文本取出来、URL 编码后作为图片发回去。没有引用就回一句用法提示。
+humaAnnotateMaxChars :: Int
+humaAnnotateMaxChars = 800
+
+humaAnnotateRoute
+  :: ( Chat.Chat :> es
+     , ChatLog.ChatLog :> es
+     , KatipE :> es
+     , IOE :> es
+     )
+  => RouteHandler es
+humaAnnotateRoute =
+  stopOn (matching isAnnotateCommand) \message _ ->
+    case message.replyToMessageId of
+      Nothing ->
+        plainReply message "引用一段文字，然后单独发「fix」，我就给你出一张虎码标注图（键盘热力 + 逐字带码）。"
+      Just quotedId ->
+        Chat.getMessageContent message quotedId >>= \case
+          Nothing ->
+            plainReply message "没取到被引用的内容，稍等几秒再试一次。"
+          Just referenced -> do
+            let body = Text.strip referenced.text
+            if Text.null body
+              then plainReply message "引用的那条消息里没有文字内容。"
+              else do
+                let clipped = Text.take humaAnnotateMaxChars body
+                    encoded = TextEncoding.decodeUtf8 (urlEncode True (TextEncoding.encodeUtf8 clipped))
+                    imageUrl =
+                      "http://fm-domain:8077/huma/annotate.png?text=" <> encoded
+                void $ Chat.replyTo message (ReplyBody.imageDirective imageUrl)
+                when (Text.length body > humaAnnotateMaxChars) $
+                  plainReply message [i|原文超过 #{humaAnnotateMaxChars} 字，这张只标注了前面 #{humaAnnotateMaxChars} 字。|]
+
+isAnnotateCommand :: IncomingMessage -> Bool
+isAnnotateCommand message =
+  Text.toCaseFold (Text.strip message.text) == "fix"

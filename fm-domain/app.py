@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """FM's retained domain data importer and read-only query service."""
 
+import huma_annotate
 import argparse
 import html
 import hashlib
@@ -7009,9 +7010,20 @@ class Api(BaseHTTPRequestHandler):
                 db = connect(self.db_path)
                 try:
                     room = (query.get("group_id", [""])[0] or "").strip()
-                    return self.json(contests_today_payload(db, room))
+                    return self.json(cached_contests_today_payload(db, room))
                 finally:
                     db.close()
+            if request.path == "/huma/annotate.png":
+                text = (query.get("text", [""])[0] or "").strip()
+                if not text:
+                    return self.json({"ok": False, "error": "text 不能为空"}, HTTPStatus.BAD_REQUEST)
+                try:
+                    return self.bytes(huma_annotate.render_png(text), "image/png")
+                except Exception as exc:  # noqa: BLE001
+                    return self.json(
+                        {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
             if request.path == "/version":
                 return self.json(version_response(db, self.db_path))
             if request.path == "/stats/advanced":
@@ -7966,6 +7978,25 @@ def contests_today_payload(db, group_id: str) -> dict:
     return {"ok": True, "date": today, "count": len(items), "items": items}
 
 
+
+
+# ── /contests/today 短期缓存（2026-11-15）──────────────────────────────────
+# 这个端点会去官网抓实时数据，冷启动 3 秒以上；bot 的若干路由在 decide 阶段会探测它，
+# 于是每条消息都被拖慢。数据本身 30 秒内不会变，直接做 TTL 缓存。
+_CONTESTS_TODAY_CACHE = {}
+_CONTESTS_TODAY_TTL_SECONDS = 30
+
+
+def cached_contests_today_payload(db, room):
+    import time as _time
+    key = room or ""
+    now = _time.time()
+    cached = _CONTESTS_TODAY_CACHE.get(key)
+    if cached and now - cached[0] < _CONTESTS_TODAY_TTL_SECONDS:
+        return cached[1]
+    payload = contests_today_payload(db, room)
+    _CONTESTS_TODAY_CACHE[key] = (now, payload)
+    return payload
 
 if __name__ == "__main__":
     main()
