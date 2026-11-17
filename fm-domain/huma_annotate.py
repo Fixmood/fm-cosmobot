@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import collections
 import os
+import re
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -105,7 +106,43 @@ class Entry:
         self.punctuation = code is None and text in PUNCTUATION
 
 
+
+
+def clean_article(text: str) -> str:
+    """从引用内容里取出真正的正文（2026-11-17 所有者要求）。
+
+    群里引用一条赛文消息时，原文形如：
+        [FM/AI赛文·虐]《标题》[字数259] 天未晞，盐场尽头的风车……
+        ……任海风把新木的辛香吹进渠网深处。----- 第5 5段 2026-11-17-FM赛文
+    去掉开头 `[...]《...》[字数N]` 与结尾 `----- 第N段 …FM赛文` 之类的元信息，
+    只留下真正要标注的文章正文。
+    """
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    match = re.search(r"字数\s*\d+\s*[\]】]", cleaned)
+    if match:
+        cleaned = cleaned[match.end():]
+    else:
+        match = re.search(r"[\]】]\s*《[^》]*》", cleaned)
+        if match:
+            cleaned = cleaned[match.end():]
+    kept = []
+    for line in cleaned.split("\n"):
+        stripped = line.strip()
+        if re.match(r"^-{3,}", stripped):
+            break
+        if "FM赛文" in stripped:
+            break
+        if "赛文" in stripped and "字数" in stripped:
+            break
+        if re.match(r"^第\s*\d+\s*段", stripped) or re.match(r"^\d+\s*段\s*20\d\d", stripped):
+            break
+        kept.append(line)
+    body = "\n".join(kept).strip()
+    return body or text.strip()
+
+
 def encode(text: str) -> Tuple[List[Entry], Dict[str, object]]:
+    text = clean_article(text)
     reverse = load_reverse_index()
     entries: List[Entry] = []
     index = 0
@@ -245,7 +282,6 @@ def render_png(text: str) -> bytes:
     if truncated:
         entries = entries[:MAX_RENDER_CHARS]
 
-    # 先量出正文需要的高度，再一次性建画布
     probe = Image.new("RGB", (WIDTH, 10))
     probe_draw = ImageDraw.Draw(probe)
     char_font = _font(30)
@@ -272,7 +308,10 @@ def render_png(text: str) -> bytes:
     if line:
         lines.append(line)
 
-    keyboard_h = 10 + len(KEY_ROWS) * (92 + 14) + 10 + 46 + 16
+    key_size = 92
+    key_gap = 16
+    row_gap = 14
+    keyboard_h = 10 + len(KEY_ROWS) * (key_size + row_gap) + 10 + 46 + 16
     header_h = 210
     legend_h = 54
     body_h = len(lines) * pair_h + 24 + (34 if truncated else 0)
@@ -285,7 +324,7 @@ def render_png(text: str) -> bytes:
     small_font = _font(20)
     tiny_font = _font(16)
 
-    # 标题
+    # 标题与统计
     draw.text((MARGIN, MARGIN - 8), "【虎码】", font=title_font, fill=ACCENT)
     stat_line = (
         f"字数 {stats['chars']}    码长 {stats['code_len']:.2f}    "
@@ -293,8 +332,6 @@ def render_png(text: str) -> bytes:
         f"    空格 {stats['spaces']}    总键数 {stats['keys']}"
     )
     draw.text((MARGIN, MARGIN + 52), stat_line, font=stats_font, fill=TEXT)
-
-    # 右上角码长分布
     dist = stats["length_dist"]
     dist_line = "  ".join(
         f"{label} {dist.get(length, 0)}"
@@ -307,27 +344,23 @@ def render_png(text: str) -> bytes:
 
     # 图例
     legend_y = header_h - 18
-    legend_items = [
+    lx = MARGIN
+    for label, color in (
         ("一码", COLOR_BY_LEN[1]),
         ("二简", COLOR_BY_LEN[2]),
         ("三简", COLOR_BY_LEN[3]),
         ("四码", COLOR_BY_LEN[4]),
         ("缺字", COLOR_MISSING),
-    ]
-    lx = MARGIN
-    for label, color in legend_items:
+    ):
         draw.rectangle([lx, legend_y, lx + 18, legend_y + 18], fill=color)
         draw.text((lx + 26, legend_y - 3), label, font=tiny_font, fill=DIM)
         lx += 96
-    draw.text((lx + 8, legend_y - 3), "（选重：码下方的黄线）", font=tiny_font, fill=DIM)
+    draw.text((lx + 8, legend_y - 3), "（只有词着色；选重：码下方黄线）", font=tiny_font, fill=DIM)
 
     # 键盘热力图
     key_counts = stats["key_counts"]
     total_keys = max(1, stats["keys"])
     kb_top = header_h + legend_h
-    key_size = 92
-    key_gap = 16
-    row_gap = 14
     for row_index, keys in enumerate(KEY_ROWS):
         row_width = len(keys) * (key_size + key_gap) - key_gap
         start_x = (WIDTH - row_width) // 2
@@ -336,7 +369,6 @@ def render_png(text: str) -> bytes:
             x = start_x + col * (key_size + key_gap)
             count = key_counts.get(key, 0)
             ratio = count / total_keys
-            # 频次着色：从深底到暖橙
             intensity = min(1.0, ratio / 0.09)
             fill = (
                 int(PANEL[0] + (226 - PANEL[0]) * intensity),
@@ -350,8 +382,8 @@ def render_png(text: str) -> bytes:
             pct = f"{ratio * 100:.1f}%"
             pw, _ = _text_size(draw, pct, tiny_font)
             draw.text((x + (key_size - pw) / 2, y + 44), pct, font=tiny_font, fill=TEXT)
-            cw, _ = _text_size(draw, str(count), tiny_font)
-            draw.text((x + (key_size - cw) / 2, y + 66), str(count), font=tiny_font, fill=DIM)
+            cw2, _ = _text_size(draw, str(count), tiny_font)
+            draw.text((x + (key_size - cw2) / 2, y + 66), str(count), font=tiny_font, fill=DIM)
 
     # 空格键
     space_y = kb_top + 10 + len(KEY_ROWS) * (key_size + row_gap) + 4
@@ -366,9 +398,8 @@ def render_png(text: str) -> bytes:
     sw, _ = _text_size(draw, space_text, tiny_font)
     draw.text((space_x + (space_w - sw) / 2, space_y + 12), space_text, font=tiny_font, fill=TEXT)
 
-    # 正文逐字带码
-    body_top = kb_top + keyboard_h
-    y = body_top
+    # 正文逐字带码（只有词着色）
+    y = kb_top + keyboard_h
     for line_entries in lines:
         x = MARGIN
         for entry in line_entries:
@@ -377,7 +408,10 @@ def render_png(text: str) -> bytes:
                 code_text = ""
             elif entry.missing:
                 color = COLOR_MISSING
-                code_text = "缺"
+                code_text = ""
+            elif len(entry.text) <= 1:
+                color = TEXT
+                code_text = entry.code or ""
             else:
                 color = COLOR_BY_LEN.get(entry.code_len, COLOR_BY_LEN[4])
                 code_text = entry.code or ""
@@ -387,7 +421,7 @@ def render_png(text: str) -> bytes:
             draw.text((x + (block - cw) / 2, y), entry.text, font=char_font, fill=color)
             if code_text:
                 draw.text((x + (block - kw) / 2, y + char_h + 2), code_text, font=code_font, fill=color)
-            if entry.selected:
+            if entry.selected and len(entry.text) > 1:
                 draw.line(
                     [(x + (block - kw) / 2, y + char_h + code_h + 6),
                      (x + (block + kw) / 2, y + char_h + code_h + 6)],
@@ -398,12 +432,7 @@ def render_png(text: str) -> bytes:
         y += pair_h
 
     if truncated:
-        draw.text(
-            (MARGIN, y + 6),
-            f"（正文过长，仅渲染前 {MAX_RENDER_CHARS} 字）",
-            font=tiny_font,
-            fill=DIM,
-        )
+        draw.text((MARGIN, y + 6), f"（正文过长，仅渲染前 {MAX_RENDER_CHARS} 字）", font=tiny_font, fill=DIM)
 
     buffer = __import__("io").BytesIO()
     image.save(buffer, format="PNG", optimize=True)

@@ -7014,11 +7014,12 @@ class Api(BaseHTTPRequestHandler):
                 finally:
                     db.close()
             if request.path == "/huma/annotate.png":
-                text = (query.get("text", [""])[0] or "").strip()
-                if not text:
+                raw = (query.get("text", [""])[0] or "").strip()
+                if not raw:
                     return self.json({"ok": False, "error": "text 不能为空"}, HTTPStatus.BAD_REQUEST)
                 try:
-                    return self.bytes(huma_annotate.render_png(text), "image/png")
+                    cleaned = _clean_huma_article(raw)
+                    return self.bytes(huma_annotate.render_png(cleaned), "image/png")
                 except Exception as exc:  # noqa: BLE001
                     return self.json(
                         {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
@@ -7454,6 +7455,63 @@ class Api(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+
+
+
+def _clean_huma_article(raw_text):
+    """从引用内容里取出正文（去掉赛文标题/段号元信息）。2026-11-17 所有者要求。
+
+    不用正则：容器里正则表现不稳定，这里用字符串扫描，行为可预测。
+    注意：赛文消息的正文和尾部元信息常常在**同一行**（没有换行），
+    所以不能只按行判断，必须在行内找截断点。
+    """
+    text = (raw_text or "").strip()
+    # 1) 去掉开头 [FM/AI赛文...]《标题》[字数N]
+    idx = text.find("字数")
+    if idx != -1:
+        j = idx + 2
+        while j < len(text) and text[j].isdigit():
+            j += 1
+        while j < len(text) and text[j] in " \t\n\r]】":
+            if text[j] in "]】":
+                j += 1
+                break
+            j += 1
+        text = text[j:]
+    # 2) 行内找尾部元信息的最早起点
+    def _first_cut(line):
+        cut = len(line)
+        for marker in ("-----", "FM赛文", "———"):
+            pos = line.find(marker)
+            if pos != -1:
+                cut = min(cut, pos)
+        # 「第 N 段」
+        probe = line
+        pos = 0
+        while True:
+            pos = probe.find("第", pos)
+            if pos == -1:
+                break
+            k = pos + 1
+            while k < len(probe) and (probe[k].isdigit() or probe[k] in " \t"):
+                k += 1
+            if k > pos + 1 and k < len(probe) and probe[k] == "段":
+                cut = min(cut, pos)
+                break
+            pos += 1
+        return cut
+
+    kept = []
+    for line in text.splitlines():
+        cut = _first_cut(line)
+        piece = line[:cut].rstrip(" \t-—").strip()
+        if piece:
+            kept.append(piece)
+        if cut < len(line):
+            break
+    body = "\n".join(kept).strip()
+    return body or (raw_text or "").strip()
 
 
 def main():
