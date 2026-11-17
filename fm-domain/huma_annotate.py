@@ -104,16 +104,18 @@ PUNCT_COMMIT_CHARS = set("，。！？：、,.!?:（）“”’《》〈〉【�
 class Entry:
     __slots__ = (
         "text", "code", "code_len", "position", "selected",
-        "missing", "punctuation", "next_punct",
+        "missing", "punctuation", "next_punct", "plain",
     )
 
-    def __init__(self, text: str, code: Optional[str], position: int, next_punct: str = ""):
+    def __init__(self, text: str, code: Optional[str], position: int,
+                 next_punct: str = "", plain: bool = False):
         self.text = text
         self.code = code
         self.code_len = len(code) if code else 0
         self.position = position
         self.selected = position > 0
-        self.missing = code is None and text not in PUNCTUATION
+        self.plain = plain
+        self.missing = code is None and not plain and text not in PUNCTUATION
         self.punctuation = code is None and text in PUNCTUATION
         # 下一个字符若是标点，可以用「码 + 标点」直接上屏（句末常见）
         self.next_punct = next_punct
@@ -189,6 +191,11 @@ def encode(text: str) -> Tuple[List[Entry], Dict[str, object]]:
             entries.append(Entry(char, None, 0))
             index += 1
             continue
+        # 2026-11-17 所有者：阿拉伯数字直接用数字键打，不走码表、不算缺字
+        if char.isascii() and char.isdigit():
+            entries.append(Entry(char, None, 0, plain=True))
+            index += 1
+            continue
         matched = None
         for size in (4, 3, 2, 1):
             if index + size > length:
@@ -219,12 +226,13 @@ def encode(text: str) -> Tuple[List[Entry], Dict[str, object]]:
     missing = sum(1 for entry in entries if entry.missing)
     commit_entries = [e for e in entries if not e.missing and not e.punctuation]
     # 上屏方式：带选重 → 选择键上屏；后面紧跟标点 → 那个标点上屏；否则按空格上屏。
-    spaces = sum(1 for e in commit_entries if not e.selected and not e.next_punct)
+    spaces = sum(1 for e in commit_entries if not e.selected and not e.next_punct and not e.plain)
     selector_keys = sum(1 for e in commit_entries if e.selected)
     punct_keys = sum(1 for e in commit_entries if not e.selected and e.next_punct)
     letter_keys = sum(e.code_len for e in commit_entries)
-    key_count = letter_keys + selector_keys + punct_keys + spaces
-    length_dist = collections.Counter(e.code_len for e in commit_entries)
+    plain_keys = sum(1 for e in commit_entries if e.plain)
+    key_count = letter_keys + selector_keys + punct_keys + spaces + plain_keys
+    length_dist = collections.Counter(e.code_len for e in commit_entries if not e.plain)
     key_counts = collections.Counter()
     for entry in commit_entries:
         if entry.code:
@@ -235,7 +243,9 @@ def encode(text: str) -> Tuple[List[Entry], Dict[str, object]]:
                 if suffix:
                     key_counts[suffix] += 1
     for entry in commit_entries:
-        if not entry.selected and entry.next_punct:
+        if entry.plain:
+            key_counts[entry.text] += 1
+        elif not entry.selected and entry.next_punct:
             key_counts[entry.next_punct] += 1
     key_counts["space"] += spaces
     stats = {
@@ -484,6 +494,9 @@ def render_png(text: str) -> bytes:
         for entry in line_entries:
             if entry.punctuation:
                 color = DIM
+                code_text = ""
+            elif entry.plain:
+                color = TEXT
                 code_text = ""
             elif entry.missing:
                 color = COLOR_MISSING
