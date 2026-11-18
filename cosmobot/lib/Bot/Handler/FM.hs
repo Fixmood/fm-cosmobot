@@ -10,6 +10,7 @@ module Bot.Handler.FM
   , parseDirectModelCommand
   ) where
 
+import qualified Bot.Chat.Bridge.FM as FMBridge
 import Bot.Core.Message
 import Bot.Core.Route
 import qualified Bot.Handler.Humanlike as Humanlike
@@ -38,6 +39,30 @@ import Network.HTTP.Types.URI (urlEncode)
 import qualified Data.Text.Encoding as TextEncoding
 import Text.Read (readMaybe)
 
+-- 2026-11-18 所有者：主人的 Matrix 消息要**立即**转发到 QQ。
+--
+-- 原来这条路是「先跑完整 agent 回合，再把回答镜像回 QQ」：实测每条消息 3~24 秒
+-- （elapsed_ms=18159/7645/4797/3223/14383/35379/23791/15633），所以感觉极慢。
+-- 这里在路由最前面做一次纯转发（不动模型），回答仍然照常异步走 agent。
+matrixOwnerRelayHandler
+  :: (Chat.Chat :> es)
+  => RouteHandler es
+matrixOwnerRelayHandler =
+  continueOn (matching isMatrixOwnerRelay) \message _ -> do
+    case FMBridge.matrixOwnerAsQQ message of
+      Nothing -> pure ()
+      Just target ->
+        void $ Chat.replyTo target (FMBridge.fmOwnerRelayBody message.text)
+
+isMatrixOwnerRelay :: IncomingMessage -> Bool
+isMatrixOwnerRelay message =
+  message.platform == PlatformMatrix
+    && message.eventKind == IncomingMessageCreated
+    && not (Text.null (Text.strip message.text))
+    && not (FMBridge.isMirroredQQMatrixMessage message)
+    && FMBridge.isFMMatrixRoom message
+    && message.senderId `elem` fmap Just FMBridge.fmOwnerMatrixIds
+
 fmHandlers
   :: ( HTTP.HTTP :> es
      , Chat.Chat :> es
@@ -51,7 +76,8 @@ fmHandlers
      )
   => [RouteHandler es]
 fmHandlers =
-  [ modelRecoveryHandler
+  [ matrixOwnerRelayHandler
+  , modelRecoveryHandler
   , groupSwitchHandler
   , humanlikeHandler
   , recallDirectHandler
