@@ -7607,6 +7607,21 @@ def _clean_huma_article(raw_text):
         if looks_like_chapter:
             text = text[newline + 1:]
 
+    # 2.7) 赛文标题行：梦幻打字阁日赛第3793期-「广」虹投稿
+    first_newline = text.find("\n")
+    if 0 <= first_newline <= 120:
+        first_line = text[:first_newline].strip()
+        if (
+            first_line
+            and len(first_line) <= 60
+            and not any(mark in first_line for mark in "。，！？；：")
+            and any(
+                key in first_line
+                for key in ("投稿", "赛第", "日赛", "周赛", "月赛", "年赛", "赛文", "第")
+            )
+        ):
+            text = text[first_newline + 1:]
+
     # 3) 还以【发文】之类开头的话，去掉前缀到第一个全角冒号
     text = text.strip()
     for prefix in ("【发文】", "[发文]", "【正文】", "【文】"):
