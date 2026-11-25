@@ -63,6 +63,45 @@ isMatrixOwnerRelay message =
     && FMBridge.isFMMatrixRoom message
     && message.senderId `elem` fmap Just FMBridge.fmOwnerMatrixIds
 
+-- 2026-11-25 所有者：双模型分派 —— 日常 deepseek-flash（快），复杂任务说「用codex」走 codex。
+-- 只认主人，命令形如「用codex / 切codex / 用deepseek / 切deepseek」，直接改运行时选择并落盘。
+modelSwitchHandler
+  :: (Chat.Chat :> es, LLM.LLM :> es)
+  => RouteHandler es
+modelSwitchHandler =
+  stopOn (matching isModelSwitchCommand) \message _ ->
+    case modelSwitchTarget message.text of
+      Nothing -> pure ()
+      Just target
+        | not (isSuperuser message) ->
+            sendStandalone message "只有主人能切换模型。"
+        | otherwise -> do
+            result <- LLM.selectChatModel target
+            case result of
+              Right info ->
+                sendStandalone message
+                  ("已切到 " <> info.provider <> "（" <> info.model <> "）。")
+              Left err ->
+                sendStandalone message ("切换模型失败：" <> err)
+
+modelSwitchTarget :: Text -> Maybe Text
+modelSwitchTarget raw =
+  let compact = Text.filter (/= ' ') (Text.toCaseFold (Text.strip raw))
+      looksLikeCommand =
+        Text.length compact <= 16
+          && any (\word -> word `Text.isInfixOf` compact) ["用", "切", "换"]
+  in if looksLikeCommand && "codex" `Text.isInfixOf` compact
+       then Just "fm-codex"
+       else
+         if looksLikeCommand && "deepseek" `Text.isInfixOf` compact
+           then Just "deepseek-flash"
+           else Nothing
+
+isModelSwitchCommand :: IncomingMessage -> Bool
+isModelSwitchCommand message =
+  message.eventKind == IncomingMessageCreated
+    && isJust (modelSwitchTarget message.text)
+
 fmHandlers
   :: ( HTTP.HTTP :> es
      , Chat.Chat :> es
@@ -76,7 +115,8 @@ fmHandlers
      )
   => [RouteHandler es]
 fmHandlers =
-  [ matrixOwnerRelayHandler
+  [ modelSwitchHandler
+  , matrixOwnerRelayHandler
   , modelRecoveryHandler
   , groupSwitchHandler
   , humanlikeHandler
