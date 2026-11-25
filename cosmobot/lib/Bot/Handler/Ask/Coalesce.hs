@@ -42,7 +42,7 @@ coalesceKey message =
 
 -- | 把一条消息并入会话缓冲。窗口内第一条消息负责挂定时器，到点合并并调用 runBatch。
 enqueueCoalesced
-  :: (Concurrency.Concurrency :> es, IOE :> es)
+  :: (Concurrency.Concurrency :> es, IOE :> es, KatipE :> es)
   => Int
   -- ^ 窗口毫秒数
   -> Int
@@ -63,6 +63,7 @@ enqueueCoalesced windowMs maxMessages key message runBatch = do
       if Set.member key scheduled
         then (scheduled, False)
         else (Set.insert key scheduled, True)
+  logInfo [i|FM coalesce: buffered key=#{key} count=#{size}|]
   when firstInWindow do
     void $ Concurrency.fork [i|ask.coalesce|] do
       Concurrency.sleepMicroseconds (max 0 windowMs * 1000)
@@ -71,7 +72,7 @@ enqueueCoalesced windowMs maxMessages key message runBatch = do
     flushCoalesced key runBatch
 
 flushCoalesced
-  :: (IOE :> es)
+  :: (IOE :> es, KatipE :> es)
   => Text
   -> ([IncomingMessage] -> Eff es ())
   -> Eff es ()
@@ -83,6 +84,7 @@ flushCoalesced key runBatch = do
     atomicModifyIORef' coalesceState.scheduledKeys \scheduled ->
       (Set.delete key scheduled, ())
   unless (null batch) do
+    logInfo [i|FM coalesce: flush key=#{key} count=#{length batch}|]
     runBatch batch
 
 -- | 把同一窗口里的多条消息并成一条「提问」，正文带说话人，附图/附件合并。

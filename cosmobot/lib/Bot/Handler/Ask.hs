@@ -255,10 +255,26 @@ conversationRoute toolCfg tools cfg threads =
               message
               \batch -> do
                 let merged = mergeWindowMessages batch
-                mergedPolicy <- classifyPolicy cfg threads merged
-                case decide mergedPolicy of
-                  Ignore -> pure ()
-                  mergedAction -> executeAction mergedPolicy mergedAction
+                -- 合并后的正文已经没有「fm 」前缀了，直接 classifyPolicy 会判定为「没被叫到」，
+                -- 于是整批被丢弃（实测：触发 3 次、回答 0 次）。所以用**最后一条原始消息**
+                -- 的分类结果（触发语义来自它），只把正文/附件换成合并后的内容。
+                case reverse batch of
+                  [] -> pure ()
+                  lastMessage : _ -> do
+                    basePolicy <- classifyPolicy cfg threads lastMessage
+                    let mergedPolicy =
+                          basePolicy
+                            { msg = merged
+                            , calledByName = basePolicy.calledByName
+                            , triggered = True
+                            , hasPrompt = True
+                            , hasImages = not (null merged.imageUrls)
+                            , hasFiles = not (null merged.files)
+                            }
+                    case decide mergedPolicy of
+                      Ignore -> pure ()
+                      Steer _ -> executeAction mergedPolicy Fresh
+                      mergedAction -> executeAction mergedPolicy mergedAction
             pure (StopWith (pure ()))
   where
     steerAction policy steer =
