@@ -33,6 +33,7 @@ import qualified Bot.Effect.Storage as Storage
 import qualified Bot.Effect.Typst as Typst
 import Bot.Core.Route
 import Bot.Handler.Ask.AgentRun (askSystemPrompt, runAskAgentThread)
+import Bot.Handler.Ask.Coalesce (coalesceKey, enqueueCoalesced, mergeWindowMessages)
 import Bot.Handler.Ask.Config
 import Bot.Core.Message
 import Bot.Prelude
@@ -232,30 +233,57 @@ conversationRoute toolCfg tools cfg threads =
   Route Nothing (const True) \message -> do
     logInfo [i|FM conversation route entered|]
     policy <- classifyPolicy cfg threads message
-    routeAction policy (decide policy)
+    let action = decide policy
+    -- 2026-11-26 所有者：合并窗口。短窗口内收到的多条触发消息并成一次提问，
+    -- 避免「同一个人补充一句」「几个人同时提要求」被逐条重复回答。
+    -- 窗口时长 / 条数上限 / @ 是否绕过 都可以在 [handler.ask] 配置。
+    case action of
+      Ignore -> pure Skip
+      Steer steer -> steerAction policy steer
+      _ -> do
+        let bypassMerge =
+              cfg.mergeSkipMentions
+                && (message.digest.mentionsBot || isJust message.replyToMessageId)
+            windowMs = max 0 cfg.mergeWindowMs
+        if windowMs <= 0 || bypassMerge
+          then pure (StopWith (executeAction policy action))
+          else do
+            enqueueCoalesced
+              windowMs
+              (max 1 cfg.mergeMaxMessages)
+              (coalesceKey message)
+              message
+              \batch -> do
+                let merged = mergeWindowMessages batch
+                mergedPolicy <- classifyPolicy cfg threads merged
+                case decide mergedPolicy of
+                  Ignore -> pure ()
+                  mergedAction -> executeAction mergedPolicy mergedAction
+            pure (StopWith (pure ()))
   where
-    routeAction policy = \case
-      Steer steer ->
-        enqueueActiveThreadSteer threads policy.msg steer >>= \case
-          True -> pure (StopWith (pure ()))
-          False -> do
-            refreshed <- classifyPolicy cfg threads policy.msg
-            let fallback = refreshed{replyTarget = withoutActive refreshed.replyTarget}
-            routeAction fallback (decide fallback)
-      Ignore ->
-        pure Skip
+    steerAction policy steer =
+      enqueueActiveThreadSteer threads policy.msg steer >>= \case
+        True -> pure (StopWith (pure ()))
+        False -> do
+          refreshed <- classifyPolicy cfg threads policy.msg
+          let fallback = refreshed{replyTarget = withoutActive refreshed.replyTarget}
+          case decide fallback of
+            Ignore -> pure Skip
+            Steer steer' -> steerAction fallback steer'
+            other -> pure (StopWith (executeAction fallback other))
+
+    executeAction policy = \case
+      Ignore -> pure ()
+      Steer _ -> pure ()
       Continue parentKey transcript ->
-        pure . StopWith $
-          Concurrency.fireWithHandle "ask.continue" \resource ->
-            continueThread toolCfg tools cfg threads resource policy.msg parentKey transcript
+        Concurrency.fireWithHandle "ask.continue" \resource ->
+          continueThread toolCfg tools cfg threads resource policy.msg parentKey transcript
       Fresh ->
-        pure . StopWith $
-          Concurrency.fireWithHandle "ask.fresh" \resource ->
-            startAskThread "matched fresh ask route" toolCfg tools cfg threads resource policy.msg (Text.strip policy.msg.text)
+        Concurrency.fireWithHandle "ask.fresh" \resource ->
+          startAskThread "matched fresh ask route" toolCfg tools cfg threads resource policy.msg (Text.strip policy.msg.text)
       FreshFromReply parentId ->
-        pure . StopWith $
-          Concurrency.fireWithHandle "ask.continue" \resource ->
-            startThreadFromReply toolCfg tools cfg threads resource policy.msg parentId
+        Concurrency.fireWithHandle "ask.continue" \resource ->
+          startThreadFromReply toolCfg tools cfg threads resource policy.msg parentId
 
 classifyPolicy
   :: (Storage.Storage :> es, Prim :> es, Concurrent :> es, IOE :> es, KatipE :> es)

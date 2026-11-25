@@ -5656,6 +5656,9 @@ askHandlerConfig =
     , recentChatContextMaxChars = 2000
     , recentChatContextDisabledGroups = []
     , fastMode = False
+    , mergeWindowMs = 800
+    , mergeMaxMessages = 6
+    , mergeSkipMentions = True
     , botIds = [(PlatformQQ, "2044933066")]
     }
 

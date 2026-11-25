@@ -279,6 +279,7 @@ library
         Bot.Handler.Ask
         Bot.Handler.Ask.AgentRun
         Bot.Handler.Ask.Config
+        Bot.Handler.Ask.Coalesce
         Bot.Handler.Audit
         Bot.Handler.Help
         Bot.Handler.Huma

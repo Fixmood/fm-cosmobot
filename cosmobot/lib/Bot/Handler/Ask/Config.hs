@@ -27,6 +27,9 @@ data AskHandlerConfig = AskHandlerConfig
   , recentChatContextMaxChars :: !Int
   , recentChatContextDisabledGroups :: ![Integer]
   , fastMode         :: !Bool
+  , mergeWindowMs    :: !Int
+  , mergeMaxMessages :: !Int
+  , mergeSkipMentions :: !Bool
   , botIds           :: ![(ChatPlatform, Text)]
   }
   deriving (Show)
@@ -45,6 +48,9 @@ instance FromValue AskHandlerConfig where
     recentChatContextMaxChars <- fromMaybe 2000 <$> optKey "recent_chat_context_max_chars"
     recentChatContextDisabledGroups <- fromMaybe [] <$> optKey "recent_chat_context_disabled_groups"
     fastMode <- fromMaybe False <$> optKey "fast_mode"
+    mergeWindowMs <- fromMaybe (800 :: Int) <$> optKey "merge_window_ms"
+    mergeMaxMessages <- fromMaybe (6 :: Int) <$> optKey "merge_max_messages"
+    mergeSkipMentions <- fromMaybe True <$> optKey "merge_skip_mentions"
     when (contextCompactionThresholdKTokens <= 0) do
       fail "handler.ask.context_compaction_threshold_ktokens must be positive"
     when (recentChatContextLimit < 0 || recentChatContextLimit > 100) do
@@ -53,6 +59,10 @@ instance FromValue AskHandlerConfig where
       fail "handler.ask.recent_chat_context_minutes must be positive"
     when (recentChatContextMaxChars < 0) do
       fail "handler.ask.recent_chat_context_max_chars must not be negative"
+    when (mergeWindowMs < 0) do
+      fail "handler.ask.merge_window_ms must not be negative"
+    when (mergeMaxMessages < 1) do
+      fail "handler.ask.merge_max_messages must be positive"
     pure AskHandlerConfig
       { name = name
       , command = command
@@ -66,5 +76,8 @@ instance FromValue AskHandlerConfig where
       , recentChatContextMaxChars = recentChatContextMaxChars
       , recentChatContextDisabledGroups = recentChatContextDisabledGroups
       , fastMode = fastMode
+      , mergeWindowMs = mergeWindowMs
+      , mergeMaxMessages = mergeMaxMessages
+      , mergeSkipMentions = mergeSkipMentions
       , botIds = []
       }
