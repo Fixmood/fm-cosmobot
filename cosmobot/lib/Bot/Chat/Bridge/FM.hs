@@ -26,6 +26,7 @@ module Bot.Chat.Bridge.FM
   , bareReplyMarker
   , stripBareReplyMarker
   , fmStandaloneMessage
+  , fmDirectQQReply
   , FMTakeoverAddress (..)
   , FMTakeoverState (..)
   , takeoverPlatform
@@ -820,10 +821,21 @@ isMatrixOwnerBridge message =
     && message.chatId == Just config.qqGroupId
     && bridgeMarker `elem` message.chatAliases
 
+-- Send a QQ-originated response to its original QQ chat without using a
+-- mirrored Matrix room as an intermediate destination.
+fmDirectQQReply :: IncomingMessage -> IncomingMessage
+fmDirectQQReply message
+  | message.platform == PlatformQQ =
+      message{chatAliases = directQQReplyMarker : message.chatAliases}
+  | otherwise = message
+
+directQQReplyMarker :: Text
+directQQReplyMarker = "fm:direct-qq-reply"
+
 usesMatrixReplyPipeline :: IncomingMessage -> Bool
 usesMatrixReplyPipeline message =
   let config = bridgeConfigFor message
-  in config.enabled &&
+  in directQQReplyMarker `notElem` message.chatAliases && config.enabled &&
     ((message.platform == PlatformQQ && message.chatId == Just config.qqGroupId)
       || isFMMatrixRoom message)
 

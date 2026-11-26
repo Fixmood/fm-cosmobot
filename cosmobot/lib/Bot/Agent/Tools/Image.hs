@@ -6,12 +6,14 @@ Stability   : experimental
 
 module Bot.Agent.Tools.Image
   ( generateImageTool
+  , hasDirectImageGenerationIntent
   , editImageTool
   , viewImageTool
   )
 where
 
 import Bot.Agent.Tools.Common
+import qualified Bot.Agent.Failure as Failure
 import Bot.Agent.Tool
 import Bot.Agent.Types
 import Bot.Core.Message
@@ -47,13 +49,22 @@ generateImageTool =
 
 hasExplicitImageGenerationIntent :: Context -> Bool
 hasExplicitImageGenerationIntent context =
-  any (`Text.isInfixOf` normalized)
-    [ "生图", "生成图片", "图片生成", "生成一张图", "生成一张", "画图", "画一张"
+  hasDirectImageGenerationIntent normalized || any (`Text.isInfixOf` normalized)
+    [ "生图", "生成图片", "图片生成", "生成一张图", "生成一张", "画图", "画一张", "看聊画漫", "聊天画漫画", "把聊天画成漫画"
     , "做张图", "来张图", "绘制", "出图", "生成头像", "生成海报"
     , "draw", "create an image", "generate an image", "make an image"
     ]
   where
     normalized = Text.toLower context.input.text
+
+-- Common drawing imperatives that should use the image model.
+hasDirectImageGenerationIntent :: Text -> Bool
+hasDirectImageGenerationIntent raw =
+  let request = Text.toCaseFold (Text.strip raw)
+  in any (`Text.isPrefixOf` request)
+       ["画一只", "画一个", "画一幅", "画一张", "帮我画", "生成图片", "生成一张图", "生图", "imagegen "]
+     && not (any (`Text.isInfixOf` request)
+       ["流程图", "统计图", "曲线图", "柱状图", "折线图", "示意图", "排行榜", "成绩图"])
 
 editImageTool :: (Chat.Chat :> es, LLM.LLM :> es, Media.Media :> es) => Tool (Eff es)
 editImageTool =
@@ -89,12 +100,10 @@ editImageTool =
                 sendImageToolResult context.message "Edited" editedRefs edited
 
 resolveImageEditRef :: Media.Media :> es => Text -> Eff es Text
-resolveImageEditRef ref
-  | isMediaRef ref = do
-      Media.localMediaPath ref >>= \case
-        Just path -> pure ("file://" <> Text.pack path)
-        Nothing -> pure ref
-  | otherwise = pure ref
+resolveImageEditRef ref = do
+  Media.localMediaPath ref >>= \case
+    Just path -> pure ("file://" <> Text.pack path)
+    Nothing -> pure ref
 
 viewImageTool :: Media.Media :> es => Tool (Eff es)
 viewImageTool =
@@ -178,4 +187,8 @@ sendImageToolResult message label imageRefs body = do
       mediaText
         | null mediaRefs = ""
         | otherwise = "\nMedia ids: " <> Text.intercalate ", " mediaRefs
-  pure (toolTextWithImages [i|#{label} and sent image message id: #{sentText}#{mediaText}|] mediaRefs)
+  if any isRight sent
+    then pure (toolTextWithImages [i|#{label} and sent image message id: #{sentText}#{mediaText}|] mediaRefs)
+    else pure (toolFailure (Failure.externalServiceFailure
+      "The image was created, but sending it to this chat failed."
+      [i|Delivery failed: #{sentText}#{mediaText}|]))

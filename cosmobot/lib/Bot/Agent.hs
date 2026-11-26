@@ -28,6 +28,7 @@ module Bot.Agent
   , runIdOf
   , defaultRuntime
   , agentStream
+  , isGroupCodexRequest
   , ToolResult (..)
   , toolText
   , toolTextWithImages
@@ -92,6 +93,9 @@ import qualified Bot.Agent.ToolRegistry as ToolRegistry
 import Bot.Agent.Tool (Tool, toolAllowed, toolName)
 import Bot.Agent.Tools.Continuation (resumeContinuationTool)
 import Bot.Agent.Types
+import qualified Bot.Chat.Bridge.FM as FMBridge
+import Bot.Core.Message (ChatKind (..), IncomingMessage (..), MessageInput (..), ChatPlatform (..))
+import Bot.Core.Route (isAllowedGroup, isSuperuser)
 import qualified Bot.Effect.Chat as Chat
 import qualified Bot.Effect.Agent as AgentEffect
 import qualified Bot.Effect.AgentAudit as AgentAudit
@@ -406,10 +410,28 @@ askNext
   -> Stream (Of Output) (Eff es) LLM.ChatAnswer
 askNext runtime agentState transcript = do
   schemas <- lift (resolveToolSchemas agentState.transcript agentState.turn runtime.runningTools)
+  let context = runtime.context
+      messages = agentRequestMessages context transcript
+      codexRequested = isGroupCodexRequest context.message
+        || (context.message.kind == ChatPrivate && isOwnerCodexRequest context.message context.input.text)
+      textOnly message = case message.content of
+        Just (LLM.TextContent _) -> message.role `elem` ["system", "user", "assistant"]
+        _ -> False
   S.map ContentDelta $
-    LLM.askWithToolsStreaming
-      schemas
-      (agentRequestMessages runtime.context transcript)
+    if codexRequested && all textOnly messages
+      then LLM.askWithToolsStreamingUsing (Just "fm-codex") schemas messages
+      else LLM.askWithToolsStreaming schemas messages
+
+isGroupCodexRequest :: IncomingMessage -> Bool
+isGroupCodexRequest message =
+  isAllowedGroup message && isOwnerCodexRequest message message.text
+
+isOwnerCodexRequest :: IncomingMessage -> Text -> Bool
+isOwnerCodexRequest message prompt =
+  message.platform == PlatformQQ
+    && isSuperuser message
+    && message.senderId == Just FMBridge.fmOwnerQQId
+    && "codex " `Text.isPrefixOf` Text.toCaseFold (Text.strip prompt)
 
 agentRequestMessages :: Context -> Transcript -> [LLM.ChatMessage]
 agentRequestMessages context (Transcript messages) =
