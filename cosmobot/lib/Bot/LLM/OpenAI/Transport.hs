@@ -1285,7 +1285,13 @@ chatStreamTextFromPayloads emitContentDeltas payloads = do
 
 imageGenerationStreamBytesFromPayloads :: [Aeson.Value] -> Either Text StrictByteString.ByteString
 imageGenerationStreamBytesFromPayloads payloads = do
-  events <- traverse parseEvent payloads
+  -- 2026-11-26：有些中转（WeiLai/weilai.chat）在 stream=true 时并不发 OpenAI 的
+  -- image_generation.* 事件，而是直接吐一个普通 images 响应：
+  --   data: {"created":...,"data":[{"b64_json":"..."}]}
+  -- 之前严格按事件解析，遇到这种格式就报
+  -- 「Error in $: parsing ImageGenerationStreamEvent…」→ 漫画/改图直接失败。
+  -- 现在：标准事件照旧；解析不了的事件先当普通 images 响应再试一次，仍不行就跳过。
+  let events = mapMaybe parseEvent payloads
   b64 <- case mapMaybe completedEventBase64 events of
     [] ->
       Left "Image generation streaming response was empty: no image output."
@@ -1297,11 +1303,29 @@ imageGenerationStreamBytesFromPayloads payloads = do
     Right bytes ->
       Right bytes
   where
-    parseEvent :: Aeson.Value -> Either Text ImageGenerationStreamEvent
+    parseEvent :: Aeson.Value -> Maybe ImageGenerationStreamEvent
     parseEvent value =
       case AesonTypes.parseEither Aeson.parseJSON value of
-        Left err -> Left (Text.pack err)
-        Right event -> Right event
+        Right event -> Just event
+        Left _ -> plainImagesResponseEvent value
+
+    -- 普通（非流式事件）images 响应 → 合成一个 completed 事件
+    plainImagesResponseEvent :: Aeson.Value -> Maybe ImageGenerationStreamEvent
+    plainImagesResponseEvent value =
+      case AesonTypes.parseMaybe plainParser value of
+        Just b64 ->
+          Just
+            ImageGenerationStreamEvent
+              { type_ = "image_generation.completed"
+              , b64Json = Just b64
+              }
+        Nothing -> Nothing
+      where
+        plainParser =
+          Aeson.withObject "images response" \object -> do
+            items <- object Aeson..: "data"
+            firstItem <- maybe (fail "empty data") pure (listToMaybe (items :: [Aeson.Value]))
+            Aeson.withObject "image" (Aeson..: "b64_json") firstItem
 
     completedEventBase64 :: ImageGenerationStreamEvent -> Maybe Text
     completedEventBase64 event =
