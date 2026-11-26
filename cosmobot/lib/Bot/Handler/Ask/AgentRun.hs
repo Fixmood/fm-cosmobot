@@ -227,26 +227,27 @@ runAskAgentThread toolCfg toolsRaw cfgRaw threads resource parentMessageKey mess
   -- （所有者 2026-11-06：复杂任务之前先说怎么做，做完之后再补充完整结果）
   -- 拟人模式下不发计划预告：那句「我先确认…再查相关记录后回复」是助手腔，
   -- 和这个人设正相反，用户实测一眼就看出"味道不对"。
-  Agent.withAgentMetadata
-    (\runId -> Agent.ToolCallMetadata
-      { agentRunId = runId
-      , originRunId = runId
-      , resourceOwner = Just resource
-      }) $
-    Agent.withRun
-      (if isImageTask message then min cfg.agentMaxTurns 8 else cfg.agentMaxTurns)
-      (compactionThresholdTokens cfg)
-      context
-      selectedTools
-      \runtime ->
-        withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text requestTranscript \activeReply -> do
-          reply <- streamAgentReply (humanlikeStreaming humanlike) runtime activeReply outputMessage requestTranscript rosterTriggers
-          finishedAt <- liftIO getCurrentTime
-          let replyResult = reply.result
-              replyStatus = replyResult.status
-              replyTurns = replyResult.turnsUsed
-          logInfo [i|FM ask completed: run=#{Agent.runIdOf runtime} elapsed_ms=#{elapsedMilliseconds startedAt finishedAt} status=#{replyStatus} turns=#{replyTurns}|]
-          commitAgentReply observer activeReply message reply
+  withRequestModel message $
+    Agent.withAgentMetadata
+      (\runId -> Agent.ToolCallMetadata
+        { agentRunId = runId
+        , originRunId = runId
+        , resourceOwner = Just resource
+        }) $
+      Agent.withRun
+        (if isImageTask message then min cfg.agentMaxTurns 8 else cfg.agentMaxTurns)
+        (compactionThresholdTokens cfg)
+        context
+        selectedTools
+        \runtime ->
+          withActiveReply threads (Agent.runIdOf runtime) resource parentMessageKey message input.text requestTranscript \activeReply -> do
+            reply <- streamAgentReply (humanlikeStreaming humanlike) runtime activeReply outputMessage requestTranscript rosterTriggers
+            finishedAt <- liftIO getCurrentTime
+            let replyResult = reply.result
+                replyStatus = replyResult.status
+                replyTurns = replyResult.turnsUsed
+            logInfo [i|FM ask completed: run=#{Agent.runIdOf runtime} elapsed_ms=#{elapsedMilliseconds startedAt finishedAt} status=#{replyStatus} turns=#{replyTurns}|]
+            commitAgentReply observer activeReply message reply
 
 -- Source images for chat comics are selected from real participants and
 -- resolved locally before the image model is called.
@@ -1995,11 +1996,19 @@ llmFailureMessage err =
 isComplexRequest :: Text -> Bool
 isComplexRequest text =
   let compact = Text.filter (not . (`elem` [' ', '\t', '\n', '\r', '\x3000'])) (Text.toCaseFold text)
-  in any (`Text.isInfixOf` compact)
-       [ "分析", "对比", "比较", "计划", "方案", "规划", "总结", "为什么", "值不值"
-       , "建议", "优化", "设计", "帮我想", "怎么写", "怎么做", "评价", "进步"
-       , "退步", "弱在哪", "强在哪", "怎么办", "怎么看"
-       ]
+      longRequest = Text.length compact >= 120
+      codeKeywords =
+        [ "代码", "脚本", "正则", "重构", "报错", "算法", "sql", "http", "api"
+        , "部署", "配置", "调试", "数据库", "服务器", "接口"
+        ]
+  in longRequest
+       || any (`Text.isInfixOf` compact)
+            ( codeKeywords
+                <> [ "分析", "对比", "比较", "计划", "方案", "规划", "总结", "为什么", "值不值"
+                   , "建议", "优化", "设计", "帮我想", "怎么写", "怎么做", "评价", "进步"
+                   , "退步", "弱在哪", "强在哪", "怎么办", "怎么看"
+                   ]
+            )
 
 -- | 让模型用一句话说明打算怎么做（低延迟；只给步骤，不给答案）。
 quickPlan :: LLM.LLM :> es => Text -> Eff es Text
@@ -2011,6 +2020,34 @@ quickPlan userText = do
     ]
   pure (Text.take 80 (Text.strip reply))
 
+
+-- | 2026-11-26 所有者：把 deepseek / codex 的使用场景分开。
+--
+--   · 日常闲聊、查询、走确定性工具的请求 → deepseek-flash（快）
+--   · 复杂任务（分析 / 对比 / 计划 / 长文 / 代码类） → 本次切到 fm-codex（稳），跑完切回
+--   · codex 调用失败 → 自动回落到原模型重试一次，避免整条请求失败
+withRequestModel :: LLM.LLM :> es => IncomingMessage -> Eff es a -> Eff es a
+withRequestModel message action
+  | not (shouldUseCodex message) = action
+  | otherwise = do
+      previous <- LLM.currentChatModel
+      let restore = traverse_ (\info -> void (LLM.selectChatModelVolatile info.provider)) previous
+      switched <- LLM.selectChatModelVolatile "fm-codex"
+      case switched of
+        Left _ -> action
+        Right _ -> do
+          result <- action `catchSync` \_ -> do
+            restore
+            action
+          restore
+          pure result
+
+-- | 哪些请求该用 codex：复杂任务，但不包括画图 / 群聊漫画（那两条走图像模型）。
+shouldUseCodex :: IncomingMessage -> Bool
+shouldUseCodex message =
+  not (isChatComicRequest message)
+    && not (isImageTask message)
+    && isComplexRequest message.text
 
 -- | 复杂任务期间临时切到 high effort 的 provider，结束后切回默认。
 -- 用易失切换（不写配置）：并发跑的其他消息在这段时间里也会用 high，可接受。
