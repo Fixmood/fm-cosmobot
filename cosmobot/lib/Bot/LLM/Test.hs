@@ -28,7 +28,7 @@ runLLMWith askTextStream askImageStream askImageEditStream askAudioStream askToo
       LLM.AskImageStream options messages -> pure (LLM.liftLocalStream liftLocal (askImageStream options messages))
       LLM.AskImageEditStream options prompt imageRefs maskRef -> pure (LLM.liftLocalStream liftLocal (askImageEditStream options prompt imageRefs maskRef))
       LLM.AskAudioStream options messages -> pure (LLM.liftLocalStream liftLocal (askAudioStream options messages))
-      LLM.AskToolsStream tools messages -> pure (LLM.liftLocalStream liftLocal (askToolsStream tools messages))
+      LLM.AskToolsStream _ tools messages -> pure (LLM.liftLocalStream liftLocal (askToolsStream tools messages))
       LLM.ListChatModels -> pure []
       LLM.CurrentChatModel -> pure Nothing
       LLM.SelectChatModelVolatile _ -> pure (Left "volatile switching unavailable in test")

@@ -187,6 +187,12 @@ instance ChatDriver ChatDrivers where
         result <- withMatrixBridgeDriver drivers message \driver target ->
           sendReplyMessage driver target body
         case result of
+          Left{}
+            | message.platform == PlatformQQ
+            , not (null (ReplyBody.replyImageUrls body)) -> do
+                qqResults <- sendQQBridgeReplies drivers message body
+                recordRecentQQDeliveries drivers message body (rights qqResults)
+                pure (fromMaybe result (Right <$> listToMaybe (rights qqResults)))
           Left{} ->
             pure result
           Right matrixMessageId -> do
@@ -205,7 +211,13 @@ instance ChatDriver ChatDrivers where
         results <- withMatrixBridgeDriver drivers message \driver target ->
           sendReplyMessages driver target body
         if not (any isRight results)
-          then pure results
+          then
+            if message.platform == PlatformQQ && not (null (ReplyBody.replyImageUrls body))
+              then do
+                qqResults <- sendQQBridgeReplies drivers message body
+                recordRecentQQDeliveries drivers message body (rights qqResults)
+                pure (if any isRight qqResults then qqResults else results <> qqResults)
+              else pure results
           else do
             qqResults <- sendQQBridgeReplies drivers message body
             let qqMessageIds = rights qqResults

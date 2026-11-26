@@ -24,6 +24,7 @@ module Bot.Agent.Tools.Chat
   , senderMemberInfoTool
   , memberInfoTool
   , userAvatarTool
+  , avatarUrl
   , listGroupMembersTool
   , currentMessageInfoTool
   )

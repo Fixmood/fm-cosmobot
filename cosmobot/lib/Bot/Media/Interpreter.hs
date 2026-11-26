@@ -21,6 +21,8 @@ import qualified Data.ByteString.Base64 as Base64
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TextEncoding
 import Effectful.FileSystem (FileSystem)
+import qualified Effectful.FileSystem as FileSystem
+import System.FilePath ((</>))
 import qualified Effectful.FileSystem.IO.ByteString as FileSystemByteString
 import Effectful.Process (Process)
 import qualified Effectful.Timeout as Timeout
@@ -179,10 +181,23 @@ modelRef runtime rawRef
 localPath :: (FileSystem :> es, Storage.Storage :> es, IOE :> es) => Runtime -> Text -> Eff es (Maybe FilePath)
 localPath runtime ref =
   case Cache.parseMediaId ref of
-    Nothing ->
-      pure Nothing
     Just fileId ->
       fmap (.path) <$> Cache.loadCachedMedia (cacheConfig runtime) fileId
+    Nothing ->
+      case cachedImageFilename ref of
+        Just filename -> do
+          let path = (cacheConfig runtime).directory </> Text.unpack filename
+          exists <- FileSystem.doesFileExist path
+          pure (if exists then Just path else Nothing)
+        Nothing -> pure Nothing
+
+cachedImageFilename :: Text -> Maybe Text
+cachedImageFilename ref = do
+  name <- Text.stripPrefix "/cosmobot/media/" (Text.strip ref)
+  let (digest, extension) = Text.breakOn "." name
+  guard (Text.length digest == 64 && Text.all (`elem` ("0123456789abcdef" :: String)) digest)
+  guard (extension `elem` [".png", ".jpg", ".jpeg", ".webp", ".gif"])
+  pure name
 
 cacheObject :: (Concurrent :> es, IOE :> es, KatipE :> es, FileSystem :> es, Process :> es, Fail :> es, Storage.Storage :> es) => Runtime -> Maybe Text -> MediaObject -> Eff es Text
 cacheObject runtime sourceRef mediaObject = do

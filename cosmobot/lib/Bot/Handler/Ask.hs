@@ -13,6 +13,7 @@ where
 import qualified Bot.Agent as Agent
 import qualified Bot.Agent.Tool as AgentTool
 import qualified Bot.Agent.Tools.Audio as AudioTools
+import qualified Bot.Agent.Tools.Model as ModelTools
 import qualified Bot.Agent.Failure as Failure
 import Bot.Core.Thread
 import Bot.Core.Transcript
@@ -32,7 +33,7 @@ import qualified Bot.Effect.Skills as Skills
 import qualified Bot.Effect.Storage as Storage
 import qualified Bot.Effect.Typst as Typst
 import Bot.Core.Route
-import Bot.Handler.Ask.AgentRun (askSystemPrompt, runAskAgentThread)
+import Bot.Handler.Ask.AgentRun (askSystemPrompt, isChatComicRequest, runAskAgentThread)
 import Bot.Handler.Ask.Config
 import Bot.Core.Message
 import Bot.Prelude
@@ -82,9 +83,52 @@ askHandlers
 askHandlers toolCfg tools cfg threads =
   [ deletedMessageRoute threads
   , naturalHaltRoute threads
+  , codexQuotaRoute
   , directVoiceRoute cfg
+  , directChatComicRoute toolCfg tools cfg threads
   , conversationRoute toolCfg tools cfg threads
   ]
+
+-- An explicitly addressed comic starts without looking up a previous
+-- conversation in the synchronous incoming-message router.
+directChatComicRoute
+  :: HandlerEffects es
+  => Agent.ToolConfig
+  -> [AgentTool.Tool (Eff es)]
+  -> AskHandlerConfig
+  -> ThreadStore
+  -> RouteHandler es
+directChatComicRoute toolCfg tools cfg threads =
+  stopOn (matching \message ->
+    message.platform == PlatformQQ
+      && isAllowedGroup message
+      && isChatComicRequest message
+      && (message.digest.mentionsBot || calledByName cfg message
+        || Text.toCaseFold (fromMaybe "FM" cfg.name) `Text.isPrefixOf` Text.toCaseFold (Text.stripStart message.text))) \message _ ->
+    Concurrency.fireWithHandle "ask.qq-comic" \resource -> do
+      logInfo "FM direct QQ comic route accepted"
+      let input = inputWithAttachments (Text.strip message.text) message.imageUrls message.files
+          transcript = startWithIncomingMessage message input
+      void (runAskAgentThread toolCfg tools cfg threads resource Nothing message input transcript)
+
+-- Quota lookup remains available when the selected chat model is exhausted.
+codexQuotaRoute :: HandlerEffects es => RouteHandler es
+codexQuotaRoute =
+  stopOn (matching \message ->
+    message.platform == PlatformQQ
+      && (isAllowedPrivate message || isAllowedGroup message)
+      && isSuperuser message
+      && message.senderId == Just FMBridge.fmOwnerQQId
+      && isCodexQuotaRequest message.text) \message _ ->
+    Concurrency.fire "ask.codex-quota" do
+      results <- LLM.queryAccountBalance (Just "codex")
+      void (Chat.replyTo (FMBridge.fmStandaloneMessage message) (ModelTools.renderBalanceResults results))
+  where
+    isCodexQuotaRequest raw =
+      let request = Text.toCaseFold raw
+      in "codex" `Text.isInfixOf` request
+           && any (`Text.isInfixOf` request)
+                ["额度", "用量", "限额", "配额", "余额", "quota", "还剩多少", "什么时候重置"]
 
 -- Explicit voice requests bypass the general tool loop. Without this guard a
 -- model can incorrectly build an MP3 in a sandbox and send it as a file card.
@@ -306,19 +350,21 @@ classifyPolicy cfg threads msg = do
                 -- 而那是正常情况。保留 warning 会让真问题淹没在假警告里。
                 logInfo [i|FM reply lookup: no_thread_for_this_reply platform=#{logPlatform} chat=#{logChat} reply_to=#{logReplyId} sender_id=#{logSender}|]
                 pure (OtherReply key.messageId)
-  let triggered = case customTrigger of
-        Nothing -> isAllowedPrivate msg || (isAllowedGroup msg && (msg.digest.mentionsBot || calledByName))
-        Just config ->
-          -- 私聊是一对一会话：对方说话就是冲着 FM 来的，不需要再喊名字。
-          -- 原来这里没有私聊这一档，而 triggerMatches 只认 prefix/mention/name/
-          -- keyword，于是出现倒挂：没配置的私聊能直接说话，配置过的主人反而
-          -- 必须发「fm 」（所有者 2026-10-23 提的）。群聊规则完全不动。
-          (isAllowedPrivate msg
-            || Trigger.triggerMatches (fromMaybe "FM" cfg.name) config msg
-            || isTriggerManagementRequest cfg msg)
-            && not (Trigger.triggerConfigHasMode Trigger.TriggerReply config && isOtherReply baseReplyTarget)
+  let codexGroupRequest = Agent.isGroupCodexRequest msg
+      triggered = codexGroupRequest || defaultTrigger
+      defaultTrigger = case customTrigger of
+          Nothing -> isAllowedPrivate msg || (isAllowedGroup msg && (msg.digest.mentionsBot || calledByName))
+          Just config ->
+            -- 私聊是一对一会话：对方说话就是冲着 FM 来的，不需要再喊名字。
+            -- 原来这里没有私聊这一档，而 triggerMatches 只认 prefix/mention/name/
+            -- keyword，于是出现倒挂：没配置的私聊能直接说话，配置过的主人反而
+            -- 必须发「fm 」（所有者 2026-10-23 提的）。群聊规则完全不动。
+            (isAllowedPrivate msg
+              || Trigger.triggerMatches (fromMaybe "FM" cfg.name) config msg
+              || isTriggerManagementRequest cfg msg)
+              && not (Trigger.triggerConfigHasMode Trigger.TriggerReply config && isOtherReply baseReplyTarget)
   replyTarget <-
-    if triggered && hasPrompt && isNoReply baseReplyTarget
+    if triggered && not codexGroupRequest && hasPrompt && isNoReply baseReplyTarget
       then lookupRecentUserThread threads msg recentUserThreadWindowSeconds >>= \case
         Just (parentKey, transcript, ageSeconds) -> do
           let recentThreadId = messageIdText parentKey.messageId

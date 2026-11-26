@@ -33,6 +33,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as AesonKey
 import qualified Data.Aeson.Types as AesonTypes
 import Network.HTTP.Req
+import qualified Text.URI as URI
 import qualified Streaming.ByteString as Q
 import qualified Streaming
 import qualified Streaming.Prelude as S
@@ -93,8 +94,8 @@ runLLM cfg action = do
                 do
                   selectedImages <- lift (MVar.readMVar imageSelection)
                   let selectedCfg = activeImageConfig cfg selectedImages
-                  resolvedImageRefs <- lift (traverse Media.publicMediaRef imageRefs)
-                  resolvedMaskRef <- lift (traverse Media.publicMediaRef maskRef)
+                  resolvedImageRefs <- lift (traverse imageEditUploadRef imageRefs)
+                  resolvedMaskRef <- lift (traverse imageEditUploadRef maskRef)
                   Retry.retryLLMStreamRequest "LLM image edit streaming request" $
                     askImageEditStreamingWithMedia selectedCfg options prompt resolvedImageRefs resolvedMaskRef
         LLM.AskAudioStream options messages ->
@@ -105,8 +106,11 @@ runLLM cfg action = do
                   resolved <- lift (resolveChatMessagesTimed messages)
                   Retry.retryLLMStreamRequest "LLM audio streaming request" $
                     normalizeReplyResult (Transport.askAudioOpenAIStreaming cfg options resolved)
-        LLM.AskToolsStream tools messages -> do
-          selected <- MVar.readMVar selection
+        LLM.AskToolsStream profile tools messages -> do
+          defaultSelection <- MVar.readMVar selection
+          let selected = case profile of
+                Just name | Map.member name cfg.chatProviders -> Just name
+                _ -> defaultSelection
           localSeqLift localEnv \liftLocal ->
             pure $
               LLM.liftLocalStream liftLocal $
@@ -274,9 +278,12 @@ runLLM cfg action = do
             Left err -> pure (Left err)
             Right selectedName -> do
               -- 易失：只改内存，不写配置文件
-              MVar.modifyMVar_ selection (const (pure selectedName))
+              active <- MVar.modifyMVar selection \current -> do
+                let allowed = current `elem` [Just "deepseek-flash", Just "deepseek-flash-high"]
+                    next = if allowed then selectedName else current
+                pure (next, if allowed then next else Nothing)
               pure $ maybe (Left "The selected chat model is unavailable.") Right
-                (find (.current) (chatModelInfos cfg selectedName))
+                (active >>= \_ -> find (.current) (chatModelInfos cfg active))
         LLM.ResetChatModel -> do
           let selectedName = cfg.chatProviderName
           liftIO (persistChatModelSelection selectedName)
@@ -285,6 +292,16 @@ runLLM cfg action = do
           pure (find (.current) (chatModelInfos cfg selectedName))
     )
     action
+
+-- Keep the bot's local upload path intact for the multipart transport.
+imageEditUploadRef :: Media.Media :> es => Text -> Eff es Text
+imageEditUploadRef ref
+  | "file://" `Text.isPrefixOf` ref = pure ref
+  | otherwise = do
+      local <- Media.localMediaPath ref
+      case local of
+        Just path -> pure ("file://" <> Text.pack path)
+        Nothing -> Media.publicMediaRef ref
 
 queryAccountBalances
   :: (HTTP.HTTP :> es, KatipE :> es, IOE :> es)
@@ -303,10 +320,32 @@ queryAccountBalances cfg target = do
         | provider <- catMaybes [cfg.imageProvider, cfg.imageFallbackProvider]
         , action <- maybeToList (imageBalanceAction target provider)
         ]
-      actions = chatActions <> imageActions
+      codexActions =
+        [ queryCodexQuota provider
+        | target == Just "codex"
+        , provider <- maybeToList (Map.lookup "fm-codex" cfg.chatProviders)
+        ]
+      actions = codexActions <> chatActions <> imageActions
   if null actions
     then pure [balanceFailure "API" "没有找到对应的已配置余额渠道。"]
     else sequence actions
+
+queryCodexQuota
+  :: (HTTP.HTTP :> es, KatipE :> es, IOE :> es)
+  => ChatProviderConfig
+  -> Eff es LLM.AccountBalanceResult
+queryCodexQuota provider =
+  withProviderKey "Codex" provider.apiKey \apiKey ->
+    case URI.mkURI (Text.dropWhileEnd (== '/') provider.baseUrl <> "/codex/quota") >>= useHttpURI of
+      Nothing -> pure (balanceFailure "Codex" "额度接口地址无效。")
+      Just (url, options) ->
+        runBalanceQuery "Codex"
+          (responseBody <$> HTTP.runReq (req GET url NoReqBody jsonResponse
+            (options <> bearerHeader apiKey <> responseTimeout 18_000_000)))
+          (parseBalance "Codex" $ Aeson.withObject "Codex quota" \object -> do
+             available <- object Aeson..: "available"
+             fields <- object Aeson..: "fields"
+             pure LLM.AccountBalance{available, fields})
 
 imageBalanceAction
   :: (HTTP.HTTP :> es, KatipE :> es, IOE :> es)

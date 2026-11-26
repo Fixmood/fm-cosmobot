@@ -7,6 +7,7 @@ module Bot.Agent.Tools.Model
   ( chatModelStatusTool
   , imageModelManageTool
   , accountBalanceTool
+  , renderBalanceResults
   , chatModelManageTool
   , chatModelAddTool
   , chatModelEditTool

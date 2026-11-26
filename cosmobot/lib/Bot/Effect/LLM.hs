@@ -22,6 +22,7 @@ module Bot.Effect.LLM
   , askAudioStreamingWithHistoryWithOptions
   , askWithTools
   , askWithToolsStreaming
+  , askWithToolsStreamingUsing
   , listChatModels
   , currentChatModel
   , queryAccountBalance
@@ -85,7 +86,7 @@ data LLM :: Effect where
   AskImageStream :: ImageRequestOptions -> [ChatMessage] -> LLM m (Stream (Of Text) m Text)
   AskImageEditStream :: ImageRequestOptions -> Text -> [Text] -> Maybe Text -> LLM m (Stream (Of Text) m Text)
   AskAudioStream :: AudioRequestOptions -> [ChatMessage] -> LLM m (Stream (Of Text) m Text)
-  AskToolsStream :: [FunctionTool] -> [ChatMessage] -> LLM m (Stream (Of Text) m ChatAnswer)
+  AskToolsStream :: Maybe Text -> [FunctionTool] -> [ChatMessage] -> LLM m (Stream (Of Text) m ChatAnswer)
   ListChatModels :: LLM m [ChatModelInfo]
   CurrentChatModel :: LLM m (Maybe ChatModelInfo)
   QueryAccountBalance :: Maybe Text -> LLM m [AccountBalanceResult]
@@ -281,8 +282,11 @@ askWithTools tools messages =
 
 -- | Ask with function tools while receiving assistant content chunks.
 askWithToolsStreaming :: LLM :> es => [FunctionTool] -> [ChatMessage] -> Stream (Of Text) (Eff es) ChatAnswer
-askWithToolsStreaming tools messages = do
-  stream <- lift (send (AskToolsStream tools messages))
+askWithToolsStreaming = askWithToolsStreamingUsing Nothing
+
+askWithToolsStreamingUsing :: LLM :> es => Maybe Text -> [FunctionTool] -> [ChatMessage] -> Stream (Of Text) (Eff es) ChatAnswer
+askWithToolsStreamingUsing profile tools messages = do
+  stream <- lift (send (AskToolsStream profile tools messages))
   stream
 
 listChatModels :: LLM :> es => Eff es [ChatModelInfo]
